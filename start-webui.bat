@@ -8,6 +8,9 @@ rem lives - natively on Windows, or inside a Docker container. The choice is
 rem saved to bridge\agent-source.txt and reused on later launches.
 
 cd /d "%~dp0bridge"
+rem The agent's working directory is the repo root (not bridge\), since that is
+rem the project the WebUI is meant to work on. %%~fI drops the trailing slash.
+for %%I in ("%~dp0.") do set "ROOT=%%~fI"
 if not exist node_modules (
   echo Installing bridge dependencies...
   call npm install --no-fund --no-audit
@@ -28,13 +31,21 @@ if /i "!SOURCE!"=="native" goto :native
 if /i "!SOURCE!"=="docker" if not "!CONTAINER!"=="" goto :docker
 
 :choose
+set "SOURCE="
 echo.
 echo  Where does your pi agent run?
 echo    1. Natively on Windows  (pi CLI installed, no Docker)
 echo    2. Inside a Docker container
 choice /c 12 /n /m "Select [1/2]: "
-if errorlevel 2 goto :choose_docker
-goto :choose_native
+rem An explicit answer only: choice returns 255 when there is no input at all
+rem (a script or shortcut with a redirected stdin), and "errorlevel 2" would
+rem then send it down the Docker path.
+if "!errorlevel!"=="1" goto :choose_native
+if "!errorlevel!"=="2" goto :choose_docker
+echo.
+echo  No selection made - nothing changed.
+pause
+exit /b 1
 
 :choose_native
 set "SOURCE=native"
@@ -43,6 +54,15 @@ goto :native
 
 :choose_docker
 set "SOURCE=docker"
+where docker >nul 2>nul
+if errorlevel 1 (
+  echo.
+  echo  Docker is not installed, or not on PATH.
+  echo  Install Docker Desktop, or run this again and pick 1 to use a pi that is
+  echo  installed on Windows.
+  pause
+  exit /b 1
+)
 echo.
 echo  Containers on this machine:
 set /a i=1
@@ -101,6 +121,27 @@ if /i "!SOURCE!"=="native" (
 )
 
 set PORT=3080
+
+rem -- if an older bridge is still holding the port, offer to stop it --
+set "OLD_PID="
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr /r /c:"LISTENING" ^| findstr /r /c:":!PORT! "') do set "OLD_PID=%%P"
+if defined OLD_PID (
+  echo.
+  echo  A previous Pi Agent WebUI is still listening on port !PORT! ^(PID !OLD_PID!^).
+  choice /c yn /n /m "Stop it and start a fresh one? [y/n]: "
+  rem Only an explicit "y" stops it: choice returns 255 when there is no input
+  rem (a script launching this with a redirected stdin, say), which must not be
+  rem read as permission to kill a bridge that may be in the middle of a turn.
+  if not "!errorlevel!"=="1" (
+    echo  Leaving the running WebUI alone.
+    pause
+    exit /b 0
+  )
+  taskkill /PID !OLD_PID! /T /F >nul 2>nul
+  echo  Stopped PID !OLD_PID!.
+  timeout /t 1 >nul
+)
+
 echo.
 echo Pi Agent WebUI starting on http://localhost:3080
 echo (to change the pi agent source later, run switch_pi_agent_source.bat)
@@ -108,9 +149,11 @@ endlocal & (
   set "PI_COMMAND=%PI_COMMAND%"
   set "PI_SESSION_DIR=%PI_SESSION_DIR%"
   set "PORT=%PORT%"
+  set "WORKSPACE_DIR=%ROOT%"
 )
 echo.
 echo  Pi Agent WebUI is running at  http://localhost:%PORT%
+echo  agent workspace : %WORKSPACE_DIR%
 echo.
 echo  To STOP it: press Ctrl+C in this window, or close this window.
 echo  (stopping also kills the pi agent + whisper server - nothing is left running)

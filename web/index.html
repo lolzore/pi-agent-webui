@@ -8,11 +8,13 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%235b9dff'/%3E%3Ctext x='50' y='68' font-size='52' text-anchor='middle' fill='white' font-family='Georgia'%3E%CF%80%3C/text%3E%3C/svg%3E">
 </head>
 <body>
+<div id="bg-media" class="hidden" aria-hidden="true"></div>
 <div id="app">
 
   <!-- ══════════ Sidebar ══════════ -->
   <aside id="sidebar">
     <div class="sidebar-head">
+      <span id="sidebar-avatar" class="avatar-wrap" hidden></span>
       <span class="logo" id="agent-title">pi agent</span>
       <button id="btn-new-session" class="btn primary" title="Start a new session">+ New</button>
     </div>
@@ -29,12 +31,16 @@
       <button id="btn-toggle-sidebar" class="btn icon" title="Toggle sidebar">☰</button>
       <input id="session-name" class="session-name" placeholder="Unnamed session" title="Click to rename">
       <button id="btn-reels" class="btn">Reels</button>
+      <button id="reels-pill" class="reels-pill hidden" title="Close the split feed panel"><span>◧ Reels</span></button>
       <button id="btn-settings" class="btn icon" title="Settings: agent name, avatar, TTS voice, voice input, thinking, theme">⚙</button>
       <button id="btn-tts" class="btn toggle" title="Speak agent replies out loud (TTS)">TTS off</button>
       <span id="conn-dot" class="conn-dot" title="Connection status"></span>
     </header>
 
     <div id="banner" class="banner hidden"></div>
+
+    <!-- "Viewing another session" banner (the agent runs in its own). -->
+    <div id="view-banner" class="view-banner hidden"></div>
 
     <div id="chat"></div>
 
@@ -50,8 +56,8 @@
       </div>
       <div id="attachments" class="attachments hidden"></div>
       <div class="composer-row">
-        <button id="btn-attach" class="btn icon" title="Attach images">+</button>
-        <input id="file-input" type="file" accept="image/*" multiple hidden>
+        <button id="btn-attach" class="btn icon" title="Attach image / PDF / audio / video">+</button>
+        <input id="file-input" type="file" accept="image/*,application/pdf,audio/*,video/*,.pdf" multiple hidden>
         <textarea id="input" rows="1" placeholder="Message the agent" autocomplete="off"></textarea>
         <button id="btn-mic" class="btn icon" title="Voice to text">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
@@ -74,11 +80,74 @@
         <span id="stat-cost" title="session cost"></span>
         <span class="stats-spacer"></span>
         <select id="model-select" title="Model"></select>
+        <button id="model-btn" class="btn pill" title="Model">no model</button>
         <select id="thinking-select" title="Thinking level"></select>
       </div>
     </div>
+
+    <!-- Searchable model list (the hidden select above stays the source of truth) -->
+    <div id="model-menu" class="model-menu hidden">
+      <input id="model-search" type="search" placeholder="Search models…" autocomplete="off" spellcheck="false">
+      <div id="model-list" class="model-list"></div>
+    </div>
   </main>
+
+  <!-- ══════════ Reels panel (in-app split — plays inside the website) ══════════ -->
+  <aside id="reels-panel" class="hidden">
+    <div class="reels-panel-head">
+      <div id="reels-resize" title="Drag to resize"></div>
+      <span class="reels-panel-title">◧ Shorts</span>
+      <div class="reels-tabs" id="reels-tabs">
+        <button class="rtab" data-feed="instagram">Reels</button>
+        <button class="rtab" data-feed="tiktok">TikTok</button>
+        <button class="rtab" data-feed="youtube">Shorts</button>
+      </div>
+      <button id="btn-reels-close" class="btn icon" title="Close panel (Esc)">✕</button>
+    </div>
+    <div class="reels-link-row">
+      <input id="reels-link" type="text" placeholder="Paste a video link…" autocomplete="off" spellcheck="false">
+      <button id="btn-reels-play" class="btn small primary">play</button>
+    </div>
+    <div id="reels-video" class="reels-video">
+      <div class="reels-placeholder">
+        <p>Paste a video link above to play it right here — no new tab.</p>
+        <p class="hint">Instagram and TikTok refuse to be embedded (<code>X-Frame-Options: DENY</code>), so the infinite feed needs its own window. <b>Open the feed</b> below and it loads for real, docked beside the app.</p>
+        <div class="reels-placeholder-actions">
+          <button id="btn-reels-feed-inline" class="btn small primary">open the feed</button>
+        </div>
+      </div>
+    </div>
+    <div class="reels-panel-foot">
+      <button id="btn-reels-feed" class="btn small" title="Opens the full infinite feed in a window docked to the right edge">open full feed in side window</button>
+    </div>
+  </aside>
 </div>
+
+<!-- Manual crop for the background and the agent's profile image -->
+<dialog id="crop-dialog">
+  <h3 id="crop-title">Crop</h3>
+  <div id="crop-stage" class="crop-stage">
+    <div id="crop-media" class="crop-media"></div>
+  </div>
+  <div class="settings-grid">
+    <label>Zoom</label>
+    <div class="rate-row">
+      <input id="crop-zoom" type="range" min="1" max="6" step="0.01" value="1">
+      <span id="crop-zoom-val">1.00×</span>
+    </div>
+    <label>Position</label>
+    <div class="rate-row">
+      <input id="crop-x" type="range" min="-1" max="1" step="0.01" value="0" title="horizontal">
+      <input id="crop-y" type="range" min="-1" max="1" step="0.01" value="0" title="vertical">
+    </div>
+  </div>
+  <p class="hint" id="crop-hint"></p>
+  <div class="dialog-buttons">
+    <button id="crop-reset" class="btn small">reset</button>
+    <button id="crop-cancel" class="btn">cancel</button>
+    <button id="crop-save" class="btn primary">save</button>
+  </div>
+</dialog>
 
 <!-- Extension dialog modal -->
 <dialog id="ext-dialog">
@@ -91,62 +160,213 @@
   </div>
 </dialog>
 
+<!-- First-launch setup (one-time) -->
+<dialog id="setup-dialog">
+  <h3>Welcome to Pi Agent</h3>
+  <p class="setup-sub">One-time setup — you can change all of this later in ⚙ Settings.</p>
+  <div class="settings-grid">
+    <label>Agent name</label>
+    <input id="setup-agent-name" type="text" placeholder="pi" autocomplete="off">
+    <label>Shorts feed</label>
+    <select id="setup-shorts-provider">
+      <option value="instagram">Instagram Reels</option>
+      <option value="tiktok">TikTok</option>
+      <option value="youtube">YouTube Shorts</option>
+      <option value="none">None (hide the button)</option>
+    </select>
+    <label>Theme color</label>
+    <div class="rate-row">
+      <input id="setup-accent" type="color" value="#5b9dff">
+      <button id="setup-accent-reset" class="btn small">default</button>
+    </div>
+  </div>
+  <div class="dialog-buttons">
+    <button id="setup-skip" class="btn">skip</button>
+    <button id="setup-done" class="btn primary">Let's go</button>
+  </div>
+</dialog>
+
 <!-- Settings dialog -->
 <dialog id="settings-dialog">
   <h3>Settings</h3>
-  <div class="settings-grid">
-    <label>Agent name</label>
-    <input id="set-agent-name" type="text" placeholder="pi">
-    <label>Profile image</label>
-    <div class="avatar-row">
-      <img id="set-avatar-preview" class="avatar avatar-big" alt="">
-      <button id="btn-avatar-upload" class="btn small">upload…</button>
-      <button id="btn-avatar-clear" class="btn small">clear</button>
-      <input id="avatar-input" type="file" accept="image/*" hidden>
+  <div class="tabs" id="settings-tabs">
+    <button class="tab active" data-tab="general">General</button>
+    <button class="tab" data-tab="voice">Voice</button>
+    <button class="tab" data-tab="appearance">Appearance</button>
+    <button class="tab" data-tab="shorts">Shorts</button>
+    <button class="tab" data-tab="providers">Pi providers</button>
+  </div>
+
+  <div class="tab-panel" id="tab-general">
+    <div class="settings-grid">
+      <label>Agent name</label>
+      <input id="set-agent-name" type="text" placeholder="pi">
+      <label>Profile image</label>
+      <div class="avatar-row">
+        <span id="set-avatar-preview" class="avatar-wrap avatar-big"></span>
+        <button id="btn-avatar-upload" class="btn small">upload…</button>
+        <button id="btn-avatar-crop" class="btn small">crop…</button>
+        <button id="btn-avatar-clear" class="btn small">clear</button>
+        <input id="avatar-input" type="file" accept="image/*,video/*,.gif,.mp4,.webm,.mov" hidden>
+      </div>
+      <label>Profile image size</label>
+      <div class="rate-row">
+        <input id="set-avatar-size" type="range" min="16" max="96" step="2" value="34">
+        <span id="set-avatar-size-val">34px</span>
+      </div>
+      <label>Thinking</label>
+      <label class="check-label"><input id="set-show-thinking" type="checkbox"> show thinking blocks</label>
+      <label></label>
+      <label class="check-label"><input id="set-expand-thinking" type="checkbox"> auto-expand thinking blocks</label>
+      <label>Tool calls</label>
+      <label class="check-label"><input id="set-expand-tools" type="checkbox"> auto-expand tool call output</label>
+      <label>Compaction</label>
+      <label class="check-label"><input id="set-auto-continue" type="checkbox"> auto-continue the task after compaction</label>
     </div>
-    <label>TTS voice</label>
-    <select id="set-tts-voice"></select>
-    <label>Speech rate</label>
-    <div class="rate-row">
-      <input id="set-tts-rate" type="range" min="0.5" max="2" step="0.05" value="1.05">
-      <span id="set-tts-rate-val">1.05</span>
-      <button id="btn-tts-test" class="btn small">test</button>
+  </div>
+
+  <div class="tab-panel hidden" id="tab-voice">
+    <div class="settings-grid">
+      <label>TTS voice</label>
+      <select id="set-tts-voice"></select>
+      <label>Speech rate</label>
+      <div class="rate-row">
+        <input id="set-tts-rate" type="range" min="0.5" max="2" step="0.05" value="1.05">
+        <span id="set-tts-rate-val">1.05</span>
+        <button id="btn-tts-test" class="btn small">test</button>
+      </div>
+      <label>Voice input</label>
+      <label class="check-label"><input id="set-voice-autosend" type="checkbox"> auto-send after voice input</label>
+      <label>Whisper endpoint</label>
+      <input id="set-stt-endpoint" type="text" placeholder="http://localhost:8080/inference or …/v1/audio/transcriptions">
+      <label>Voice input backend</label>
+      <select id="set-stt-backend">
+        <option value="whisper">Whisper server</option>
+        <option value="browser">Browser (Chrome/Edge only)</option>
+      </select>
+      <label>TTS backend</label>
+      <select id="set-tts-backend"><option value="browser">Browser voices</option><option value="endpoint">Local TTS server (Piper etc.)</option></select>
+      <label>TTS server URL</label>
+      <input id="set-tts-endpoint" type="text" placeholder="http://localhost:8880/v1/audio/speech">
+      <label>TTS model / voice</label>
+      <div class="rate-row">
+        <input id="set-tts-model" type="text" placeholder="model, e.g. piper">
+        <input id="set-tts-voice-name" type="text" placeholder="voice, e.g. en_US-amy-medium">
+      </div>
     </div>
-    <label>Voice input</label>
-    <label class="check-label"><input id="set-voice-autosend" type="checkbox"> auto-send after voice input</label>
-    <label>Whisper endpoint</label>
-    <input id="set-stt-endpoint" type="text" placeholder="http://localhost:8080/inference or …/v1/audio/transcriptions">
-    <label>Voice input backend</label>
-    <select id="set-stt-backend">
-      <option value="whisper">Whisper server</option>
-      <option value="browser">Browser (Chrome/Edge only)</option>
-    </select>
-    <label>Thinking</label>
-    <label class="check-label"><input id="set-show-thinking" type="checkbox"> show thinking blocks</label>
-    <label></label>
-    <label class="check-label"><input id="set-expand-thinking" type="checkbox"> auto-expand thinking blocks</label>
-    <label>Tool calls</label>
-    <label class="check-label"><input id="set-expand-tools" type="checkbox"> auto-expand tool call output</label>
-    <label>TTS backend</label>
-    <select id="set-tts-backend"><option value="browser">Browser voices</option><option value="endpoint">Local TTS server (Piper etc.)</option></select>
-    <label>TTS server URL</label>
-    <input id="set-tts-endpoint" type="text" placeholder="http://localhost:8880/v1/audio/speech">
-    <label>TTS model / voice</label>
-    <div class="rate-row">
-      <input id="set-tts-model" type="text" placeholder="model, e.g. piper">
-      <input id="set-tts-voice-name" type="text" placeholder="voice, e.g. en_US-amy-medium">
+  </div>
+
+  <div class="tab-panel hidden" id="tab-appearance">
+    <div class="settings-grid">
+      <label>Theme color</label>
+      <div class="rate-row">
+        <input id="set-accent" type="color" value="#5b9dff">
+        <button id="btn-accent-reset" class="btn small">default</button>
+      </div>
+      <label>Background</label>
+      <div class="rate-row">
+        <input id="set-bg-url" type="text" placeholder="image / GIF / video URL">
+        <button id="btn-bg-upload" class="btn small">upload…</button>
+        <button id="btn-bg-crop" class="btn small">crop…</button>
+        <button id="btn-bg-clear" class="btn small">clear</button>
+        <input id="bg-input" type="file" accept="image/*,video/*,.gif,.mp4,.webm,.mov" hidden>
+      </div>
+      <label>Chatbox transparency</label>
+      <div class="rate-row">
+        <input id="set-chat-opacity" type="range" min="0" max="100" step="5">
+        <span id="set-chat-opacity-val">100%</span>
+      </div>
+      <label>Text outline</label>
+      <div class="rate-row">
+        <label class="check-label"><input id="set-text-outline" type="checkbox"> outline chat text (keeps it readable over the background)</label>
+      </div>
+      <label>Outline color</label>
+      <div class="rate-row">
+        <input id="set-outline-color" type="color" value="#000000">
+        <span class="hint">1px around every glyph</span>
+      </div>
+      <label>Typing</label>
+      <label class="check-label"><input id="set-type-anywhere" type="checkbox"> start typing anywhere in the window (no need to click the box)</label>
+      <label>Font</label>
+      <div class="font-row">
+        <input id="set-font" list="font-list" placeholder="System (Segoe UI)" spellcheck="false" autocomplete="off">
+        <datalist id="font-list"></datalist>
+        <button id="btn-font-reset" class="btn small" title="Reset to system default">reset</button>
+      </div>
+      <label>Text size</label>
+      <div class="rate-row">
+        <input id="set-font-size" type="range" min="12" max="20" step="1">
+        <span id="set-font-size-val">14px</span>
+      </div>
     </div>
-    <label>Theme color</label>
-    <div class="rate-row">
-      <input id="set-accent" type="color" value="#5b9dff">
-      <button id="btn-accent-reset" class="btn small">default</button>
+  </div>
+
+  <div class="tab-panel hidden" id="tab-shorts">
+    <div class="settings-grid">
+      <label>Shorts feed</label>
+      <select id="set-shorts-provider">
+        <option value="instagram">Instagram Reels</option>
+        <option value="tiktok">TikTok</option>
+        <option value="youtube">YouTube Shorts</option>
+        <option value="none">None (hide the button)</option>
+      </select>
+      <label>Open with</label>
+      <select id="set-shorts-mode">
+        <option value="panel">In-app split panel (plays inside the website)</option>
+        <option value="window">Side window (full infinite feed)</option>
+        <option value="tab">New browser tab</option>
+      </select>
     </div>
-    <label>Background</label>
-    <div class="rate-row">
-      <input id="set-bg-url" type="text" placeholder="image URL">
-      <button id="btn-bg-upload" class="btn small">upload…</button>
-      <button id="btn-bg-clear" class="btn small">clear</button>
-      <input id="bg-input" type="file" accept="image/*" hidden>
+    <label class="check-label"><input id="set-shorts-auto" type="checkbox"> open it automatically while the agent runs (closes when the run finishes)</label>
+    <p class="hint">One tap opens your feed. The in-app panel plays single videos inside the website (paste a link). The infinite feed can't be embedded in a browser — the side window docks flush to the right edge, and the Pi mobile app (React Native) shows it as a true native panel.</p>
+  </div>
+
+  <!-- Pi providers: write to ~/.pi/agent/models.json so pi picks them up -->
+  <div class="tab-panel hidden" id="tab-providers">
+    <p class="hint" style="margin-top:2px">Custom model providers saved to <code>~/.pi/agent/models.json</code> (pi reloads it on every /model).</p>
+    <div id="pi-providers-list" class="prov-list"></div>
+    <div class="settings-grid">
+      <label>Provider id</label>
+      <input id="prov-id" type="text" placeholder="my-provider" autocomplete="off">
+      <label>Base URL</label>
+      <input id="prov-base-url" type="text" placeholder="https://api.example.com/v1" autocomplete="off">
+      <label>API</label>
+      <select id="prov-api">
+        <option value="openai-completions">openai-completions (most compatible)</option>
+        <option value="openai-responses">openai-responses</option>
+        <option value="anthropic-messages">anthropic-messages</option>
+        <option value="google-generative-ai">google-generative-ai</option>
+        <option value="mistral-conversations">mistral-conversations</option>
+        <option value="bedrock-converse-stream">bedrock-converse-stream</option>
+      </select>
+      <label>API key</label>
+      <input id="prov-api-key" type="password" placeholder="sk-… (blank keeps existing key)" autocomplete="off">
+      <label>Models</label>
+      <textarea id="prov-models" rows="4" placeholder="one model id per line (optional)" spellcheck="false"></textarea>
+    </div>
+    <div class="rate-row prov-actions">
+      <button id="btn-prov-discover" class="btn small" title="Fetch the model list from the base URL above and fill the Models field">discover models</button>
+      <button id="btn-prov-test" class="btn small" title="Send a minimal completion to verify the URL + API + key actually work (catches misconfigured endpoints that return empty replies)">test connection</button>
+      <button id="btn-prov-add" class="btn small primary">add / update in pi</button>
+    </div>
+
+    <!-- pi /login: credentials in ~/.pi/agent/auth.json -->
+    <div class="prov-section" style="margin-top:14px; border-top:1px solid var(--border); padding-top:10px">
+      <p class="hint" style="margin-top:2px">Log in to a provider — this writes to <code>~/.pi/agent/auth.json</code>, the same file pi's <code>/login</code> uses. The agent restarts to pick up the change.</p>
+      <div class="settings-grid">
+        <label>Provider</label>
+        <input id="auth-provider" type="text" list="auth-provider-ids" placeholder="search or type a provider id…" autocomplete="off">
+        <datalist id="auth-provider-ids"></datalist>
+        <label>API key</label>
+        <input id="auth-key" type="password" placeholder="sk-…" autocomplete="off">
+      </div>
+      <div id="auth-status" class="auth-status"></div>
+      <div class="rate-row prov-actions">
+        <button id="btn-auth-login" class="btn small primary" title="Store the key in auth.json — same as /login → Use an API key">login (save key)</button>
+        <button id="btn-auth-logout" class="btn small" title="Remove the provider's credentials from auth.json — same as /logout">logout (remove)</button>
+      </div>
+      <div id="auth-logged-in" class="prov-list auth-logged-in"></div>
+      <p class="hint">Subscription / OAuth logins (ChatGPT, Claude, GitHub Copilot, OpenRouter, xAI…) open a browser flow — run <code>/login &lt;provider&gt;</code> in a pi terminal for those.</p>
     </div>
   </div>
   <div class="dialog-buttons">
@@ -155,7 +375,7 @@
 </dialog>
 
 <div id="toasts"></div>
-<div id="drop-overlay" class="drop-overlay hidden">Drop images to attach</div>
+<div id="drop-overlay" class="drop-overlay hidden">Drop files to attach</div>
 
 
 

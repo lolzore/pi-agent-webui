@@ -1,0 +1,47 @@
+{
+  "name": "PiAgent",
+  "version": "0.3.0",
+  "private": true,
+  "scripts": {
+    "start": "react-native start",
+    "windows": "react-native run-windows --arch x64 --logging --msbuildprops WindowsTargetPlatformVersion=10.0.26100.0,PlatformToolset=v145",
+    "windows:release": "react-native run-windows --arch x64 --release --no-deploy --no-packager --msbuildprops WindowsTargetPlatformVersion=10.0.26100.0,PlatformToolset=v145",
+    "windows:build": "react-native run-windows --arch x64 --no-launch --no-packager --no-deploy --msbuildprops WindowsTargetPlatformVersion=10.0.26100.0,PlatformToolset=v145",
+    "android": "react-native run-android",
+    "ios": "react-native run-ios",
+    "lint": "eslint .",
+    "test:windows": "jest --config jest.config.windows.js"
+  },
+  "dependencies": {
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "react": "19.2.3",
+    "react-native": "0.84.1",
+    "react-native-safe-area-context": "^5.7.0",
+    "react-native-webview": "13.16.1",
+    "react-native-windows": "0.84.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.25.2",
+    "@babel/preset-env": "^7.25.3",
+    "@babel/runtime": "^7.25.0",
+    "@react-native-community/cli": "20.1.0",
+    "@react-native/babel-preset": "0.84.1",
+    "@react-native/eslint-config": "0.84.1",
+    "@react-native/metro-config": "0.84.1",
+    "@react-native/typescript-config": "0.84.1",
+    "@types/react": "^19.2.0",
+    "eslint": "^8.19.0",
+    "prettier": "2.8.8",
+    "@rnx-kit/jest-preset": "^0.3.1"
+  },
+  "engines": {
+    "node": ">= 22.11.0"
+  },
+  "react-native-windows": {
+    "init-windows": {
+      "name": "PiAgent",
+      "namespace": "PiAgent",
+      "template": "cpp-app"
+    }
+  }
+}

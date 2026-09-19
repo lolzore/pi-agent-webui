@@ -1,6 +1,7 @@
-# dependencies and runtime artifacts
+# dependencies and runtime artifacts (all auto-installed/downloaded on launch)
 bridge/node_modules/
 bridge/whisper/
+uploads/
 workspace/
 
 # machine-specific pi agent source choice (native vs docker container name)

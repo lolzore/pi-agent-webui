@@ -9,7 +9,7 @@ Browser  ──WebSocket/HTTP──▶  bridge (Node.js)  ──stdin/stdout JSO
      (web/ static files)         (bridge/server.js)         (inside the container)
 ```
 
-One `pi --mode rpc` subprocess is spawned per browser tab; every pi RPC command and event is relayed 1:1, so the full agent protocol (streaming, tools, bash, extensions) works.
+A single `pi --mode rpc` subprocess is shared by every connected client; every pi RPC command is relayed to it and every event is broadcast back to all of them, so the full agent protocol (streaming, tools, bash, extensions) works — and the browser UI, the desktop app and any other window stay in lockstep in real time instead of drifting apart.
 
 ## Features
 
@@ -25,14 +25,18 @@ One `pi --mode rpc` subprocess is spawned per browser tab; every pi RPC command 
 | **Switching sessions** | Sidebar lists all sessions found in the pi session dir (from `/api/sessions`); click to `switch_session`, filter box, ⟳ refresh, `+ New` starts a new session, click the title bar name to rename (`set_session_name`). |
 | **Voice to text** | 🎙 button uses the Web Speech API (Chrome/Edge; `localhost` is a secure context so no HTTPS needed). Speech fills the composer — review, then send manually, or enable **auto-send** (settings ⚙ or `/autosend`) for hands-free sending. |
 | **TTS for agent output** | `TTS` toggle in the header (or `/tts`) auto-speaks every assistant reply via `speechSynthesis`; every assistant message also has a 🔊 button. Pick the Windows voice and speech rate in settings ⚙ (with a test button). Esc stops playback. |
-| **Agent identity** | Rename the agent and give it a profile image in settings ⚙ — both show next to its messages and in the header. Stored in browser localStorage. |
+| **Agent identity** | Rename the agent and give it a profile image in settings ⚙ — both show next to its messages, and the image also sits top-left in the sidebar. There is no built-in placeholder: with no image set, only the name shows, and **clear** removes it everywhere. The image can be a still, a GIF or a video, and either can be **cropped by hand** (settings → crop…: drag to move, scroll or the slider to zoom — zooming in is what unlocks sideways movement, since a picture that already fits the frame edge to edge has nothing to slide along). Its size is adjustable too. |
+| **Readable over anything** | Chat text is outlined (a 1px shadow around every glyph) so it stays legible when the panels are translucent and a background image or video shows through — the outline colour comes from settings, and it can be switched off. **Chatbox transparency** fades the composer, sidebar, message bubbles, tool cards, bash/system output, code blocks and the model/thinking controls together, with a real backdrop blur behind them. Backgrounds (image / GIF / video) get the same manual crop as the profile image. |
+| **Typing** | Optional **type anywhere**: with it on, any keystroke while the window is focused lands in the composer without clicking it first. |
 | **Pi extensions integration** | Full `extension_ui_request` sub-protocol in the browser: `select`/`confirm`/`input`/`editor` dialogs become native modals, `notify` → toasts, `setStatus`/`setWidget` → status & widget bars above the composer, `setTitle` → tab title, `set_editor_text` → composer. Extension-registered slash commands appear in the `/` menu. |
 
-Extras: streaming markdown rendering (code blocks, thinking collapse, live tool-call cards), model & thinking-level pickers, session stats (context %, cost) in the sidebar, queue display with steer/follow-up, Esc to clear-queue + abort, agent crash banner with one-click restart.
+Extras: streaming markdown rendering (code blocks, thinking collapse, live tool-call cards), model & thinking-level pickers (the model list is searchable and scrolls, however many you have), session stats (context %, cost, tokens/sec that stay on screen after the turn ends), queue display with steer/follow-up, Esc to clear-queue + abort, agent crash banner with one-click restart.
 
 ## Run it
 
 > This machine runs Forgejo on port 3000, so the WebUI uses **http://localhost:3080**.
+
+There are three ways in: the **browser UI** (`start-webui.bat`), the same UI in **its own window** with no build step (`start-app-window.bat`, Edge/Chrome app mode), or the **native Windows app** (`start-app.bat`, source in `pi-desktop/`).
 
 ### Choosing the agent source (first run)
 
@@ -72,6 +76,43 @@ npm start                # serves http://localhost:3080 by default (set PORT to 
 
 Env vars for the bridge: `PORT` (3000), `PI_COMMAND` (default `pi --mode rpc`), `WORKSPACE_DIR` (agent cwd), `PI_SESSION_DIR` (default `~/.pi/agent/sessions`).
 
+### App window, no toolchain (start-app-window.bat)
+
+```
+start-app-window.bat
+```
+
+Opens the same web UI as its own window instead of a browser tab, using
+Edge/Chrome app mode (no tabs, no address bar), and starts the bridge first if
+nothing is listening on port 3080. Nothing to install and nothing to compile;
+the default browser is used when no Chromium browser is found.
+
+This is the recommended way to run it as an app. The native shell below looks
+slightly more native but needs the C++ toolchain described there.
+
+### Native desktop app (pi-desktop/)
+
+The `pi-desktop/` folder is a **React Native for Windows** app: a WebView2 host
+around the same `web/` UI, plus native extras the browser cannot do — the
+Instagram / TikTok / YouTube Shorts feed renders in a real WebView2 surface, so
+`X-Frame-Options: DENY` does not apply, and the feed can auto-open while the
+agent runs.
+
+```
+start-app.bat
+```
+
+That starts the bridge if needed, installs the app's npm dependencies, builds it
+when there is no build yet, and launches it. The first build compiles the C++
+React Native Windows runtime and takes 5-20 minutes; afterwards
+`pi-desktop\windows\x64\Release\PiAgent.exe` starts directly.
+
+Building needs **Visual Studio 2022 with the "Desktop development with C++"
+workload and the Windows 11 SDK (10.0.26100)**, which is a few gigabytes of
+download — that is the reason `start-app-window.bat` exists. The project files
+are committed (only build output is ignored), so a clone builds as-is once the
+toolchain is present; see `pi-desktop/README.md` for the details.
+
 ### Try it without any agent (UI smoke test)
 
 ```powershell
@@ -88,6 +129,7 @@ $env:PI_COMMAND="node mock_agent.js"; npm start
 - **TTS** uses the Windows voices installed on the *client* machine (browser-side speech synthesis).
 - If the header dot is red, the WebSocket is down — the banner offers a retry. If pi itself crashes, the banner offers **Restart agent** (spawns a fresh `pi --mode rpc`, same session).
 - Session listing scans `PI_SESSION_DIR` for `*.jsonl` (recursively). Set it to `docker:<container>:<path>` to list sessions inside a container via `docker exec`, or a plain host path for a native pi install.
+- **Renamed or moved the project folder?** Each session records the working directory it was taken in, and pi refuses to open a session whose folder is gone. When you click such a session the WebUI says which folder is missing and offers to recreate it; saying yes puts the (empty) folder back and opens the session, so nothing is lost.
 - No authentication is included — keep the port bound to localhost (the default).
 - RPC notes: prompts sent while the agent streams are queued with `streamingBehavior: "steer"`; `Esc` sends `clear_queue` then `abort` (queued text is restored into the composer).
 
@@ -95,6 +137,8 @@ $env:PI_COMMAND="node mock_agent.js"; npm start
 
 ```
 start-webui.bat         launcher: pick native pi or a Docker container, then serve :3080
+start-app-window.bat    same UI in its own app window (Edge/Chrome app mode), no toolchain needed
+start-app.bat           native React Native for Windows app (builds pi-desktop/, needs Visual Studio)
 switch_pi_agent_source.bat  re-run the source picker, then launch
 Dockerfile              container image (node + pi CLI + bridge + web)
 docker-compose.yml      alternative: dedicated container with bundled pi, port 3080

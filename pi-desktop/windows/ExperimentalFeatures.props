@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <PropertyGroup Label="Microsoft.ReactNative Experimental Features">
+    <!--
+      Required for building a New Architecture project.
+
+      App projects should not change this value.
+
+      See https://microsoft.github.io/react-native-windows/docs/new-architecture
+    -->
+    <RnwNewArch>true</RnwNewArch>
+
+    <!--
+      Changes compilation to assume use of Microsoft.ReactNative NuGet packages
+      instead of building the framework from source. Defaults to true.
+
+      This is set during app project creation and should not be changed.
+
+      See https://microsoft.github.io/react-native-windows/docs/nuget
+    -->
+    <UseExperimentalNuget>true</UseExperimentalNuget>
+
+    <ReactExperimentalFeaturesSet>true</ReactExperimentalFeaturesSet>
+  </PropertyGroup>
+
+  <PropertyGroup Label="New Architecture">
+    <!--
+      Mirror ReactNativeArchitecture.props here, because it is imported far too late
+      for community modules.
+
+      That file sets UseHermes / UseFabric / UseWinUI3 = true for RnwNewArch projects,
+      but it is pulled in by Microsoft.ReactNative.WindowsSdk.Default.props, which
+      community module projects import around line 40. Projects such as
+      @react-native-async-storage/async-storage pick their Win32 vs legacy-UWP layout
+      with a <Choose> on $(UseFabric) at the very top of the project, before that
+      import runs. The property is therefore still empty, the <Choose> takes the
+      legacy UWP branch (AppContainerApplication=true), and the build dies with
+      "The BaseOutputPath/OutputPath property is not set" because the UWP toolset and
+      MSIX packaging components are not installed.
+
+      This file is imported first (line 4 of every RNW project), so defining the values
+      here makes those <Choose> blocks resolve correctly.
+    -->
+    <UseHermes Condition="'$(RnwNewArch)' == 'true'">true</UseHermes>
+    <UseFabric Condition="'$(RnwNewArch)' == 'true'">true</UseFabric>
+    <UseWinUI3 Condition="'$(RnwNewArch)' == 'true'">true</UseWinUI3>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Visual Studio Toolset Compatibility">
+    <!--
+      Workaround for building RNW with Visual Studio 2026 (MSBuild 18.x / VCTargetsPath v180).
+
+      RNW's Microsoft.ReactNative.vcxproj and PropertySheets\React.Cpp.props both compare
+      $(PlatformToolsetVersion) numerically (less than 145) to decide whether to pass /await
+      to cl.exe. That property used to be defined by Microsoft.Cpp.Default.props, but VS 2026
+      moved it into Microsoft.Cpp.VCTools.props, which is imported later, by Microsoft.Cpp.props.
+      RNW evaluates the comparison before that, so the value is still empty and MSBuild aborts
+      with MSB4086 (a numeric comparison was attempted on a property that evaluates to empty).
+
+      This file is imported at the very top of every React Native Windows project (the app,
+      Microsoft.ReactNative, and community modules such as react-native-webview), i.e. before
+      the comparisons run, so defining the value here fixes the build without patching
+      node_modules. 145 is the VS 2026 toolset (v145); 143 is the VS 2022 toolset (v143).
+    -->
+    <PlatformToolsetVersion Condition="'$(PlatformToolsetVersion)' == '' and '$(VisualStudioVersion)' == '18.0'">145</PlatformToolsetVersion>
+    <PlatformToolsetVersion Condition="'$(PlatformToolsetVersion)' == ''">143</PlatformToolsetVersion>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Windows App SDK">
+    <!--
+      Windows App SDK 1.8 verifies that every transitive framework package it needs
+      (Base, Foundation, InteractiveExperiences, WinUI, DWrite, Widgets, AI, ML,
+      Runtime) is explicitly referenced, and fails the build of native modules that
+      only pull in the umbrella Microsoft.WindowsAppSDK package, which is what
+      react-native-windows 0.84 and the community modules do.
+
+      The Windows App SDK runtime is installed on this machine, and the RNW app
+      itself carries the framework reference, so the check is purely advisory here.
+    -->
+    <WindowsAppSDKVerifyTransitiveDependencies Condition="'$(WindowsAppSDKVerifyTransitiveDependencies)' == ''">false</WindowsAppSDKVerifyTransitiveDependencies>
+  </PropertyGroup>
+
+</Project>
