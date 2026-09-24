@@ -14,18 +14,24 @@
   <!-- ══════════ Sidebar ══════════ -->
   <aside id="sidebar">
     <div class="sidebar-head">
-      <span id="sidebar-avatar" class="avatar-wrap" hidden></span>
-      <span class="logo" id="agent-title">pi agent</span>
+      <!-- Who you are looking at. The picture and the name are the button: clicking
+           them switches instance (or adds one), right-clicking a row removes it. -->
+      <button id="btn-instance" class="instance-head" title="pi agent instances — click to switch or add another one">
+        <span id="sidebar-avatar" class="avatar-wrap" hidden></span>
+        <span class="instance-labels">
+          <span class="logo" id="instance-name">pi agent</span>
+          <span class="instance-sub" id="instance-sub">this machine</span>
+        </span>
+        <span class="instance-caret" aria-hidden="true">▾</span>
+      </button>
       <button id="btn-new-session" class="btn primary" title="Start a new session">+ New</button>
     </div>
     <div class="sidebar-search">
       <input id="session-filter" type="search" placeholder="Filter sessions…">
+      <button id="btn-new-folder" class="btn icon" title="New folder — group sessions by hand (or drag one onto it)">＋</button>
       <button id="btn-refresh-sessions" class="btn icon" title="Refresh session list">⟳</button>
     </div>
     <div id="session-list" class="session-list"></div>
-    <div class="sidebar-foot">
-      <button id="btn-instance" class="btn small instance-btn" title="Switch pi agent instance">this machine</button>
-    </div>
   </aside>
 
   <!-- ══════════ Main ══════════ -->
@@ -33,20 +39,38 @@
     <header id="topbar">
       <button id="btn-toggle-sidebar" class="btn icon" title="Toggle sidebar">☰</button>
       <input id="session-name" class="session-name" placeholder="Unnamed session" title="Click to rename">
+      <!-- Subagents the agent has running right now: a job that takes minutes
+           should not look like a spinner somewhere in the transcript. -->
+      <button id="btn-subagents" class="btn small hidden" title="Subagents running in this session">sub-agents <span id="subagents-count">0</span></button>
       <button id="btn-reels" class="btn">Reels</button>
       <button id="reels-pill" class="reels-pill hidden" title="Close the split feed panel"><span>◧ Reels</span></button>
       <button id="btn-settings" class="btn icon" title="Settings: agent name, avatar, TTS voice, voice input, thinking, theme">⚙</button>
       <button id="btn-tts" class="btn toggle" title="Speak agent replies out loud (TTS)">TTS off</button>
+      <!-- Everything the app said and everything that went wrong, with the time
+           it happened: toasts vanish after five seconds, and an error that came
+           and went while you were reading the chat was simply gone. -->
+      <button id="btn-bell" class="btn small bell" title="Recent notifications and errors">Notifications<span id="bell-count" class="bell-count hidden">0</span></button>
       <span id="conn-dot" class="conn-dot" title="Connection status"></span>
     </header>
 
     <div id="banner" class="banner hidden"></div>
 
+    <!-- Shown while the page is looking at another instance through the local
+         bridge. The way out is here, not in a browser's back button. -->
+    <div id="remote-banner" class="remote-banner hidden"></div>
+
     <!-- "Viewing another session" banner (the agent runs in its own). -->
     <div id="view-banner" class="view-banner hidden"></div>
 
+    <!-- The chat column scrolls, not the message list inside it. The scrollbar
+         then runs all the way to the bottom of the window (like the session list)
+         instead of stopping at the top of the composer, and typing - which makes
+         the composer taller - does not shorten it. The composer is docked to the
+         bottom of this scroller, so it stays where it is while you scroll. -->
+    <div id="chat-scroll">
     <div id="chat"></div>
 
+    <div id="composer-dock">
     <div id="queue-bar" class="queue-bar hidden"></div>
     <div id="widget-bar" class="widget-bar hidden"></div>
     <div id="status-bar" class="status-bar hidden"></div>
@@ -61,7 +85,7 @@
       <div class="composer-row">
         <button id="btn-attach" class="btn icon" title="Attach image / PDF / audio / video">+</button>
         <input id="file-input" type="file" accept="image/*,application/pdf,audio/*,video/*,.pdf" multiple hidden>
-        <textarea id="input" rows="1" placeholder="Message the agent" autocomplete="off"></textarea>
+        <textarea id="input" rows="1" placeholder="Message the agent" autocomplete="off" spellcheck="true"></textarea>
         <button id="btn-mic" class="btn icon" title="Voice to text">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
         </button>
@@ -89,10 +113,15 @@
         <button id="thinking-btn" class="btn pill" title="Thinking level">off</button>
       </div>
     </div>
+    </div>
+    </div>
 
     <!-- Searchable model list (the hidden select above stays the source of truth) -->
     <div id="model-menu" class="model-menu hidden">
-      <input id="model-search" type="search" placeholder="Search models…" autocomplete="off" spellcheck="false">
+      <div class="model-search-row">
+        <input id="model-search" type="search" placeholder="Search models…" autocomplete="off" spellcheck="false">
+        <button id="model-refresh" class="btn icon" title="Reload the model list (and re-scan llama.cpp servers)"><span class="ico">⟳</span></button>
+      </div>
       <div id="model-list" class="model-list"></div>
     </div>
   </main>
@@ -179,10 +208,44 @@
 <!-- First-launch setup (one-time) -->
 <dialog id="setup-dialog">
   <h3>Welcome to Pi Agent</h3>
-  <p class="setup-sub">One-time setup — you can change all of this later in ⚙ Settings.</p>
+  <p class="setup-sub">One-time setup — everything here can be changed later in ⚙ Settings.</p>
   <div class="settings-grid">
     <label>Agent name</label>
     <input id="setup-agent-name" type="text" placeholder="pi" autocomplete="off">
+    <label>Profile image</label>
+    <div class="avatar-row">
+      <span id="setup-avatar-preview" class="avatar-wrap avatar-big"></span>
+      <button id="setup-avatar-upload" class="btn small">upload…</button>
+      <button id="setup-avatar-clear" class="btn small">clear</button>
+    </div>
+    <label>Theme color</label>
+    <div class="rate-row">
+      <input id="setup-accent" type="color" value="#5b9dff">
+      <button id="setup-accent-reset" class="btn small">default</button>
+    </div>
+    <label></label>
+    <label class="check-label"><input id="setup-gamer" type="checkbox"> gamer mode — let the theme colour drift through the rainbow</label>
+    <label id="setup-gamer-speed-label" class="hidden">Colour cycle</label>
+    <div class="rate-row hidden" id="setup-gamer-speed-row">
+      <input id="setup-gamer-speed" type="range" min="4" max="60" step="2" value="16">
+      <span id="setup-gamer-speed-val">16s</span>
+    </div>
+    <label>Text size</label>
+    <div class="rate-row">
+      <input id="setup-font-size" type="range" min="12" max="22" step="1" value="14">
+      <span id="setup-font-size-val">14px</span>
+    </div>
+    <label>Background</label>
+    <div class="rate-row">
+      <button id="setup-bg-upload" class="btn small">upload a picture or video…</button>
+      <button id="setup-bg-clear" class="btn small">clear</button>
+    </div>
+    <label>When the agent finishes</label>
+    <label class="check-label"><input id="setup-done-sound" type="checkbox"> play a sound</label>
+    <label></label>
+    <label class="check-label"><input id="setup-done-notify" type="checkbox"> desktop notification</label>
+    <label>Voice input</label>
+    <label class="check-label"><input id="setup-voice-autosend" type="checkbox"> send as soon as the mic stops</label>
     <label>Shorts feed</label>
     <select id="setup-shorts-provider">
       <option value="instagram">Instagram Reels</option>
@@ -190,12 +253,14 @@
       <option value="youtube">YouTube Shorts</option>
       <option value="none">None (hide the button)</option>
     </select>
-    <label>Theme color</label>
-    <div class="rate-row">
-      <input id="setup-accent" type="color" value="#5b9dff">
-      <button id="setup-accent-reset" class="btn small">default</button>
-    </div>
+    <label>Network</label>
+    <label class="check-label"><input id="setup-lan" type="checkbox"> let other devices on this network open this WebUI</label>
   </div>
+  <p class="setup-sub">Worth knowing: the <b>sub-agents</b> button in the top bar shows what each child agent is
+    doing and opens its own conversation, fork paths in the session list can be <b>folded away</b> with the
+    arrow, the timer at the bottom counts the whole task (and survives a reload), background images and videos have
+    no size limit (they are stored, never sent to the model), and voice input can run on a local
+    <b>Whisper</b> model from Settings → Voice.</p>
   <div class="dialog-buttons">
     <button id="setup-skip" class="btn">skip</button>
     <button id="setup-done" class="btn primary">Let's go</button>
@@ -203,8 +268,22 @@
 </dialog>
 
 <!-- Settings dialog -->
-<dialog id="settings-dialog">
+<!-- What one subagent wrote, read from the extension's own artifact file. -->
+  <dialog id="subagent-dialog">
+    <h3 id="subagent-title">subagent</h3>
+    <div id="subagent-meta" class="dim"></div>
+    <pre id="subagent-body" class="subagent-body"></pre>
+    <div class="dialog-row">
+      <button id="subagent-copy" class="btn small">copy</button>
+      <button id="subagent-close" class="btn primary">close</button>
+    </div>
+  </dialog>
+
+  <dialog id="settings-dialog">
   <h3>Settings</h3>
+  <!-- While you are looking at another instance, its own face (name, picture,
+       background) is not something these settings change. -->
+  <div class="hint hidden" id="remote-settings-note"></div>
   <div class="tabs" id="settings-tabs">
     <button class="tab active" data-tab="general">General</button>
     <button class="tab" data-tab="voice">Voice</button>
@@ -240,6 +319,16 @@
       <label class="check-label"><input id="set-expand-tools" type="checkbox"> auto-expand tool call output</label>
       <label>Compaction</label>
       <label class="check-label"><input id="set-auto-continue" type="checkbox"> auto-continue the task after compaction</label>
+      <label>When the agent finishes</label>
+      <label class="check-label"><input id="set-done-sound" type="checkbox"> play a sound</label>
+      <label></label>
+      <label class="check-label"><input id="set-done-notify" type="checkbox"> desktop notification</label>
+      <label></label>
+      <label class="check-label"><input id="set-done-only-unfocused" type="checkbox"> only when this window is not focused</label>
+      <label>Network</label>
+      <label class="check-label"><input id="set-lan" type="checkbox"> let other devices on this network open this WebUI</label>
+      <label></label>
+      <div class="hint" id="lan-hint"></div>
     </div>
   </div>
 
@@ -272,14 +361,29 @@
       <label>Whisper endpoint</label>
       <input id="set-stt-endpoint" type="text" placeholder="http://localhost:8081/inference (filled in automatically)">
       <label>TTS backend</label>
-      <select id="set-tts-backend"><option value="browser">Browser voices</option><option value="endpoint">Local TTS server (Piper etc.)</option></select>
-      <label>TTS server URL</label>
+      <select id="set-tts-backend">
+        <option value="browser">Browser voices (built in, nothing to set up)</option>
+        <option value="endpoint">Local TTS server — Piper, Kokoro, openedai-speech…</option>
+        <option value="fish">Fish Audio (cloud — cloned voices)</option>
+        <option value="openai">OpenAI-compatible cloud (OpenAI, Groq, DeepInfra…)</option>
+      </select>
+      <label id="tts-endpoint-label">TTS server URL</label>
       <input id="set-tts-endpoint" type="text" placeholder="http://localhost:8880/v1/audio/speech">
-      <label>TTS model / voice</label>
+      <label id="tts-model-label">TTS model / voice</label>
       <div class="rate-row">
         <input id="set-tts-model" type="text" placeholder="model, e.g. piper">
         <input id="set-tts-voice-name" type="text" placeholder="voice, e.g. en_US-amy-medium">
       </div>
+      <label id="tts-cloud-key-label" class="hidden">Cloud API key</label>
+      <input id="set-tts-apikey" class="hidden" type="password" placeholder="sk-… — kept on this machine, sent by the bridge" autocomplete="off">
+      <label id="tts-cloud-model-label" class="hidden">Cloud model</label>
+      <input id="set-tts-cloud-model" class="hidden" type="text" placeholder="fish: s1 · openai: tts-1 or gpt-4o-mini-tts">
+      <label id="tts-cloud-voice-label" class="hidden">Cloud voice</label>
+      <input id="set-tts-cloud-voice" class="hidden" type="text" placeholder="fish: a reference id · openai: alloy / nova / …">
+      <label id="tts-cloud-url-label" class="hidden">Service URL</label>
+      <input id="set-tts-cloud-url" class="hidden" type="text" placeholder="https://api.fish.audio · https://api.openai.com">
+      <label></label>
+      <div class="hint hidden" id="tts-cloud-note"></div>
     </div>
   </div>
 
@@ -290,6 +394,13 @@
         <input id="set-accent" type="color" value="#5b9dff">
         <button id="btn-accent-reset" class="btn small">default</button>
       </div>
+      <label></label>
+      <label class="check-label"><input id="set-gamer" type="checkbox"> gamer mode — let the theme colour drift through the rainbow</label>
+      <label id="gamer-speed-label" class="hidden">Colour cycle</label>
+      <div class="rate-row hidden" id="gamer-speed-row">
+        <input id="set-gamer-speed" type="range" min="4" max="60" step="2" value="16">
+        <span id="set-gamer-speed-val">16s</span>
+      </div>
       <label>Background</label>
       <div class="rate-row">
         <input id="set-bg-url" type="text" placeholder="image / GIF / video URL">
@@ -297,6 +408,18 @@
         <button id="btn-bg-crop" class="btn small">crop…</button>
         <button id="btn-bg-clear" class="btn small">clear</button>
         <input id="bg-input" type="file" accept="image/*,video/*,.gif,.mp4,.webm,.mov" hidden>
+      </div>
+      <label>Background transparency</label>
+      <div class="rate-row">
+        <input id="set-bg-opacity" type="range" min="0" max="100" step="5">
+        <span id="set-bg-opacity-val">100%</span>
+      </div>
+      <label>Background sound</label>
+      <label class="check-label"><input id="set-bg-audio" type="checkbox"> play a background video's audio</label>
+      <label>Background volume</label>
+      <div class="rate-row">
+        <input id="set-bg-volume" type="range" min="0" max="100" step="5">
+        <span id="set-bg-volume-val">50%</span>
       </div>
       <label>Chatbox transparency</label>
       <div class="rate-row">

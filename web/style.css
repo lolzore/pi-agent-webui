@@ -15,6 +15,10 @@
   --mono: ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace;
   --chat-font: "Segoe UI", system-ui, -apple-system, sans-serif;
   --chat-size: 14px;
+  /* --chat-size / 14, set from the text-size setting: every fixed size inside the
+     conversation (thinking blocks, code, tool cards, the message header) is
+     written as calc(<size>px * var(--chat-scale)) so one slider moves all of it. */
+  --chat-scale: 1;
   --ui-alpha: 1;
   --outline-color: #000;
   --avatar-size: 34px;
@@ -25,6 +29,7 @@
  * handles static images / GIFs). Kept out of the layout entirely. */
 #bg-media {
   position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden;
+  user-select: none;
   /* centred so a cropped picture (which is bigger than the frame) stays put
    * inside it, and the frame does the clipping */
   display: flex; align-items: center; justify-content: center;
@@ -58,8 +63,36 @@ body {
 }
 body.sidebar-hidden #sidebar { display: none; }
 .sidebar-head {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 12px;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 10px 12px;
+}
+/* The instance button is the agent's face and name: one tap to switch, and the
+ * only part of the sidebar that is about a different machine. */
+.instance-head {
+  display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1;
+  background: transparent; border: 1px solid transparent; border-radius: 8px;
+  color: var(--text); padding: 4px 6px; cursor: pointer; text-align: left;
+}
+.instance-head:hover { background: var(--bg-hover); }
+.instance-head.remote { border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: var(--accent-dim); }
+.instance-labels { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; overflow: hidden; }
+/* The name ellipsizes, the buttons next to it keep their size - a long agent
+ * name used to push "+ New" half off the edge. */
+.instance-labels .logo { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#btn-new-session { flex: none; }
+.instance-sub { font-size: 11px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.instance-caret { color: var(--text-dim); font-size: 10px; margin-left: auto; }
+/* avatar per row in the switcher */
+.model-item .menu-avatar {
+  width: 24px; height: 24px; border-radius: 50%; object-fit: cover; flex: none;
+  background: var(--bg-hover); margin-right: 8px;
+}
+.model-item .menu-avatar.empty { display: inline-block; }
+.remote-banner {
+  margin: 8px 12px 0; padding: 7px 10px; border-radius: 8px; font-size: 12.5px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
 }
 .logo { font-weight: 700; font-size: 15px; }
 .sidebar-search { display: flex; gap: 6px; padding: 0 12px 8px; }
@@ -74,10 +107,48 @@ body.sidebar-hidden #sidebar { display: none; }
   margin-bottom: 2px; border: 1px solid transparent;
 }
 .session-item:hover { background: var(--bg-hover); }
+.session-folder {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 8px; margin: 4px 0 2px; border-radius: 6px;
+  font-size: 12px; color: var(--text-dim); cursor: pointer;
+  border: 1px dashed transparent; user-select: none;
+}
+.session-folder:hover { background: var(--bg-hover); color: var(--text); }
+.session-folder.drop { border-color: var(--accent); background: var(--accent-dim); color: var(--text); }
+.session-folder .folder-caret { width: 10px; font-size: 10px; }
+.session-folder .folder-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-folder .folder-count {
+  margin-left: auto; font-size: 10px; padding: 0 5px; border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--text);
+}
+.session-item.dragging { opacity: 0.45; }
+.session-item.drop-line { box-shadow: inset 0 2px 0 0 var(--accent); }
+.session-list.drop-here { outline: 1px dashed var(--accent); outline-offset: -3px; border-radius: 8px; }
+
 .session-item.active { background: var(--accent-dim); border-color: var(--accent); }
+/* The arrow that folds a session's forks away. It was a 10px glyph - too small to
+   hit, especially on a phone - so it is a real button-sized target now (the row
+   itself is still clickable for switching sessions). */
+.session-item .fork-toggle {
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: 0 0 auto;
+  min-width: 24px; height: 22px; padding: 0 6px; margin: 0;
+  font-size: 13px; line-height: 1; font-weight: 600;
+  border-radius: 7px; cursor: pointer; user-select: none;
+  color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+  transition: background .12s ease, transform .12s ease;
+}
+.session-item .fork-toggle:hover { background: color-mix(in srgb, var(--accent) 30%, transparent); transform: scale(1.06); }
+.session-item .fork-toggle:hover { opacity: 1; color: var(--accent); }
+
 .session-item .s-name {
   font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  /* the fold arrow is a real button, so the row has to make room for it instead of
+     letting it sit on top of the date/size line below */
+  display: flex; align-items: center; gap: 6px; min-height: 22px;
 }
+.session-item .s-name > .name-text { overflow: hidden; text-overflow: ellipsis; }
 .session-item .s-meta { font-size: 11px; color: var(--text-dim); }
 .sidebar-foot {
   border-top: 1px solid var(--border);
@@ -103,6 +174,41 @@ body.sidebar-hidden #sidebar { display: none; }
 }
 .session-name:hover { border-color: var(--border); }
 .session-name:focus { border-color: var(--accent); outline: none; background: var(--bg-elev); }
+/* the bell: unnoticed errors keep a mark on it until the list is opened */
+#btn-bell { position: relative; }
+#btn-bell.has-error { border-color: var(--red); color: var(--red); }
+.bell-count {
+  position: absolute; top: -7px; right: -7px; min-width: 15px; height: 15px;
+  border-radius: 999px; background: var(--accent); color: #08101c;
+  font-size: 10px; font-weight: 700; line-height: 15px; text-align: center; padding: 0 3px;
+}
+#btn-bell.has-error .bell-count { background: var(--red); color: #fff; }
+/* a dropdown that replaced a native <select>: the element stays for the code,
+   the button is what people see */
+.pretty-source { display: none !important; }
+.pretty-wrap { display: inline-flex; min-width: 0; width: 100%; }
+.pretty-wrap .pretty-select { flex: 1; }
+/* The gamer speed row is two cells (label + slider); keeping it in one wrapper
+   would leave a gap in the label column. */
+.pretty-select { min-width: 140px; max-width: 100%; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pretty-select::after { content: ' ▾'; color: var(--text-dim); }
+/* a subagent's conversation inside its dialog */
+.subagent-body { max-height: 55vh; overflow: auto; margin: 8px 0; padding: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+.sub-msg { margin-bottom: 10px; }
+.sub-msg .sub-who { font-size: 11px; text-transform: uppercase; letter-spacing: .4px; color: var(--text-dim); margin-bottom: 3px; }
+.sub-msg.user .sub-who { color: var(--accent); }
+.sub-msg.assistant .sub-body, .sub-msg.toolResult .sub-body {
+  background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px;
+}
+.sub-msg.toolResult .sub-body { font-family: var(--mono); font-size: 12px; color: var(--text-dim); white-space: pre-wrap; }
+.sub-msg .sub-body p { margin: 0 0 6px; }
+.sub-msg .sub-body p:last-child { margin-bottom: 0; }
+
+.fav-source {
+  position: fixed; left: -4px; top: -4px; width: 2px; height: 2px;
+  opacity: 0.01; pointer-events: none; z-index: -1;
+}
+
 .conn-dot {
   width: 10px; height: 10px; border-radius: 50%;
   background: var(--red); flex-shrink: 0;
@@ -320,8 +426,33 @@ body.hide-thinking details.thinking { display: none; }
   max-width: 860px; margin: 6px auto 0;
   display: flex; align-items: center; justify-content: flex-start;
   gap: 12px; font-size: 12px; color: var(--text-dim);
+  /* One line, always. This row used to wrap when it ran out of room, and since the
+     numbers grow while the agent works, the row folded and unfolded with them - the
+     whole dock (composer included) moved up and down by 26px. The width at which
+     things get tight is a property of the window, so the squeeze has to be taken
+     by the elastic parts (the model and thinking pills, which truncate) and never
+     by the layout. */
+  flex-wrap: nowrap;
+  min-height: 44px;
 }
+/* The ring, the ctx label and the total never shrink and never paint outside
+   their box (that is what ran the ctx label into the token counter). */
+#stats-bar .ctx-ring, #ctx-label, #stat-turn { flex: 0 0 auto; }
+/* The token counter is the long one and the least important, so it truncates -
+   the ring and the label next to it carry the same information. The controls keep
+   a readable width; squeezing them to 50px was worse than clipping a number. */
+#stat-tokens, #stat-cost { flex: 0 1 auto; min-width: 44px; overflow: hidden; text-overflow: ellipsis; }
+#stats-bar select, #stats-bar .btn.pill { flex: 0 0 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#model-btn { max-width: 200px; }
 #stats-bar .stats-spacer { flex: 1; }
+/* Numbers that grow while the agent runs: fixed-width digits, and enough room
+   reserved for the longest form so the row never rewraps as the seconds tick.
+   An empty counter reserves nothing at all. */
+#stats-bar > span { font-variant-numeric: tabular-nums; white-space: nowrap; min-width: 0; }
+#stat-turn { min-width: 12ch; }
+#stat-turn:empty, #stat-cost:empty { min-width: 0; }
+#stat-tokens, #stat-cost { min-width: 12ch; }
+#stat-tokens:empty, #stat-cost:empty { min-width: 0; }
 #stats-bar select { max-width: 150px; font-size: 11.5px; padding: 3px 6px; }
 .ctx-ring { display: inline-flex; align-items: center; }
 .ctx-ring .ring-bg { stroke: var(--bg-hover); }
@@ -333,6 +464,9 @@ body.hide-thinking details.thinking { display: none; }
 .ctx-label {
   font-family: var(--mono); font-size: 11px; color: var(--text-dim);
   white-space: nowrap; min-width: 1px;
+  /* never shrink below the text and never paint outside the box - it used to do
+     both, over the token counter */
+  flex: 0 0 auto; overflow: hidden; text-overflow: ellipsis;
 }
 #stat-tokens { font-family: var(--mono); font-size: 11.5px; }
 
@@ -348,6 +482,11 @@ body.hide-thinking details.thinking { display: none; }
 .settings-grid textarea {
   width: 100%; box-sizing: border-box;
   font: 12px var(--mono); resize: vertical;
+}
+/* a row that will take the file you are dragging over it */
+.drop-ok {
+  outline: 2px dashed var(--accent); outline-offset: 3px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent); border-radius: 8px;
 }
 .avatar-row { display: flex; align-items: center; gap: 8px; }
 .rate-row { display: flex; align-items: center; gap: 8px; }
@@ -437,18 +576,34 @@ dialog#setup-dialog h3 { margin: 0 0 2px; }
 .view-banner .btn { margin-left: auto; flex: none; }
 
 /* ───────────────────────── chat ───────────────────────── */
-#chat {
-  flex: 1; overflow-y: auto; padding: 16px 12px 8px;
-  font-family: var(--chat-font); font-size: var(--chat-size);
-  /* Content lands above the caret constantly (thinking blocks, tool cards,
-   * rendered markdown). Chromium's scroll anchoring would move scrollTop on
-   * its own, which reads as the user leaving the bottom and silently kills
-   * auto-follow mid-turn. */
-  overflow-anchor: none;
+/* The scroller of the conversation. overflow-anchor off: content lands above
+ * the caret constantly (thinking blocks, tool cards), and Chromium's scroll
+ * anchoring would move scrollTop on its own, which reads as the user leaving the
+ * bottom and silently kills auto-follow mid-turn. */
+#chat-scroll {
+  flex: 1; min-height: 0; display: flex; flex-direction: column;
+  overflow-y: auto; overflow-x: hidden; overflow-anchor: none;
+  scrollbar-gutter: stable;
+  /* Over-scrolling (a trackpad flick past the end) rubber-banded the whole
+     transcript - and the sticky composer with it - upwards and then back, which
+     during a run looked exactly like the UI jumping. */
+  overscroll-behavior: contain;
 }
+html, body { overscroll-behavior: none; }
+#chat {
+  /* Grows to fill the column when the conversation is short (so the composer
+   * stays at the bottom) but is never squeezed: taller than the window and the
+   * scroller above scrolls. */
+  flex: 1 0 auto; padding: 16px 12px 8px;
+  font-family: var(--chat-font); font-size: var(--chat-size);
+}
+/* The composer and the bars above it ride at the bottom of the scroller. Text
+ * scrolls behind them and shows through the translucent panels, blurred by the
+ * backdrop filter they already have. */
+#composer-dock { position: sticky; bottom: 0; z-index: 3; flex: none; }
 .msg { max-width: 860px; margin: 0 auto 14px; }
 .msg .who {
-  font-size: 11px; font-weight: 700; letter-spacing: 0.4px;
+  font-size: calc(11px * var(--chat-scale)); font-weight: 700; letter-spacing: 0.4px;
   text-transform: uppercase; color: var(--text-dim); margin-bottom: 3px;
   display: flex; align-items: center; gap: 6px;
 }
@@ -467,7 +622,7 @@ dialog#setup-dialog h3 { margin: 0 0 2px; }
 .msg .msg-tools { display: inline-flex; gap: 6px; margin-left: 8px; }
 .msg .msg-tools.pending { display: none; } /* live message: buttons appear once the turn is over */
 .msg .msg-tools .btn {
-  font-size: 11px; padding: 1px 8px;
+  font-size: calc(11px * var(--chat-scale)); padding: 1px 8px;
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
 }
@@ -479,14 +634,14 @@ dialog#setup-dialog h3 { margin: 0 0 2px; }
   background: color-mix(in srgb, #0c0e12 calc(var(--ui-alpha) * 100%), transparent);
   border: 1px solid color-mix(in srgb, var(--border) calc(var(--ui-alpha) * 100%), transparent);
   border-radius: 8px; padding: 10px 12px; overflow-x: auto;
-  font: 12.5px/1.5 var(--mono); margin: 8px 0;
+  font-size: calc(12.5px * var(--chat-scale)); line-height: 1.5; font-family: var(--mono); margin: 8px 0;
 }
 .md code.inline {
   background: color-mix(in srgb, #0c0e12 calc(var(--ui-alpha) * 100%), transparent);
   border: 1px solid color-mix(in srgb, var(--border) calc(var(--ui-alpha) * 100%), transparent);
-  border-radius: 4px; padding: 1px 5px; font: 12px var(--mono);
+  border-radius: 4px; padding: 1px 5px; font-size: calc(12px * var(--chat-scale)); font-family: var(--mono);
 }
-.md h1, .md h2, .md h3 { margin: 10px 0 6px; font-size: 15px; }
+.md h1, .md h2, .md h3 { margin: 10px 0 6px; font-size: calc(15px * var(--chat-scale)); }
 .md ul, .md ol { margin: 4px 0 8px; padding-left: 22px; }
 .md a { color: var(--accent); }
 .md blockquote {
@@ -501,7 +656,7 @@ dialog#setup-dialog h3 { margin: 0 0 2px; }
 /* thinking + tool cards */
 details.thinking {
   border: 1px dashed var(--border); border-radius: 8px;
-  padding: 4px 10px; margin: 6px 0; color: var(--text-dim); font-size: 12.5px;
+  padding: 4px 10px; margin: 6px 0; color: var(--text-dim); font-size: calc(12.5px * var(--chat-scale));
 }
 details.thinking summary { cursor: pointer; user-select: none; }
 details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
@@ -512,14 +667,14 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
   background: color-mix(in srgb, #141821 calc(var(--ui-alpha) * 100%), transparent);
   backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 10px));
   -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 10px));
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--chat-scale));
 }
 .tool-card .tool-head {
   display: flex; align-items: center; gap: 8px;
   padding: 6px 10px; cursor: pointer; user-select: none;
 }
 .tool-card .tool-name { font-family: var(--mono); font-weight: 600; color: var(--yellow); }
-.tool-card .tool-state { margin-left: auto; font-size: 11px; color: var(--text-dim); }
+.tool-card .tool-state { margin-left: auto; font-size: calc(11px * var(--chat-scale)); color: var(--text-dim); }
 .tool-card .tool-state.done { color: var(--green); }
 .tool-card .tool-state.error { color: var(--red); }
 /* The three "..." dots bob in a wave; the "running" text next to them does not
@@ -535,7 +690,7 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
 .tool-card .tool-state .streaming-dots .dot:nth-child(3) { animation-delay: .32s; }
 .tool-card .tool-body {
   border-top: 1px solid var(--border); padding: 8px 10px;
-  font-family: var(--mono); font-size: 12px; white-space: pre-wrap;
+  font-family: var(--mono); font-size: calc(12px * var(--chat-scale)); white-space: pre-wrap;
   max-height: 260px; overflow-y: auto; word-break: break-word;
 }
 .bash-card .tool-name { color: var(--green); }
@@ -546,14 +701,40 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
   background: var(--accent); vertical-align: text-bottom;
   animation: pulse 0.8s infinite; border-radius: 2px;
 }
-.agent-stats { color: var(--text-dim); font-weight: 400; font-size: 10.5px; letter-spacing: 0; text-transform: none; }
+.agent-stats { color: var(--text-dim); font-weight: 400; font-size: calc(10.5px * var(--chat-scale)); letter-spacing: 0; text-transform: none; }
+
+/* The message header carries numbers that grow while it streams (tokens read and
+   written, t/s). As plain inline text, a longer number pushed the row onto a
+   second line and a shorter one pulled it back - so the message grew and shrank
+   as it streamed and the whole conversation moved up and down with it. Laid out
+   as a flex row where the stats may shrink, the row keeps one line: the label
+   gets an ellipsis instead of rewrapping, and its title carries the full text. */
+.msg.assistant .who { display: flex; flex-wrap: wrap; align-items: center; }
+.msg.assistant .who > * { flex: 0 0 auto; }
+.msg.assistant .who > .agent-stats {
+  flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+}
 
 /* ───────────────────────── bars + composer ───────────────────────── */
+/* A bar above the composer must not change the layout while it is up: every
+   pixel of its height is a pixel the transcript moves. An extension widget that
+   goes from one line to two - or that is cleared for a single frame between
+   updates - used to resize the whole dock, and with it the visible conversation.
+   That was "the UI jumps up and down while the agent is running". */
 .queue-bar, .widget-bar, .status-bar {
+  scrollbar-gutter: stable;
   max-width: 860px; width: calc(100% - 24px); margin: 0 auto;
-  font-size: 12px; color: var(--text-dim);
+  font-size: calc(12px * var(--chat-scale)); color: var(--text-dim);
 }
-.queue-bar { padding: 2px 0; }
+.queue-bar {
+  padding: 2px 0;
+  /* one line, always: the chips used to wrap onto a second line as more messages
+     were queued, which resized the dock and moved the composer and stats with it */
+  height: calc(1.9em + 4px); overflow-x: auto; overflow-y: hidden;
+  white-space: nowrap; scrollbar-width: none;
+}
+.queue-bar::-webkit-scrollbar { display: none; }
 .queue-chip {
   display: inline-block;
   background: color-mix(in srgb, var(--bg-elev) calc(var(--ui-alpha) * 100%), transparent);
@@ -566,8 +747,26 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
   border: 1px solid color-mix(in srgb, var(--border) calc(var(--ui-alpha) * 100%), transparent);
   border-radius: 8px;
   padding: 6px 10px; margin-bottom: 4px; white-space: pre-wrap; color: var(--text);
+  /* one height whatever it holds; anything longer scrolls inside it */
+  height: calc(3.2em + 12px); overflow-y: auto;
 }
-.status-bar { padding: 2px 4px; display: flex; gap: 14px; flex-wrap: wrap; }
+.status-bar {
+  padding: 2px 4px; display: flex; gap: 14px; flex-wrap: wrap;
+  /* one line, always: it used to grow to two when a second status appeared, which
+     moved everything below it */
+  height: 1.6em; max-height: 1.6em; overflow-y: auto;
+}
+/* While the agent is running, a bar that has been cleared for a moment keeps its
+   box. Extensions set and clear their status/widget constantly during a run (an
+   MCP server connecting, the sub-agent widget), and every appear/disappear
+   resized the dock - the composer and stats row went with it. Released on run end,
+   so nothing is wasted while idle. */
+body.run-active .queue-bar.hidden,
+body.run-active .widget-bar.hidden,
+body.run-active .status-bar.hidden {
+  /* .hidden is display:none !important, so this has to out-specify it */
+  display: block !important; visibility: hidden;
+}
 
 /* No slab behind the whole composer strip: only the actual controls carry a
  * background, so typing more (or adding attachments) never stretches a dark bar
@@ -586,7 +785,7 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
 .edit-banner {
   max-width: 860px; margin: 0 auto 6px;
   background: #2b2410; border: 1px solid var(--yellow); border-radius: 8px;
-  padding: 6px 10px; font-size: 12.5px; display: flex; justify-content: space-between;
+  padding: 6px 10px; font-size: calc(12.5px * var(--chat-scale)); display: flex; justify-content: space-between;
   align-items: center; gap: 8px;
 }
 .attachments {
@@ -600,7 +799,7 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
 .attachment .rm {
   position: absolute; top: -6px; right: -6px; width: 18px; height: 18px;
   border-radius: 50%; background: var(--red); color: #fff; border: none;
-  font-size: 11px; line-height: 18px; text-align: center; cursor: pointer; padding: 0;
+  font-size: calc(11px * var(--chat-scale)); line-height: 18px; text-align: center; cursor: pointer; padding: 0;
 }
 .composer-row {
   max-width: 860px; margin: 0 auto;
@@ -777,14 +976,120 @@ body { display: flex; }
 }
 .font-row input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
 
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
+/* Scrollbars follow the theme colour: the grey ones read as part of the
+ * browser rather than part of the app, and on the sidebar they were hard to see
+ * against the panel at all. */
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-thumb {
+  /* a transparent border + background-clip keeps the thumb visually thinner than
+   * the track that reserves the space */
+  background: color-mix(in srgb, var(--accent) 50%, transparent);
+  border: 2px solid transparent; background-clip: padding-box; border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--accent) 78%, transparent); background-clip: padding-box; }
+::-webkit-scrollbar-track { background: color-mix(in srgb, var(--accent) 9%, transparent); border-radius: 8px; }
+::-webkit-scrollbar-corner { background: transparent; }
+/* standards version (Firefox, Chrome 121+) */
+/* The highlight you drag over text is the one accent-coloured thing the plain
+ * theme did not set, which left the browser's default blue next to everything
+ * else - and left it out of gamer mode entirely. */
+::selection { background: color-mix(in srgb, var(--accent) 42%, transparent); color: var(--text); }
+* { scrollbar-color: color-mix(in srgb, var(--accent) 55%, transparent) color-mix(in srgb, var(--accent) 10%, transparent); scrollbar-width: thin; }
 
+/* ───────────────────────── long content ─────────────────────────────────
+ * A model can emit one enormous unbroken line (a minified file, a URL, a base64
+ * blob). Without this the line widened the transcript and the whole chat could
+ * be scrolled sideways, which is never what you want: the text wraps, and only
+ * a code block itself scrolls. */
+#chat-scroll { overflow-x: hidden; }
+.msg, .msg .body, .msg .bubble, .msg .text, .who, .tool-card, .tool-card .tool-out,
+.tool-card .tool-name, .queue-item, .status-bar, #view-banner, .edit-banner,
+.stt-transcript, .agent-stats, .attachments {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+}
+/* code keeps its shape but scrolls inside its own box */
+.msg pre, .tool-card pre, .codebox pre, .md pre, pre {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.msg code { overflow-wrap: anywhere; }
+.msg a { overflow-wrap: anywhere; }
+
+/* ───────────────────────── mobile / narrow windows ───────────────────────
+ * A phone (or a narrow side window) used to show a topbar whose session name was
+ * squeezed to nothing between the buttons, a stats bar whose numbers drew on top
+ * of each other, and a sidebar that covered a third of the screen. The sidebar is
+ * a drawer here, the topbar wraps onto two rows, and the stats bar wraps rather
+ * than overlapping. */
 @media (max-width: 760px) {
-  #sidebar { position: fixed; z-index: 40; height: 100vh; left: -260px; transition: left .15s; }
-  #sidebar.open { left: 0; }
+  #sidebar {
+    position: fixed; z-index: 40; height: 100vh; height: 100dvh;
+    left: -280px; width: 268px; min-width: 0;
+    transition: left .18s ease;
+  }
+  /* The dimming behind the drawer exists only while the drawer is out. As a plain
+   * rule on #sidebar it painted a 45% black veil over the whole app at every
+   * narrow width, drawer or not - a window under 760px simply looked broken, and
+   * that veil was the "invisible" thing swallowing the UI. */
+  #sidebar.open {
+    left: 0;
+    box-shadow: 0 0 0 100vmax rgba(0, 0, 0, .45);
+  }
   body.sidebar-hidden #sidebar { display: flex; }
+
+  #topbar { flex-wrap: wrap; gap: 6px; padding: 8px 10px; row-gap: 8px; }
+  /* the name gets a row of its own instead of the leftovers between buttons */
+  #session-name { order: -1; flex: 1 1 100%; font-size: 15px; padding: 2px 4px; }
+  #btn-settings, #btn-toggle-sidebar { order: 1; }
+  #btn-tts, #conn-dot { order: 2; }
+  #btn-tts { margin-left: auto; }
+
+  #chat { padding: 10px 10px 4px; }
+  .msg { margin-bottom: 12px; }
+
+  #composer { padding: 4px 8px 8px; }
+  .composer-row { gap: 6px; padding: 6px; }
+  .composer-row .btn.icon { padding: 7px; }
+  #input { font-size: 15px; }               /* 16px avoids the iOS zoom-on-focus */
+
+  /* the stats row wraps into as many lines as it needs, and the least important
+     numbers step aside rather than colliding */
+  /* One row, scrolled sideways instead of wrapped: wrapped, the model and thinking
+     controls ended up on a second row that fell off the bottom of a short screen
+     (and a taller dock is also what pushed them out of reach). The two controls
+     come first so they are always the visible part. */
+  #stats-bar { flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; padding: 4px 6px; gap: 10px; scrollbar-width: none; }
+  #stats-bar::-webkit-scrollbar { height: 0; }
+  #stats-bar #model-btn, #stats-bar #thinking-btn { order: -1; flex: 0 0 auto; }
+  #stats-bar .stats-spacer { order: -1; flex: 0 0 4px; }
+  #stats-bar > span { flex: 0 0 auto; }
+  /* and the dock can never be taller than what it sits in */
+  #composer-dock { max-height: 100%; overflow-y: auto; }
+  .stats-spacer { display: none; }
+  #stat-turn { display: none; }
+  #ctx-label { max-width: 45vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #model-btn.pill { max-width: 44vw; }
+  .ctx-ring svg { width: 30px; height: 30px; }
+
+  /* dialogs go edge to edge: a 560px box on a 412px screen is mostly backdrop */
+  dialog { max-width: 100vw; }
+  dialog#settings-dialog, dialog#setup-dialog, dialog#ask-dialog, dialog#crop-dialog {
+    width: 100vw; max-width: 100vw; height: 100vh; height: 100dvh;
+    max-height: 100dvh; border-radius: 0; margin: 0;
+  }
+  dialog#settings-dialog .settings-grid { grid-template-columns: 1fr; }
+  dialog#settings-dialog .settings-grid > label { margin-top: 6px; }
+
+  /* anything tappable gets a real target */
+  .btn { min-height: 32px; }
+  .session-item { padding: 10px 10px; }
+  .model-menu { left: 8px; right: 8px; width: auto; }
+  .model-item { padding: 9px 10px; }
 }
 
 /* Reels placeholder: the feed cannot be iframed, so the panel offers a real
@@ -836,10 +1141,18 @@ body.text-outline .session-item .s-meta { text-shadow: none; }
   border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.55);
   padding: 8px; display: flex; flex-direction: column; gap: 6px;
 }
+.model-search-row { display: flex; gap: 6px; align-items: stretch; }
 .model-menu input[type="search"] {
   background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px;
   color: var(--text); padding: 6px 8px; font-size: 12.5px;
+  flex: 1; min-width: 0;
 }
+#model-refresh { flex: 0 0 auto; padding: 4px 9px; font-size: 13px; line-height: 1.1; }
+#model-refresh .ico { display: inline-block; }
+/* spin the glyph, not the button box */
+#model-refresh.spinning .ico { animation: model-refresh-spin .7s linear infinite; }
+#model-refresh.spinning { color: var(--accent); }
+@keyframes model-refresh-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .model-list { max-height: 46vh; overflow-y: auto; display: flex; flex-direction: column; }
 .model-group {
   font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px;
@@ -976,13 +1289,6 @@ body.hide-tools .msg.tool { display: none; }
 .session-item.fork { padding: 3px 9px 3px 12px; margin-bottom: 1px; }
 .session-item.fork .s-name { font-size: 12px; }
 .session-item.fork .s-meta { font-size: 10px; opacity: .8; }
-.session-item .fork-toggle {
-  float: right; font-size: 10px; color: var(--accent); cursor: pointer;
-  border: 1px solid var(--accent-dim); border-radius: 999px; padding: 0 6px;
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-}
-.session-item .fork-toggle:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
-
 /* the cropper must always keep its own buttons on screen */
 #crop-dialog { max-height: 92vh; overflow: auto; }
 .crop-stage { max-height: 52vh; }
@@ -1011,3 +1317,15 @@ body.hide-tools .msg.tool { display: none; }
   border: 1px solid var(--border); border-radius: 12px; padding: 16px;
   box-shadow: 0 24px 70px rgba(0, 0, 0, .65);
 }
+
+/* ── this round ──────────────────────────────────────────────────────────
+   A message that has nothing left to show once thinking and/or tool calls are
+   hidden used to stay as a bare header with token counts (a column of empty
+   boxes), the llama.cpp group heading, and the dismiss button for a banner that
+   would otherwise come back on its own. */
+.msg.assistant[data-hollow="1"] { display: none; }
+.prov-group {
+  margin: 2px 0 8px; font-size: 11.5px; letter-spacing: .3px; text-transform: uppercase;
+  color: var(--text-dim);
+}
+.banner-x { margin-left: 8px; padding: 2px 8px; line-height: 1.2; }

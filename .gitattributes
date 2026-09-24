@@ -1,2 +1,4 @@
 * text=auto
 *.bat text eol=crlf
+# shell scripts must be LF even on a Windows checkout, or bash refuses them
+*.sh text eol=lf

@@ -18,6 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 const { spawn, execFile, execSync } = require('child_process');
 
 const WHISPER_PORT = process.env.WHISPER_PORT || '8081';
@@ -31,6 +32,8 @@ const WHISPER_MODELS = [
     note: 'The default: quick and decent for English dictation.' },
   { id: 'ggml-small.en.bin', label: 'Small (English)', size: '466 MB',
     note: 'Noticeably better English accuracy, still quick.' },
+  { id: 'ggml-large-v3-turbo.bin', label: 'Large v3 Turbo (multilingual)', size: '1.6 GB',
+    note: 'Nearly Large-v3 accuracy for a fraction of the size and time - the better multilingual pick on most machines.' },
   { id: 'ggml-large-v3.bin', label: 'Large v3 (multilingual)', size: '3.1 GB',
     note: 'The biggest multilingual model: best accuracy for any language, needs about 4 GB of memory and a long first download.' }
 ];
@@ -39,7 +42,33 @@ const VENDOR_DIR = path.join(__dirname, 'whisper');
 // Note: whisper.cpp's semantic-version releases ship source only; the Windows
 // binaries are attached to the tagged nightly builds (b5130 etc.).
 const BIN_ZIP_URL = 'https://github.com/ggml-org/whisper.cpp/releases/download/b5130/whisper-bin-x64.zip';
-const MODEL_URL = (m) => `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${m}`;
+
+/* Everything this module downloads is checked against a published SHA-256 before
+ * it is used, and a download that does not match is deleted instead of run. The
+ * whisper server it starts is a native binary and the models are picked up from
+ * the public internet, so "it came from the right host" is not good enough.
+ *
+ * Sources:
+ *  - the models: the LFS metadata of huggingface.co/ggerganov/whisper.cpp
+ *    (GET /api/models/ggerganov/whisper.cpp?blobs=true -> siblings[].lfs.sha256),
+ *    which is what the resolve URL serves. Downloads are pinned to one commit so
+ *    the bytes behind a URL cannot change under a hash we stored.
+ *  - the Windows binary zip: the release asset digest published by the GitHub API
+ *    for tag b5130 (assets[].digest, sha256). whisper.cpp itself ships no
+ *    checksums.txt next to that asset, so this is the strongest available source.
+ *
+ * A model that is not listed here is still downloaded (a user may type any id),
+ * with a warning that nothing could be verified. */
+const MODEL_REVISION = process.env.WHISPER_MODEL_REVISION || '5359861c739e955e79d9a303bcbc70fb988958b1';
+const MODEL_URL = (m) => `https://huggingface.co/ggerganov/whisper.cpp/resolve/${MODEL_REVISION}/${m}`;
+const BIN_ZIP_SHA256 = 'f9ec6c52a2e949b62ab51fa21d0d497958f9e41c3010c157c4e42932d5316f3c';
+const MODEL_SHA256 = {
+  'ggml-tiny.en.bin': '921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f',
+  'ggml-base.en.bin': 'a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002',
+  'ggml-small.en.bin': 'c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d',
+  'ggml-large-v3.bin': '64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2',
+  'ggml-large-v3-turbo.bin': '1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69',
+};
 
 // The whisper-server child we spawned (null if we reused an existing server or
 // never started one). Kept so the bridge can stop it on shutdown.
@@ -57,7 +86,10 @@ function tcpReachable(port) {
   });
 }
 
-function download(url, dest, onProgress) {
+/* Download to `dest`, hashing as the bytes arrive, and only keep the file when
+ * the hash matches `expected` (or when no hash is known for it). A mismatch is
+ * deleted, so a spoofed or truncated download can never be executed or loaded. */
+function download(url, dest, onProgress, expected, what) {
   return new Promise((resolve, reject) => {
     const get = (u, redirects) => {
       const mod = u.startsWith('https:') ? https : http;
@@ -72,15 +104,32 @@ function download(url, dest, onProgress) {
         }
         const total = parseInt(res.headers['content-length'] || '0', 10);
         const out = fs.createWriteStream(dest);
+        const hash = crypto.createHash('sha256');
         let got = 0, lastPct = -100;
         res.on('data', (c) => {
           got += c.length;
+          hash.update(c);
           const pct = total ? Math.floor((got / total) * 100) : 0;
           if (onProgress) onProgress(got, total);
           if (pct >= lastPct + 10) { lastPct = pct; console.log(`  downloading ${path.basename(dest)} … ${pct}%`); }
         });
         res.pipe(out);
-        out.on('finish', () => out.close(resolve));
+        out.on('finish', () => out.close(() => {
+          const digest = hash.digest('hex');
+          if (!expected) {
+            console.log(`  ⚠ no published checksum for ${what || path.basename(dest)} - downloaded ${digest}, NOT verified`);
+            return resolve(digest);
+          }
+          if (digest !== expected) {
+            try { fs.unlinkSync(dest); } catch { /* gone already */ }
+            const err = new Error(`${what || path.basename(dest)} failed its SHA-256 check `
+              + `(expected ${expected.slice(0, 12)}…, got ${digest.slice(0, 12)}…) - the download was discarded`);
+            err.code = 'ESHACHECK';
+            return reject(err);
+          }
+          console.log(`  ✓ ${path.basename(dest)} matches its published SHA-256`);
+          resolve(digest);
+        }));
         out.on('error', reject);
       }).on('error', reject);
     };
@@ -139,7 +188,8 @@ async function doStartWhisper(modelId) {
       console.log('whisper STT: first run — downloading whisper.cpp binaries (~200 MB, once)…');
       whisperState = { state: 'downloading', model: modelName, url: null, detail: 'whisper.cpp binaries (~200 MB, once)', got: 0, total: 0 };
       const zip = path.join(VENDOR_DIR, 'whisper-bin-x64.zip');
-      await download(BIN_ZIP_URL, zip, (got, total) => { whisperState.got = got; whisperState.total = total; });
+      await download(BIN_ZIP_URL, zip, (got, total) => { whisperState.got = got; whisperState.total = total; },
+        BIN_ZIP_SHA256, 'the whisper.cpp binaries');
       whisperState.detail = 'unpacking whisper.cpp…';
       await unzip(zip, VENDOR_DIR);
       fs.rmSync(zip, { force: true });
@@ -154,7 +204,8 @@ async function doStartWhisper(modelId) {
       console.log(`whisper STT: downloading model ${modelName}…`);
       const info = WHISPER_MODELS.find((m) => m.id === modelName);
       whisperState = { state: 'downloading', model: modelName, url: null, detail: `model ${modelName} (${info ? info.size : ''})`.trim(), got: 0, total: 0 };
-      await download(MODEL_URL(modelName), model, (got, total) => { whisperState.got = got; whisperState.total = total; });
+      await download(MODEL_URL(modelName), model, (got, total) => { whisperState.got = got; whisperState.total = total; },
+        MODEL_SHA256[modelName], `the model ${modelName}`);
     }
     const child = spawn(serverExe, ['-m', model, '--port', String(WHISPER_PORT), '--inference-path', '/inference'], {
       cwd: path.dirname(serverExe),

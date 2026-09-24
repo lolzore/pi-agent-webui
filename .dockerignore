@@ -1,0 +1,20 @@
+# Keep the image to the code it needs. Without this the build context is the
+# whole checkout: your sessions, uploads and settings would be baked into the
+# image, and bridge/node_modules would be copied over the container's own with
+# Windows binaries.
+**/node_modules
+.git
+.gitattributes
+.gitignore
+pi-desktop
+uploads
+workspace
+*.log
+*.tmp
+webui-settings.json
+last-session.json
+agent-source.txt
+.env
+.env.*
+bridge/whisper
+README.md

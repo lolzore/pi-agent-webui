@@ -7,8 +7,9 @@
 #   2. docker compose up --build
 #   3. Open http://localhost:3080
 #
-# NOTE: host port 3080 is used because 3000 is occupied by Forgejo on this
-# machine. Only the left side of the ports mapping needs to change.
+# NOTE: the host port is 3080 (where the launcher serves a native bridge);
+# override it with PI_WEBUI_PORT if something already uses it. The container's own
+# port stays 3000 - only the left side of the mapping is ever worth changing.
 #
 # Your work is mounted from ./workspace so it survives container rebuilds,
 # and pi's own data (sessions, settings, extensions, auth) lives in the named
@@ -21,7 +22,10 @@ services:
     build: .
     container_name: pi-webui
     ports:
-      - "3080:3000"
+      # Host port is configurable: 3080 is what the launcher uses for a native
+      # bridge, so running both at once used to fail with "port is already
+      # allocated" for whoever started second. PI_WEBUI_PORT=3090 docker compose up
+      - "${PI_WEBUI_PORT:-3080}:3000"
     environment:
       # Pass through whichever provider keys you use:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -34,6 +38,8 @@ services:
       - PI_COMMAND=pi --mode rpc
       - WORKSPACE_DIR=/workspace
       - PI_SESSION_DIR=/root/.pi/agent/sessions
+      # PI_WEBUI_DEBUG_RPC=1 logs every RPC and session change to `docker logs`
+      - PI_WEBUI_DEBUG_RPC=${PI_WEBUI_DEBUG_RPC:-}
     volumes:
       - ./workspace:/workspace
       - pi_data:/root/.pi

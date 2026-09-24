@@ -55,9 +55,17 @@ export function WebUIHost({ url }) {
     };
   }, [place]);
 
-  // Same surface, new URL (host/port change).
+  // Same surface, new URL (host/port change) - and only for a real change.
+  // This component is remounted by every layout change, and the effect also runs
+  // on mount: navigating to the URL the surface is already showing is a full page
+  // load in WebView2, which is what made a one-pixel window resize reload every
+  // element and restart the background video on frame 0.
+  const lastUrlRef = useRef(null);
   useEffect(() => {
-    if (openedRef.current) WV.navigate(url);
+    const first = lastUrlRef.current === null;
+    if (lastUrlRef.current === url) return;
+    lastUrlRef.current = url;
+    if (!first && openedRef.current) WV.navigate(url);
   }, [url]);
 
   return (
