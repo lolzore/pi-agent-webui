@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, Linking,
 } from 'react-native';
@@ -101,7 +101,7 @@ export function ShortsPanel({ provider, onProviderChange, onClose, compact, expa
     return true;
   }, [provider]);
 
-  const header = (
+  const header = useMemo(() => (
     <View style={styles.header}>
       <View style={styles.tabs}>
         {FEED_ORDER.map((key) => {
@@ -137,7 +137,7 @@ export function ShortsPanel({ provider, onProviderChange, onClose, compact, expa
         ) : null}
       </View>
     </View>
-  );
+  ), [provider, onProviderChange, reload, openInApp, onToggleExpand, compact, expanded, onClose]);
 
   return (
     <View style={[styles.wrap, compact && styles.wrapCompact]}>
@@ -154,6 +154,12 @@ export function ShortsPanel({ provider, onProviderChange, onClose, compact, expa
           return (
             <View key={key} style={[StyleSheet.absoluteFill, !active && styles.hiddenFeed]} pointerEvents={active ? 'auto' : 'none'}>
               <WebView
+                /* An inline arrow, not useCallback: this is inside a .map(), and
+                 * a hook in a loop breaks React's rules of hooks (the hook order
+                 * then depends on FEED_ORDER). The original inline function was
+                 * correct — React only re-attaches a ref when the function
+                 * identity changes, and this one is recreated with the element
+                 * anyway. */
                 ref={(w) => { if (w) refs.current[key] = w; }}
                 source={{ uri: FEEDS[key].url }}
                 // a fresh key per provider-retry so RN actually tears down & rebuilds

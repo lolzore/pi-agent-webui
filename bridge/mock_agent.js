@@ -73,7 +73,13 @@ process.stdin.on('data', (d) => {
   while ((nl = buffer.indexOf('\n')) >= 0) {
     const line = buffer.slice(0, nl).trim();
     buffer = buffer.slice(nl + 1);
-    if (line) handle(JSON.parse(line));
+    if (line) {
+      try {
+        handle(JSON.parse(line));
+      } catch (e) {
+        // Ignore malformed JSON lines
+      }
+    }
   }
 });
 

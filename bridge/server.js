@@ -21,6 +21,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const zlib = require('zlib');   // streaming gzip for the session transcript response
+const { StringDecoder } = require('string_decoder');
 const { spawn, execFile, execSync } = require('child_process');
 const { pathToFileURL } = require('url');
 const { WebSocketServer, WebSocket } = require('ws');
@@ -289,11 +291,25 @@ let builtinCommandsCache = null;
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json',
+  '.map': 'application/json',
+  '.webmanifest': 'application/manifest+json',
+  '.txt': 'text/plain; charset=utf-8',
+  '.wasm': 'application/wasm',
   '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
 };
 
 /* Resolve a session path for export/delete: only real .jsonl files inside the
@@ -320,9 +336,19 @@ function safeSessionPath(raw) {
  * The transcript reader used to refuse outright - "docker session dirs are not
  * supported here" - and the UI showed that as "Could not load session" for every
  * session in the sidebar whenever the agent ran in a container. */
+/* Run a command in a container and collect its stdout.
+ *
+ * The container name is validated **here** rather than at each call site (issue
+ * #29). It comes from PI_SESSION_DIR, so it is operator-set and was never
+ * remotely reachable - but it is an argv element alongside argument lists that
+ * *are* built from untrusted data, and the next person adding a call should not
+ * have to re-derive which of the two is trusted. Validating in one place means
+ * every caller, present and future, inherits it. */
 function dockerCapture(container, args, timeoutMs = 60000, maxBuffer = 256 * 1024 * 1024) {
+  const ctr = safeContainerName(container);
+  if (!ctr) return Promise.resolve('');
   return new Promise((resolve) => {
-    execFile('docker', ['exec', container, ...args], { timeout: timeoutMs, maxBuffer, shell: false },
+    execFile('docker', ['exec', ctr, ...args], { timeout: timeoutMs, maxBuffer, shell: false },
       (err, stdout) => resolve(err ? '' : stdout));
   });
 }
@@ -351,7 +377,423 @@ function sessionRef(raw) {
 
 async function readSessionRef(ref) {
   if (ref.kind === 'docker') return (await dockerCapture(ref.container, ['cat', ref.path])) || null;
-  try { return fs.readFileSync(ref.path, 'utf8'); } catch { return null; }
+  // Promises, not readFileSync: a session file can be tens of megabytes, and the
+  // synchronous read held the whole bridge's event loop for the duration - the
+  // agent's RPC pipe included, so asking for a long transcript froze the agent
+  // too. Nothing here needs the file before the next line anyway.
+  try { return await fs.promises.readFile(ref.path, 'utf8'); } catch { return null; }
+}
+
+/* ── reading a session transcript ───────────────────────────────────────
+ * This used to be: read the whole file, split it into an array, JSON.parse
+ * every line, build one array of messages, stringify the lot, and only then
+ * write the first byte.
+ *
+ * Measured on a real 70 MB session, the JSON.parse was 49 ms of a 565 ms load -
+ * so making the parsing parallel would have been the wrong lever entirely. The
+ * cost was elsewhere: 378 ms elapsed before the browser saw a single byte, all
+ * of it one unbroken block on the event loop, and roughly 200 MB of resident
+ * memory for the duration (the file as a string, the parsed objects, and the
+ * re-serialised copy - three copies of the same base64).
+ *
+ * So: read the file line by line and write each message out as it is parsed.
+ * Time-to-first-byte drops to about the cost of the first line, the transfer
+ * overlaps the parsing instead of following it, peak memory falls to roughly one
+ * message, and the yields between batches stop a long read from stalling the
+ * agent's event stream (which is why opening a long session used to visibly
+ * pause a running turn). */
+
+/* The file's lines, as an async iterable. Backpressure-aware: the caller's
+ * writes are awaited, so a slow client cannot make the bridge buffer the whole
+ * transcript in memory to send it later. */
+/* ── images in a session file: a reference instead of the bytes ──────────
+ *
+ * A session file stores every picture the agent ever looked at, or that was
+ * ever pasted, as a base64 block inside its JSON line. On a real session here
+ * that was 99% of the file: 69 of 70 MB on one, 25 of 221 messages carrying
+ * everything. The transcript response was that file again, so opening the
+ * session downloaded every picture in it - to render a handful of them as
+ * 220-pixel thumbnails, most of them far below the fold.
+ *
+ * So the transcript now names the pictures instead of carrying them, and the
+ * bytes are fetched only for the ones actually on screen. The browser already
+ * defers this: lazySrc() sets an <img>'s src when it comes within 1200px of the
+ * viewport and takes it away again past 3000px, so scrolling a long session
+ * pulls in the pictures you pass and releases the ones you leave.
+ *
+ * The reference is a plain URL, which means nothing in the renderer has to
+ * change shape: the same <img src> works for a URL and for a data URL, and
+ * clicking one to view it full size opens the same thing.
+ *
+ * Two escape hatches, both deliberate:
+ *  - `?inline=1` on the transcript puts the bytes back in the response, exactly
+ *    as it used to be, for anything that wants a self-contained file;
+ *  - pictures below the threshold stay inline, so a small icon in a message
+ *    costs no extra request and still opens instantly. */
+const IMAGE_INLINE_LIMIT = 8 * 1024;   // base64 characters
+
+/* Where to fetch one picture from. The token is the file's size and mtime, so a
+ * session that grows (a new turn appended) or is rewritten invalidates every
+ * reference to it, and the browser's own cache does the rest. */
+function imageUrl(sessionPath, line, part, stamp) {
+  return `/api/session-image?path=${encodeURIComponent(sessionPath)}&line=${line}&part=${part}` +
+    (stamp ? `&v=${encodeURIComponent(stamp)}` : '');
+}
+
+/* Replace the big image blocks in one message with references. Returns how many
+ * were moved out and how many bytes that saved, so the endpoint can report it. */
+function externaliseImages(msg, sessionPath, line, stamp) {
+  const content = msg && msg.content;
+  if (!Array.isArray(content)) return { n: 0, saved: 0 };
+  let n = 0, saved = 0;
+  for (let i = 0; i < content.length; i++) {
+    const b = content[i];
+    if (!b || b.type !== 'image' || typeof b.data !== 'string') continue;
+    if (b.data.length <= IMAGE_INLINE_LIMIT) continue;
+    const bytes = Math.round(b.data.length * 0.75);
+    // the payload is replaced in place: the object is freshly parsed from the
+    // file and nothing else holds it.
+    // `part` is the index in the content array, not a count of pictures - a
+    // message shaped [text, image, text, image] has parts 1 and 3, and counting
+    // the pictures instead pointed the fetch at the wrong block (a 404, for every
+    // image in every message that did not start with one).
+    b.data = undefined;
+    b.bytes = bytes;
+    b.line = line;
+    b.part = i;
+    b.src = imageUrl(sessionPath, line, i, stamp);
+    n++; saved += bytes;
+  }
+  return { n, saved };
+}
+
+/* ── where each line starts ───────────────────────────────────────────────
+ *
+ * `/api/session-image` has to find one line in a session file, and it used to do
+ * that by reading the file from the beginning until it reached it. Cost is
+ * therefore O(position of the line): measured on a 36 MB / 60-line session,
+ * 6.4 ms for an image on line 2 and 44.9 ms for one on line 60. With N images
+ * that is O(N x filesize) - and every image the chat shows costs one of those.
+ *
+ * The transcript endpoint already reads every line of the file, so it can record
+ * where each one started at no extra cost. This is that record: byte offset per
+ * line, keyed by the same size+mtime token the image URLs already use, so a
+ * session that grows or is rewritten invalidates it exactly as it invalidates
+ * the browser's cached copies.
+ *
+ * Bounded on purpose. These are the newest sessions in a bounded list, and a run
+ * that opens hundreds of different sessions should not keep all of them. */
+const LINE_INDEX_MAX = 24;
+const LINE_INDEX = new Map();   // key -> { offsets: number[] }
+
+function indexKey(ref, stamp) {
+  const where = ref.kind === 'docker' ? `${ref.container}:${ref.path}` : ref.path;
+  return `${where}|${stamp || ''}`;
+}
+
+function indexPut(key, offsets) {
+  LINE_INDEX.delete(key);            // re-insert so it counts as most recent
+  LINE_INDEX.set(key, { offsets });
+  while (LINE_INDEX.size > LINE_INDEX_MAX) LINE_INDEX.delete(LINE_INDEX.keys().next().value);
+}
+
+function indexGet(key) {
+  const hit = LINE_INDEX.get(key);
+  return hit ? hit.offsets : null;
+}
+
+/* The size+mtime token for a session, the same one the image URLs carry. */
+async function sessionStamp(ref) {
+  try {
+    if (ref.kind !== 'docker') {
+      const s = await fs.promises.stat(ref.path);
+      return `${s.size}-${Math.floor(s.mtimeMs)}`;
+    }
+    return String(await dockerCapture(ref.container, ['stat', '-c', '%s-%Y', ref.path], 20000) || '').trim();
+  } catch { return ''; }
+}
+
+/* One line, read from a known byte offset, without reading what came before it.
+ *
+ * This carried a note claiming that "a line longer than the cap is reported as
+ * not found, which falls back to the forward scan". That was not what the code
+ * did - it returned the truncated bytes as if they were the whole line - and the
+ * note has gone with the bug, because believing it is what made the failure look
+ * like a missing image. */
+/* One line, read from a known byte offset, for the picture endpoint.
+ *
+ * A session line has no size worth guessing at: a message carries its pictures
+ * inline, and one off a phone camera is several megabytes of base64 on a single
+ * line. This used to grow its read but stop at 8 MB - smaller than that - so the
+ * line came back truncated, JSON.parse threw on it, and the caller reported the
+ * image as "no longer at that line" while it sat there in the file. Which is
+ * issue #38 exactly: the pictures that failed to load were the phone ones, every
+ * other picture worked, and the file was fine all along.
+ *
+ * So the read grows until it finds the newline or reaches the end of the file.
+ * maxBytes is still there for a caller that wants a ceiling; the default is the
+ * file. Measured on the session from that issue: line 85 is 10,450,484 chars of
+ * base64 and now serves as a 7,837,863-byte PNG.
+ *
+ * The chunks are joined and decoded ONCE at the end rather than per read: a
+ * multi-byte character can straddle two reads, and decoding each chunk on its own
+ * would corrupt it - the same reason sessionLines below decodes the way it does. */
+async function readLineAt(ref, offset, maxBytes = Number.MAX_SAFE_INTEGER) {
+  if (offset < 0) return null;
+  if (ref.kind === 'docker') {
+    // `tail -c +N` is 1-based, and the path is argv as everywhere else
+    const out = await dockerCapture(ref.container, ['tail', '-c', `+${offset + 1}`, ref.path], 30000);
+    const text = String(out || '');
+    const nl = text.indexOf('\n');
+    return nl < 0 ? (text || null) : text.slice(0, nl);
+  }
+  let fh;
+  try { fh = await fs.promises.open(ref.path, 'r'); } catch { return null; }
+  try {
+    const st = await fh.stat();
+    if (offset >= st.size) return null;
+    const hardEnd = Math.min(offset + maxBytes, st.size);
+    const chunks = [];
+    let got = 0;
+    let len = Math.min(65536, hardEnd - offset);
+    for (;;) {
+      if (len <= 0) break;
+      const buf = Buffer.alloc(len);
+      const { bytesRead } = await fh.read(buf, 0, len, offset + got);
+      if (!bytesRead) break;
+      const slice = buf.subarray(0, bytesRead);
+      const nl = slice.indexOf(0x0a);
+      if (nl >= 0) {
+        // cut at the newline, so what is decoded holds only whole characters
+        chunks.push(slice.subarray(0, nl));
+        break;
+      }
+      chunks.push(slice);
+      got += bytesRead;
+      if (bytesRead < len) break;                 // the line runs to the end of the file
+      if (offset + got >= hardEnd) break;         // a ceiling was asked for
+      len = Math.min(len * 4, 64 * 1024 * 1024, hardEnd - offset - got);
+    }
+    if (!chunks.length) return null;
+    return Buffer.concat(chunks).toString('utf8');
+  } catch { return null; } finally {
+    try { await fh.close(); } catch { /* already closed */ }
+  }
+}
+
+/* Every line of a session, one at a time, with the byte offset of each.
+ *
+ * Streaming rather than reading the file whole, because a session can be tens of
+ * megabytes; `onLine` is handed the offset before each line so a caller can build
+ * the line index that readLineAt above seeks with. */
+async function* sessionLines(ref, onLine) {
+  if (ref.kind === 'docker') {
+    // `docker exec` hands us a live stdout, so the file can be read as it
+    // arrives instead of after the whole of it has crossed into this process.
+    // The first version used dockerCapture, which collects the entire file into
+    // one string before returning - so on the setup the bridge actually runs on
+    // (a native bridge driving an agent inside a container) nothing could be
+    // sent until the last byte had come back: measured 1513 ms before the first
+    // byte on a 70 MB session, 3.3 s to finish.
+    const child = spawn('docker', ['exec', ref.container, 'cat', ref.path], { stdio: ['ignore', 'pipe', 'ignore'] });
+    // A multi-byte character can straddle two chunks, so the bytes are decoded
+    // through a StringDecoder rather than with toString() per chunk - otherwise a
+    // session containing any emoji or accented text would be corrupted wherever
+    // it happened to fall on a buffer edge.
+    const decoder = new StringDecoder('utf8');
+    let buf = '';
+    let failed = null;
+    // bytes consumed before the line now being assembled
+    let consumed = 0;
+    child.on('error', (e) => { failed = e; });
+    try {
+      for await (const chunk of child.stdout) {
+        const text = buf + decoder.write(chunk);
+        const parts = text.split('\n');
+        buf = parts.pop();
+        for (const line of parts) {
+          if (onLine) onLine(consumed);
+          // +1 for the newline that was split away
+          consumed += Buffer.byteLength(line, 'utf8') + 1;
+          yield line;
+        }
+        if (failed) throw failed;
+      }
+      buf += decoder.end();
+      if (buf) { if (onLine) onLine(consumed); yield buf; }
+      if (failed) throw failed;
+    } finally {
+      try { child.kill(); } catch { /* already gone */ }
+    }
+    return;
+  }
+  /* Read the raw bytes and decode them here, rather than letting the stream do
+   * the decoding, so that a byte offset per line can be counted. Node's own
+   * decode and StringDecoder agree on utf8 - the multi-byte test that guards this
+   * function is what proves it - and the docker branch above already decodes
+   * this way for the same reason (a character can straddle two chunks). */
+  const stream = fs.createReadStream(ref.path, { highWaterMark: 1 << 18 });
+  const decoder = new StringDecoder('utf8');
+  // `buf` is the partial trailing line carried between chunks. It is declared
+  // per-branch on purpose: the docker branch above has its own, and sharing one
+  // across both would let a docker read leak a half-line into a local read.
+  let buf = '';
+  // bytes consumed before the line now being assembled
+  let consumed = 0;
+  const emit = function* (line, bytes) {
+    if (onLine) onLine(consumed);
+    consumed += bytes;
+    yield line;
+  };
+  for await (const chunk of stream) {
+    const text = decoder.write(chunk);
+    let start = 0, nl;
+    while ((nl = text.indexOf('\n', start)) >= 0) {
+      buf += text.slice(start, nl);
+      // +1 for the newline itself
+      for (const l of emit(buf, Buffer.byteLength(buf, 'utf8') + 1)) yield l;
+      buf = '';
+      start = nl + 1;
+    }
+    if (start < text.length) buf += text.slice(start);
+  }
+  buf += decoder.end();
+  if (buf) { if (onLine) onLine(consumed); yield buf; }
+}
+
+/* Let the event loop have the thread back. setImmediate (not a timer) so this is
+ * the very next turn of the check phase - no millisecond of latency added. */
+const breathe = () => new Promise((r) => setImmediate(r));
+
+/* Write, honouring backpressure.
+ *
+ * Coalescing matters more than it looks. A session line can be a quarter of a
+ * megabyte (one message with a screenshot in it), and writing each one on its own
+ * meant the socket buffer filled on every line, the write went async, and the
+ * next line was not even read until the previous one had drained - read, parse,
+ * write, wait, repeat, all strictly in series. That measured *slower* than the
+ * old build-everything-first approach even though it started instantly, because
+ * it gave up the memory bandwidth of one big sequential read.
+ *
+ * So: gather messages into a buffer and send it in reasonably large pieces, and
+ * only then wait for the socket. The response is told about a big buffer so it
+ * does not report "full" after 16 KB. */
+const WRITE_CHUNK = 256 * 1024;
+function writeStream(res) {
+  const w = { res, buf: [], size: 0, wait: null };
+  w.add = (s) => { w.buf.push(s); w.size += s.length; };
+  w.flush = async () => {
+    if (!w.size) return;
+    const chunk = w.buf.length === 1 ? w.buf[0] : w.buf.join('');
+    w.buf.length = 0; w.size = 0;
+    if (w.res.write(chunk)) return;
+    await new Promise((resolve) => w.res.once('drain', resolve));
+  };
+  return w;
+}
+
+/* How big the file is, without reading it.
+ *
+ * This one line cost more than everything else put together when it was written
+ * the obvious way. Asking for the size by reading the file - which is what the
+ * first version did, through readSessionRef - pulls the whole thing across
+ * `docker exec` before the first line of the response exists, which is precisely
+ * the wait streaming was supposed to remove: 1478 ms before the first byte on a
+ * 70 MB session, with every streaming change already in place and none of it
+ * mattering. `stat` answers in about a millisecond. */
+async function sessionSize(ref) {
+  try {
+    if (ref.kind !== 'docker') return (await fs.promises.stat(ref.path)).size;
+    const out = await dockerCapture(ref.container, ['stat', '-c', '%s', ref.path], 20000);
+    const n = parseInt(String(out || '').trim(), 10);
+    return Number.isFinite(n) ? n : 0;
+  } catch { return 0; }
+}
+
+/* How much of a session is base64 image data, estimated from a few windows
+ * spread across the whole file.
+ *
+ * The windows are averaged, which is what makes this an estimate of the file
+ * rather than of its worst moment. "Worst window" was the first version and it
+ * turned out to be too frightened: a 21 MB session that is 77% text and whose
+ * gzip saves 12 MB had one window that landed inside a picture, and taking the
+ * maximum threw the compression away. The mean lands within a few percent of the
+ * real figure on every real session measured, and the decision that follows
+ * (which is only "is it worth the CPU") is nowhere near that precise.
+ *
+ * The windows are read with seek, so the file is not read twice. */
+const DENSITY_WINDOWS = 8;
+const DENSITY_SPAN = 48 * 1024;
+
+async function sessionSample(ref, from, len) {
+  try {
+    if (ref.kind === 'docker') {
+      // no seeking inside the container: take a prefix for the start of the
+      // file and a suffix for the rest, which is a coarse estimate but costs two
+      // small execs rather than a copy of the file.
+      //
+      // The suffix used to be a script - `tail -c +N '<path>' | head -c L` - which
+      // put the session path inside shell text a second time (see
+      // scanDockerSessions for what that cost). `tail` takes the offset as an
+      // argument and the length is applied here, so there is no pipeline and no
+      // script: the path is only ever argv.
+      const head = from === 0
+        ? await dockerCapture(ref.container, ['head', '-c', String(len), ref.path], 20000)
+        : String(await dockerCapture(ref.container, ['tail', '-c', `+${from + 1}`, ref.path], 20000) || '').slice(0, len);
+      return String(head || '');
+    }
+    const fh = await fs.promises.open(ref.path, 'r');
+    try {
+      const st = await fh.stat();
+      const buf = Buffer.alloc(Math.min(len, Math.max(0, st.size - from)));
+      if (!buf.length) return '';
+      const { bytesRead } = await fh.read(buf, 0, buf.length, from);
+      return buf.slice(0, bytesRead).toString('utf8');
+    } finally { await fh.close(); }
+  } catch { return ''; }
+}
+
+function base64Share(text) {
+  if (!text) return 1;                 // cannot tell: assume the worst
+  let bytes = 0;
+  // Two ways to recognise image data, and the second one matters more:
+  //
+  //  - the marked form, "data": "<base64>", which is how it looks in the
+  //    beginning of an image block;
+  //  - a long unbroken run of base64 characters with no JSON punctuation in it.
+  //
+  // The original probe only looked for the marker, which made it useless: the
+  // sampling windows are 48 KB and an image block is megabytes, so a window
+  // almost always lands *inside* one, with the key thousands of kilobytes away in
+  // a part of the file that window never saw. Measured on a real 70 MB session,
+  // seven of eight windows were pure base64 and all eight reported "no images".
+  //
+  // 400 characters is far longer than any ordinary token - a hash is 64 hex
+  // characters, a JSON key is tens - so a run that long is image data and nothing
+  // else.
+  const re = /"data"\s*:\s*"([A-Za-z0-9+/=]{200,})"|([A-Za-z0-9+/=]{400,})/g;
+  let m;
+  while ((m = re.exec(text)) !== null) bytes += (m[1] || m[2]).length;
+  // base64 carries 3 bytes in 4 characters, so the source bytes are 3/4 of the
+  // character count. Measured against the sample that over-counts, which is the
+  // safe direction: it declines to compress rather than compressing in vain.
+  return bytes ? Math.min(1, (bytes * 0.75) / text.length) : 0;
+}
+
+async function imageDensity(ref) {
+  const size = await sessionSize(ref);
+  if (!size) return 1;
+  const span = Math.min(DENSITY_SPAN, size);
+  const step = size > span ? Math.floor((size - span) / (DENSITY_WINDOWS - 1)) : 0;
+  let total = 0, seen = 0;
+  for (let i = 0; i < DENSITY_WINDOWS; i++) {
+    const at = Math.min(Math.max(0, size - span), i * step);
+    const text = await sessionSample(ref, at, span);
+    if (!text) return 1;            // cannot read it: assume the worst
+    total += base64Share(text);
+    seen++;
+  }
+  return seen ? total / seen : 1;
 }
 
 async function deleteSessionRef(ref) {
@@ -385,7 +827,12 @@ async function subagentArtifact(runId, wantLabel) {
   const localDir = path.join(SESSION_DIR, 'subagent-artifacts');
   let names = [];
   if (remote) {
-    const out = await dockerCapture(remote.container, ['sh', '-c', `ls -1 '${path.posix.join(remote.dir, 'subagent-artifacts')}' 2>/dev/null`], 20000);
+    // the directory is argv ($1), not script text - same rule as everywhere else
+    // that a path meets a shell in this file
+    const ctr = safeContainerName(remote.container);
+    if (!ctr) return null;
+    const out = await dockerRun(ctr, ['sh', '-c',
+      'ls -1 "$1" 2>/dev/null', 'sh', path.posix.join(remote.dir, 'subagent-artifacts')], 20000);
     names = out.split('\n').map((x) => x.trim()).filter(Boolean);
   } else {
     try { names = fs.readdirSync(localDir); } catch { names = []; }
@@ -414,26 +861,93 @@ async function subagentArtifact(runId, wantLabel) {
   return { file, text: file.endsWith('.jsonl') ? tailText(text) : text };
 }
 
+/* A pi-subagents run directory, or null.
+ *
+ * This value arrives in a query string, so it is a *reference* to validate, not
+ * a path to use. The check used to be a regex that only had to match somewhere
+ * in the string, after which the value was pasted into `ls -1t '<dir>'/…`
+ * inside `sh -c`. Two things followed from that, both verified:
+ *
+ *   - in container mode, `dir=/tmp/pi-subagents-x/async-subagent-runs/'; touch X; '`
+ *     ran `touch X` inside the container (command execution);
+ *   - in local mode, `…/async-subagent-runs/../../../secret` walked out of the
+ *     run directory and read an unrelated `status.json` (arbitrary file read).
+ *
+ * So the shape is now *anchored*, and normalisation - which is what collapses
+ * `..` - happens before the test:
+ *
+ *   <something>/pi-subagents<scope>/async-subagent-runs/<one segment>
+ *
+ * One segment means nothing can be appended to it, and in local mode the path
+ * must additionally sit under a run root this bridge actually uses. The
+ * character allowlist then removes everything a shell or a glob treats as
+ * special, so even a path that passes the shape carries no syntax. */
+/* A run directory is *data*: it is always passed as argv and quoted as "$1", so
+ * the quoting - not this pattern - is what stops a command running. What follows
+ * is belt and braces, and it is a denylist on purpose.
+ *
+ * The first version of this was an allowlist, [A-Za-z0-9 ._+@:/-], and it was
+ * wrong in a way the tests caught: os.tmpdir() on Windows returns the 8.3 short
+ * form (C:/Users/THEBLU~1/AppData/Local/Temp), and `~` was not in the set - so
+ * every genuine run directory on this machine was refused and the feature the
+ * check exists to protect stopped working. An allowlist has to enumerate every
+ * character a real path can contain and gets it wrong quietly; a denylist only
+ * has to name the ones that are actually dangerous. */
+const RUN_DIR_UNSAFE = /["'`$\\;|&<>(){}\[\]*?!#\r\n\u0000]/;
+const RUN_DIR_SHAPE = /\/pi-subagents[^/]*\/async-subagent-runs\/[^/]+$/;
+
+function runDirOk(p) {
+  if (RUN_DIR_UNSAFE.test(p)) return false;
+  if (p.split('/').includes('..')) return false;   // normalise() already removed these
+  return RUN_DIR_SHAPE.test(p);
+}
+
+function runDirRef(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const remote = parseSessionDir();
+  if (remote) {
+    const ctr = safeContainerName(remote.container);
+    if (!ctr) return null;
+    const p = path.posix.normalize(raw.trim().replaceAll(String.fromCharCode(92), '/'));
+    if (!p.startsWith('/') || !runDirOk(p)) return null;
+    return { kind: 'docker', container: ctr, dir: p };
+  }
+  let p;
+  try { p = path.resolve(raw.trim()); } catch { return null; }
+  const asPosix = p.replaceAll(String.fromCharCode(92), '/');
+  if (!runDirOk(asPosix)) return null;
+  // ...and under a root this bridge would itself create
+  const roots = asyncRunRoots()
+    .map((r) => path.resolve(r).replaceAll(String.fromCharCode(92), '/').replace(/\/+$/, ''))
+    .filter(Boolean);
+  if (!roots.some((r) => asPosix.startsWith(r + '/'))) return null;
+  return { kind: 'local', dir: p };
+}
+
 async function subagentRunLog(asyncDir) {
-  if (typeof asyncDir !== 'string' || !asyncDir) return null;
-  // Only ever a run directory: this path comes over the wire.
-  const posix = String(asyncDir).replaceAll(String.fromCharCode(92), '/');
-  if (!/pi-subagents[^/]*\/async-subagent-runs\//.test(posix)) return null;
-  const dir = parseSessionDir() ? path.posix.normalize(posix) : path.normalize(asyncDir);
-  if (parseSessionDir()) {
-    const out = await dockerCapture(parseSessionDir().container, ['sh', '-c',
-      `ls -1t '${dir}'/output-*.log '${dir}'/status.json 2>/dev/null | head -5`], 20000);
+  const ref = runDirRef(asyncDir);
+  if (!ref) return null;
+  if (ref.kind === 'docker') {
+    // The directory is argv, quoted as `$1`, and never part of the script text.
+    // (The result of `"$1"` is not re-scanned for expansions, so even a `$(` in
+    // it would stay literal - and the denylist above rejects one anyway.)
+    const out = await dockerRun(ref.container, ['sh', '-c',
+      'ls -1t "$1"/output-*.log "$1"/status.json 2>/dev/null | head -5', 'sh', ref.dir], 20000);
     const first = out.split('\n').map((x) => x.trim()).filter(Boolean)[0];
     if (!first) return null;
-    const text = await dockerCapture(parseSessionDir().container, ['cat', first], 30000);
-    return text ? { file: path.posix.basename(first), text: tailText(text) } : null;
+    // the file we then read is a bare basename under the run dir, re-joined from
+    // a validated name rather than taken as a path
+    const base = path.posix.basename(first);
+    if (!/^[\w.-]+$/.test(base)) return null;
+    const text = await dockerRun(ref.container, ['cat', `${ref.dir}/${base}`], 30000);
+    return text ? { file: base, text: tailText(text) } : null;
   }
   let files = [];
-  try { files = fs.readdirSync(dir); } catch { return null; }
+  try { files = fs.readdirSync(ref.dir); } catch { return null; }
   const logs = files.filter((f) => /^output-.*\.log$/.test(f)).sort();
   const pick = logs.length ? logs[logs.length - 1] : (files.includes('status.json') ? 'status.json' : null);
   if (!pick) return null;
-  try { return { file: pick, text: tailText(fs.readFileSync(path.join(dir, pick), 'utf8')) }; } catch { return null; }
+  try { return { file: pick, text: tailText(fs.readFileSync(path.join(ref.dir, pick), 'utf8')) }; } catch { return null; }
 }
 
 /* ── live subagent runs ──────────────────────────────────────────────────
@@ -575,8 +1089,12 @@ async function artifactNamesIn(dir) {
   const remote = parseSessionDir();
   let names = [];
   if (remote) {
-    const out = await dockerCapture(remote.container, ['sh', '-c',
-      `ls -1 '${path.posix.join(dir, 'subagent-artifacts')}' 2>/dev/null`], 20000).catch(() => '');
+    const ctr = safeContainerName(remote.container);
+    if (!ctr) return [];
+    // argv again: this path is derived from a run's status.json, which lives in
+    // the container and is not trusted text
+    const out = await dockerRun(ctr, ['sh', '-c',
+      'ls -1 "$1" 2>/dev/null', 'sh', path.posix.join(dir, 'subagent-artifacts')], 20000).catch(() => '');
     names = String(out || '').split('\n').map((x) => x.trim()).filter(Boolean);
   } else {
     try { names = fs.readdirSync(path.join(dir, 'subagent-artifacts')); } catch { names = []; }
@@ -754,12 +1272,9 @@ function serveStatic(req, res) {
  * step is defensive — worst case the file name is the title.
  */
 
-function execCapture(cmd, args, timeoutMs = 15000) {
-  return new Promise((resolve) => {
-    execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, shell: false },
-      (err, stdout) => resolve(err ? '' : stdout));
-  });
-}
+/* (execCapture lived here - a docker helper with no callers left once
+ * scanDockerSessions stopped building shell scripts. dockerRun() above is the
+ * one to use: same shape, but sized for a session directory's worth of output.) */
 
 // Extract a display title from the head of one session file's content.
 /* Latest `session_info` name found scanning lines backwards (pi appends these
@@ -779,21 +1294,9 @@ function nameFromText(text) {
   return null;
 }
 
-function nameFromTail(file, bytes = 64 * 1024) {
-  try {
-    const st = fs.statSync(file);
-    const len = Math.min(bytes, st.size);
-    const fd = fs.openSync(file, 'r');
-    const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, st.size - len);
-    fs.closeSync(fd);
-    let text = buf.toString('utf8');
-    // a tail read usually starts mid-line — drop the partial first line
-    if (st.size > len) text = text.slice(text.indexOf('\n') + 1);
-    return nameFromText(text);
-  } catch { /* unreadable */ }
-  return null;
-}
+/* (nameFromTail lived here. It stat'ed and opened every session file a second
+ * time just to read the tail. readSessionEdges() above reads head and tail from
+ * one open, so the function went with the second read.) */
 
 function titleFromHead(head) {
   let title = '';
@@ -836,48 +1339,100 @@ function isSubagentTranscript(p) {
   return /(^|[\\/])(subagent-artifacts|async-subagent-runs|chain-runs|subagent-results)([\\/]|$)/.test(p) || /(^|[\\/])(run|step)-\d+[\\/]/.test(p);
 }
 
-function scanLocalSessions() {
+/* Read a file's head and its tail from ONE open.
+ *
+ * Two things were wrong with doing this the obvious way. Every session file was
+ * opened twice - once for the head, once inside nameFromTail - and the whole loop
+ * was strictly sequential. Profiled over 200 session files: 19.8 ms of separate
+ * stat() calls, 91.9 ms for the head reads and 105.9 ms for the tail reads, which
+ * is the entire ~210 ms that `GET /api/sessions` measured per call. mtime and size
+ * now come from fstat on the handle already held, and the caller overlaps the
+ * files instead of walking them one at a time. */
+async function readSessionEdges(file, bytes = 64 * 1024) {
+  let fh;
+  try { fh = await fs.promises.open(file, 'r'); } catch { return null; }
+  try {
+    const st = await fh.stat();
+    const headLen = Math.min(bytes, st.size);
+    const headBuf = Buffer.alloc(headLen);
+    const headRead = await fh.read(headBuf, 0, headLen, 0);
+    const head = headBuf.toString('utf8', 0, headRead.bytesRead);
+    // a file smaller than one window IS its own tail, exactly as nameFromTail
+    // treated it - otherwise a session under 64 KB would lose its explicit name
+    let tail = head;
+    let tailTruncated = false;
+    if (st.size > headLen) {
+      const tailLen = Math.min(bytes, st.size);
+      const tailBuf = Buffer.alloc(tailLen);
+      const r = await fh.read(tailBuf, 0, tailLen, st.size - tailLen);
+      tail = tailBuf.toString('utf8', 0, r.bytesRead);
+      tailTruncated = true;
+    }
+    return { head, tail, tailTruncated, mtimeMs: st.mtimeMs, size: st.size };
+  } catch {
+    return null;
+  } finally {
+    try { await fh.close(); } catch { /* already closed */ }
+  }
+}
+
+/* Run `fn` over `items` with at most `limit` in flight.
+ *
+ * The cost here is per-file latency, not CPU, so overlapping the I/O is most of
+ * the win - but an unbounded Promise.all over a session directory with thousands
+ * of files would hold thousands of descriptors open at once, so the concurrency
+ * is capped. */
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i], i);
+    }
+  };
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker);
+  await Promise.all(workers);
+  return out;
+}
+
+const SCAN_CONCURRENCY = 24;
+
+async function scanLocalSessions() {
   let files;
   try {
-    files = fs.readdirSync(SESSION_DIR, { recursive: true })
-      .filter((f) => f.endsWith('.jsonl') && !isSubagentTranscript(f))
-      .map((f) => path.join(SESSION_DIR, f));
+    files = await fs.promises.readdir(SESSION_DIR, { recursive: true })
+      .then((f) => f.filter((f) => f.endsWith('.jsonl') && !isSubagentTranscript(f)))
+      .then((f) => f.map((f) => path.join(SESSION_DIR, f)));
   } catch {
     return [];
   }
+  const edges = await mapLimit(files, SCAN_CONCURRENCY, (f) => readSessionEdges(f));
   const sessions = [];
-  for (const file of files) {
-    let st;
-    try {
-      st = fs.statSync(file);
-    } catch {
-      continue;
-    }
-    let title = '';
-    let parent = null;
-    try {
-      const fd = fs.openSync(file, 'r');
-      const buf = Buffer.alloc(64 * 1024);
-      const read = fs.readSync(fd, buf, 0, buf.length, 0);
-      fs.closeSync(fd);
-      const head = buf.toString('utf8', 0, read);
-      title = titleFromHead(head);
-      // The header records where a fork came from, which is what the sidebar
-      // uses to show "this one branched off that one".
-      const first = head.split('\n')[0];
-      try { parent = JSON.parse(first).parentSession || null; } catch { /* old or odd file */ }
-    } catch {
-      /* unreadable file — fall back to file name */
-    }
+  for (let i = 0; i < files.length; i++) {
+    const e = edges[i];
+    if (!e) continue;                             // vanished between readdir and open
+    const file = files[i];
     const name = path.basename(file);
-    // prefer an explicit rename (tail) over the derived first-message title
-    const explicit = nameFromTail(file);
+    let parent = null;
+    // The header records where a fork came from, which is what the sidebar
+    // uses to show "this one branched off that one".
+    try { parent = JSON.parse(e.head.split('\n')[0]).parentSession || null; } catch { /* old or odd file */ }
+    let title = '';
+    try { title = titleFromHead(e.head); } catch { /* unreadable */ }
+    // prefer an explicit rename (tail) over the derived first-message title.
+    // A tail read usually starts mid-line, so the partial first line is dropped -
+    // and when there is no newline in the window there is nothing to drop.
+    const tailForName = e.tailTruncated ? e.tail.slice(e.tail.indexOf('\n') + 1) : e.tail;
+    let explicit = null;
+    try { explicit = nameFromText(tailForName); } catch { /* odd file */ }
     sessions.push({
       path: file,
       fileName: name,
       name: explicit || title || name.replace(/\.jsonl$/, ''),
-      mtime: st.mtimeMs,
-      size: st.size,
+      mtime: e.mtimeMs,
+      size: e.size,
       parent,
     });
   }
@@ -885,30 +1440,138 @@ function scanLocalSessions() {
   return sessions.slice(0, 200);
 }
 
-async function scanDockerSessions(container, dir) {
-  // Recursive "mtime size path" lines, newest first. find -printf is GNU; the
-  // sandbox images are Debian-based so this holds.
-  const statOut = await execCapture('docker', ['exec', container, 'sh', '-c',
-    `find '${dir}' -name '*.jsonl' -printf '%T@ %s %p\\n' 2>/dev/null | sort -rn | head -200`]);
-  if (!statOut.trim()) return [];
-  const files = statOut.trim().split('\n').map((l) => {
-    const [mtime, size, ...rest] = l.trim().split(' ');
-    return {
-      path: rest.join(' '),
-      fileName: rest.join(' ').split('/').pop(),
-      mtime: Math.floor(parseFloat(mtime) * 1000),
-      size: parseInt(size, 10) || 0,
-    };
-  }).filter((f) => f.path.endsWith('.jsonl') && !isSubagentTranscript(f.path));
+/* A container name that is safe to hand to `docker exec`.
+ *
+ * The name is always an argv element, never script text, so this is not about
+ * shell quoting: it only has to reject values `docker` would read as a flag
+ * (leading `-`) and anything a line-oriented reader could not carry. */
+function safeContainerName(name) {
+  const n = String(name == null ? '' : name).trim();
+  return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(n) ? n : null;
+}
 
-  // Pull a title out of each file head + any explicit renames from the tail.
-  const heads = await execCapture('docker', ['exec', container, 'sh', '-c',
-    `for f in ${files.map((f) => `'${f.path}'`).join(' ')}; do` +
-    ` echo "===PIWEBUI $f"; head -c 32768 "$f"; echo;` +
-    ` echo "===PIWEBUITAIL $f"; tail -c 65536 "$f" 2>/dev/null; echo; done`], 30000);
+/* Run one command in a container. Args are passed positionally - the file list
+ * below is a list of argv elements, never text spliced into a script. */
+function dockerRun(container, args, timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    execFile('docker', ['exec', container, ...args],
+      { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, shell: false },
+      (err, stdout) => resolve(err ? '' : String(stdout || '')));
+  });
+}
+
+/* Session discovery inside a container.
+ *
+ * ── why this is written the way it is ──────────────────────────────────────
+ *
+ * It used to build a shell script out of the file names it had just read:
+ *
+ *     for f in '<path1>' '<path2>'; do …; done        ->  sh -c
+ *
+ * A session file whose *name* contained a single quote therefore closed the
+ * quote and ran a command of its own. That was not theoretical: one
+ * unauthenticated `GET /api/sessions`, with a file named
+ * `a'; do touch PWNED_FINAL; done #x.jsonl` in the session directory, created
+ * /workspace/PWNED_FINAL inside the container. File names come from `find`, and
+ * `find` is not a trusted source of shell-safe text.
+ *
+ * So the directory is now *data* (`$1`), the paths are *argv* (`"$@"`), and
+ * nothing that arrives over the wire or off the filesystem is ever parsed as
+ * shell syntax.
+ *
+ * Two more faults lived in the same function and are fixed with it, because
+ * they are the same mistake seen from the other end - treating a path as a
+ * string to be rewritten rather than a value to be carried:
+ *
+ *  - the directory was "sanitised" by deleting every character outside
+ *    [A-Za-z0-9_-/], which deleted the dot in `~/.pi/agent/sessions` - the
+ *    default session directory - so the scan looked at `/root/pi/agent/sessions`,
+ *    which does not exist, and reported **zero sessions with no error at all**,
+ *    for ever. Verified against a container: the dotted path listed nothing, the
+ *    same directory without a dot listed the session. The container name is now
+ *    validated instead, and the directory is passed through untouched.
+ *
+ *  - it relied on `find -printf`, which is a GNU extension. BusyBox `find`
+ *    (Alpine, and many slim images) has no such option, so the listing was
+ *    silently empty on those too. `find -print0` plus `stat -c` works on both -
+ *    checked on Debian and on Alpine.
+ *
+ * A file name containing a newline or the marker text is skipped rather than
+ * allowed to make the head/tail markers ambiguous. */
+const DOCKER_SCAN_LIMIT = 200;
+const DOCKER_LIST_BYTES = 2000000;
+const TITLE_MARKER = '===PIWEBUI';
+
+/* One warning per distinct reason.
+ *
+ * The session scan can fail for reasons that are all reported the same way - an
+ * empty list - so anything that explains one is worth saying once, and not worth
+ * repeating every twenty seconds for the rest of the run (issue #30). */
+const SCAN_WARNED = new Set();
+function warnScanOnce(key, message) {
+  if (SCAN_WARNED.has(key)) return;
+  SCAN_WARNED.add(key);
+  console.warn(`session scan: ${message}`);
+}
+
+async function scanDockerSessions(container, dir) {
+  const ctr = safeContainerName(container);
+  if (!ctr) {
+    /* Say why, once.
+     *
+     * Every failure in this function used to be silent: the dot-stripping bug
+     * and the GNU `find -printf` dependency both presented as HTTP 200 with an
+     * empty session list, no error and no log line, so an empty sidebar was
+     * indistinguishable from "you have no sessions" (issue #30). A docker mode
+     * that cannot be reached at all is worth one line in the console. */
+    warnScanOnce('container-name', `session scan skipped: "${String(container).slice(0, 60)}" is not a usable container name`);
+    return [];
+  }
+  const root = String(dir == null ? '' : dir).trim();
+  if (!root) return [];
+
+  // 1) the files. NUL-separated, so a space or a quote in a name is just a byte.
+  const listRaw = await dockerRun(ctr, ['sh', '-c',
+    `find "$1" -name '*.jsonl' -print0 2>/dev/null | head -c ${DOCKER_LIST_BYTES}`, 'sh', root]);
+  const paths = listRaw.split('\u0000')
+    .map((s) => s.replace(/\r?\n$/, ''))
+    .filter(Boolean)
+    .filter((p) => p.endsWith('.jsonl') && !isSubagentTranscript(p))
+    // a name the marker line below cannot carry unambiguously
+    .filter((p) => !/[\r\n]/.test(p) && !p.includes(TITLE_MARKER))
+    .slice(0, DOCKER_SCAN_LIMIT);
+  if (!paths.length) return [];
+
+  // 2) mtime and size. One `stat` per file, over argv; GNU and BusyBox agree on -c.
+  const statRaw = await dockerRun(ctr, ['sh', '-c',
+    'for f do stat -c "%Y %s %n" "$f" 2>/dev/null || true; done', 'sh', ...paths]);
+  const files = [];
+  for (const line of statRaw.split('\n')) {
+    const m = /^(\d+) (\d+) ([\s\S]+)$/.exec(line.trim());
+    if (!m) continue;
+    const p = m[3];
+    if (!paths.includes(p)) continue;         // never trust a name we did not ask for
+    files.push({
+      path: p,
+      fileName: p.split('/').pop(),
+      mtime: Math.floor(parseFloat(m[1]) * 1000),
+      size: parseInt(m[2], 10) || 0,
+    });
+  }
+  if (!files.length) return [];
+  files.sort((a, b) => b.mtime - a.mtime);
+  const newest = files.slice(0, DOCKER_SCAN_LIMIT);
+
+  // 3) a title from each file's head, and any explicit rename from its tail.
+  //    `for f do` walks "$@", so a quote or a space in a name is inert.
+  const heads = await dockerRun(ctr, ['sh', '-c',
+    'for f do' +
+    ` echo "${TITLE_MARKER} $f"; head -c 32768 "$f"; echo;` +
+    ` echo "${TITLE_MARKER}TAIL $f"; tail -c 65536 "$f" 2>/dev/null; echo; done`, 'sh',
+    ...newest.map((f) => f.path)], 60000);
   const titleByFile = {};
   const explicitByFile = {};
-  for (const chunk of heads.split('===PIWEBUI')) {
+  for (const chunk of heads.split(TITLE_MARKER)) {
     const nl = chunk.indexOf('\n');
     if (nl < 0) continue;
     const marker = chunk.slice(0, nl).trim();
@@ -916,7 +1579,7 @@ async function scanDockerSessions(container, dir) {
     if (marker.startsWith('TAIL ')) explicitByFile[marker.slice(5).trim()] = nameFromText(body);
     else if (marker) titleByFile[marker] = titleFromHead(body);
   }
-  return files.map((f) => ({
+  return newest.map((f) => ({
     path: f.path,
     fileName: f.fileName,
     name: explicitByFile[f.path] || titleByFile[f.path] || f.fileName.replace(/\.jsonl$/, ''),
@@ -925,16 +1588,43 @@ async function scanDockerSessions(container, dir) {
   }));
 }
 
+/* Discover sessions, and carry the reason if it fails.
+ *
+ * Returning a bare [] on failure is what made an unreadable session directory
+ * indistinguishable from an empty one: the page showed an empty sidebar, which
+ * reads as "you have no sessions" rather than "nothing could be read". The scan
+ * still returns [] so every existing caller works, but it records why, and
+ * /api/sessions passes that on for the UI to show (issue #30). */
+let lastScanError = null;
+
 async function scanSessions() {
   const remote = parseSessionDir();
   if (remote) {
+    const ctr = safeContainerName(remote.container);
+    if (!ctr) {
+      lastScanError = `"${String(remote.container).slice(0, 60)}" is not a usable container name`;
+      warnScanOnce('container-name', lastScanError);
+      return [];
+    }
     try {
-      return await scanDockerSessions(remote.container, remote.dir);
-    } catch {
+      const found = await scanDockerSessions(remote.container, remote.dir);
+      lastScanError = null;
+      return found;
+    } catch (e) {
+      lastScanError = `could not read ${remote.dir} in ${ctr}: ${e.message}`;
+      warnScanOnce('docker-scan', lastScanError);
       return [];
     }
   }
-  return scanLocalSessions();
+  try {
+    const found = await scanLocalSessions();
+    lastScanError = null;
+    return found;
+  } catch (e) {
+    lastScanError = `could not read ${SESSION_DIR}: ${e.message}`;
+    warnScanOnce('local-scan', lastScanError);
+    return [];
+  }
 }
 
 // UI settings (appearance, agent name/avatar, voice). PI_WEBUI_SETTINGS lets a
@@ -1073,9 +1763,14 @@ async function sessionFileExists(p) {
   if (typeof p !== 'string' || !p.trim()) return false;
   const remote = parseSessionDir();
   if (remote) {
-    const q = p.replace(/'/g, "'\\''");
+    const ctr = safeContainerName(remote.container);
+    if (!ctr) return false;
+    // This one escaped its quotes by hand - `p.replace(/'/g, "'\\''")` is the
+    // correct POSIX trick, and it was the only place in the file that got it
+    // right. It is still quoting to be read by a shell when it does not have to:
+    // the path goes in as argv, so there is nothing left to escape. */
     return await new Promise((resolve) => {
-      execFile('docker', ['exec', remote.container, 'sh', '-c', `test -f '${q}'`],
+      execFile('docker', ['exec', ctr, 'sh', '-c', 'test -f "$1"', 'sh', p],
         { timeout: 15000 }, (err) => resolve(!err));
     });
   }
@@ -1272,9 +1967,30 @@ function maskKey(k) {
   return s.slice(0, 4) + '…' + s.slice(-4);
 }
 
+/* Write a JSON file atomically: full contents to a sibling .tmp, then renamed
+ * over the target. Rename is atomic within a directory, so a concurrent reader
+ * (pi reloading the file, or another request) sees either the old file or the
+ * new one, never a half-written one. The temp name carries the pid so two
+ * writes racing in the same process cannot clobber each other's staging file. */
+function writeJsonAtomic(target, value) {
+  const tmp = `${target}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(value, null, 2));
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* nothing to clean up */ }
+    throw e;
+  }
+}
+
+/* Write models.json atomically.
+ *
+ * mkdir matters here and not just for tidiness: on a machine (or in a container)
+ * whose ~/.pi/agent does not exist yet, the write failed outright without it,
+ * so "add provider" reported a bare ENOENT. */
 function writeModelsFile(file) {
   fs.mkdirSync(PI_AGENT_DIR, { recursive: true });
-  fs.writeFileSync(PI_MODELS_FILE, JSON.stringify(file, null, 2) + '\n');
+  writeJsonAtomic(PI_MODELS_FILE, `${JSON.stringify(file, null, 2)}\n`);
 }
 
 /* This machine's private IPv4 addresses. A llama-server started with the default
@@ -1340,10 +2056,28 @@ async function llamaSweepLan() {
   console.log(`llama.cpp on the LAN: ${found.length ? found.join(', ') : 'nothing found'}`);
 }
 
+/* The LAN sweep is opt-in.
+ *
+ * It used to run on any bridge start where it had not been switched off, which
+ * meant every page load fired up to 1016 HTTP probes at the local subnet
+ * (2 subnets x 254 hosts x 2 ports, 48 at a time, 350 ms timeout each) - measured
+ * at 1.24 s for the first `/api/llama-models`, reached from `refreshModels()` on
+ * connect. On a shared or office network that is both slow and rude, so it is now
+ * asked for rather than assumed:
+ *
+ *     PI_LLAMA_SCAN=on     enable the sweep
+ *     unset / anything else  no sweep
+ *
+ * Nothing is lost at the default: `llamaServerCandidates()` still probes what is
+ * configured, loopback, and this machine's own addresses, which is where a local
+ * llama-server lives. The sweep only ever added *other machines* on the subnet. */
+function llamaLanEnabled() {
+  const v = String(process.env.PI_LLAMA_SCAN || '').trim().toLowerCase();
+  return v === 'on' || v === '1' || v === 'true' || v === 'yes';
+}
+
 function llamaLanUrls() {
-  // PI_LLAMA_SCAN=off turns the sweep off for anyone who does not want the bridge
-  // walking their subnet.
-  if (String(process.env.PI_LLAMA_SCAN || '').toLowerCase() === 'off') return [];
+  if (!llamaLanEnabled()) return [];
   if (llamaLan.urls.length && Date.now() - llamaLan.at < LLAMA_LAN_TTL) return llamaLan.urls;
   if (!llamaLan.scanning) llamaSweepLan().catch(() => {});
   // While a sweep is running the previous answer (if any) still counts.
@@ -1354,7 +2088,137 @@ function llamaLanUrls() {
  * a retry loop). */
 const llamaModelsCache = { at: 0, data: null };
 
+/* ── who is allowed to talk to this bridge ─────────────────────────────────
+ *
+ * There is no authentication, so when the bridge is on the network anyone who
+ * can reach it can drive the agent - including its `bash` RPC, which is a shell on
+ * this machine. That is a deliberate trade for a single-user tool, but two classes
+ * of attack do not need to be able to *reach* the port at all, and both arrive
+ * through a browser the user is already using (issue #23):
+ *
+ *  - **Cross-site request forgery.** Any page you visit can POST to
+ *    http://<this-machine>:<port>/api/session-delete. CORS stops it *reading* the
+ *    reply, but a POST with a side effect needs no reply. Same for the endpoints
+ *    that write auth.json and models.json, and for /api/upload-raw.
+ *  - **DNS rebinding.** A hostname the attacker controls, resolved to this
+ *    machine's LAN address, makes the bridge same-origin with their page - so the
+ *    same-origin policy stops protecting anything and they can read every session.
+ *
+ * Both are fixed the same way and neither needs a login:
+ *
+ *  - the `Host` header must be an address this bridge actually answers on, which
+ *    is what rebinding cannot forge;
+ *  - a write (anything but GET/HEAD/OPTIONS) must not carry an `Origin` from
+ *    somewhere else. Browsers send Origin on every cross-site write, including
+ *    plain form posts, so its absence means a non-browser client - curl, the
+ *    desktop shell - which is not what CSRF is about.
+ *
+ * This is not a substitute for authentication if the machine is on a network you
+ * do not trust; it closes the two holes that need no credentials to exploit.
+ * PI_WEBUI_ALLOWED_HOSTS adds names for setups this cannot guess (a DNS name, a
+ * reverse proxy). */
+const EXTRA_ALLOWED_HOSTS = String(process.env.PI_WEBUI_ALLOWED_HOSTS || '')
+  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+
+let hostCache = { at: 0, names: null };
+function allowedHostNames() {
+  const now = Date.now();
+  if (hostCache.names && now - hostCache.at < 30000) return hostCache.names;
+  const names = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0', '::']);
+  for (const n of EXTRA_ALLOWED_HOSTS) names.add(n);
+  // the machine's own names and addresses: how someone actually reaches it
+  try { names.add(String(os.hostname()).toLowerCase()); } catch { /* none */ }
+  try { names.add(String(os.hostname()).toLowerCase() + '.local'); } catch { /* none */ }
+  try { names.add(String(os.hostname()).toLowerCase() + '.localhost'); } catch { /* none */ }
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const a of list || []) if (a && a.address) names.add(String(a.address).toLowerCase());
+  }
+  hostCache = { at: now, names };
+  return names;
+}
+
+/* The host part of a Host header, without the port and without IPv6 brackets. */
+function hostOnly(hostHeader) {
+  const h = String(hostHeader || '').trim().toLowerCase();
+  if (!h) return '';
+  if (h.startsWith('[')) {
+    const end = h.indexOf(']');
+    return end < 0 ? h : h.slice(1, end);
+  }
+  const colon = h.lastIndexOf(':');
+  // a lone colon means a port; several mean an IPv6 literal without brackets
+  return colon >= 0 && h.indexOf(':') === colon ? h.slice(0, colon) : h;
+}
+
+const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/* null when the request is fine, or a short reason to log and refuse with. */
+function requestRefused(req) {
+  const host = hostOnly(req.headers.host);
+  // A missing Host means HTTP/1.0. Browsers always send one, and it is the header
+  // a rebinding attack cannot get right, so its absence is not accepted.
+  if (!host) return 'no Host header';
+  if (!allowedHostNames().has(host)) return `Host "${host}" is not an address this bridge answers on`;
+
+  if (!WRITE_METHODS.has(String(req.method || '').toUpperCase())) return null;
+
+  const origin = req.headers.origin;
+  if (!origin) return null;                       // not a browser (curl, the desktop shell)
+  let oHost, oProto;
+  try {
+    const u = new URL(String(origin));
+    oHost = hostOnly(u.host);
+    oProto = u.protocol;
+  } catch { return `Origin "${String(origin).slice(0, 60)}" is not a URL`; }
+  // Same origin as the request itself, which covers every way the UI is reached
+  // (loopback, LAN address, hostname, a proxy) without having to list them.
+  const selfProto = req.socket && req.socket.encrypted ? 'https:' : 'http:';
+  if (oHost === host && oProto === selfProto) return null;
+  return `Origin "${String(origin).slice(0, 60)}" is not this bridge`;
+}
+
+/* The endpoints that exist to be read by *another* instance's page - they are
+ * declared cross-origin on purpose and say nothing private (a name, a picture, a
+ * busy flag, a build id). They are still subject to the Host check, which is what
+ * actually stops rebinding. */
+const CROSS_ORIGIN_OK = ['/api/health', '/api/instance-card'];
+
 const server = http.createServer(async (req, res) => {
+  // A client that goes away mid-response (a closed tab, a laptop lid, a Ctrl-C on
+  // a long download) makes the socket's next write raise EPIPE / ECONNRESET.
+  // Unhandled, that is an 'error' event on the socket with no listener, and Node
+  // takes the *whole bridge* down with it - the agent, every other tab, the
+  // WebSocket the agent was streaming on. It happened for real on a large
+  // session-messages response, which is exactly the payload a browser abandons
+  // most often: it re-requests on every reload. Nothing to do about a client
+  // that left; just do not let it stop anything else.
+  //
+  // The listener goes on the socket, not on the response: the error is raised by
+  // Socket._writeGeneric and emitted on the Socket, and a res.on('error') does
+  // not see it.
+  if (req.socket && !req.socket.__guarded) {
+    req.socket.__guarded = true;
+    req.socket.on('error', () => { /* the client went away mid-response */ });
+  }
+  req.on('error', () => { /* client aborted the request */ });
+  req.on('aborted', () => { /* ditto */ });
+  res.on('error', () => { /* ditto */ });
+
+  /* Refuse before anything else looks at the request: a cross-site write or a
+   * rebound hostname must not reach a handler, whatever the endpoint is. */
+  const refused = requestRefused(req);
+  if (refused) {
+    const why = String(refused);
+    const noisy = !/^Host /.test(why);           // a wrong Host is usually a scanner
+    if (noisy) console.warn(`refused ${req.method} ${String(req.url).slice(0, 80)}: ${why}`);
+    res.writeHead(403, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({
+      error: `refused: ${why}`,
+      hint: 'If you reach this bridge by a name or address not listed here, add it to PI_WEBUI_ALLOWED_HOSTS.',
+    }));
+    return;
+  }
+
   if (req.url.startsWith('/api/ui-settings')) {
     if (req.method === 'POST') {
       let body = '';
@@ -1390,6 +2254,10 @@ const server = http.createServer(async (req, res) => {
       sessionDir: SESSION_DIR,
       remembered: loadLastSession(),
       sessions: await scanSessions(),
+      // A scan that failed is reported alongside the empty list, so the sidebar
+      // can say "the session directory could not be read" instead of looking
+      // like an account with no sessions in it (issue #30).
+      scanError: lastScanError,
       // What the agent is doing right now, so a page that reloads in the middle
       // of it (or a second tab) shows the same thing as the one that started it.
       busy: agentStatus.busy,
@@ -1401,8 +2269,112 @@ const server = http.createServer(async (req, res) => {
   // sessions while the shared agent keeps running in its own session
   // (the live view of the running session stays in the UI's DOM cache).
   // Local session dirs only — docker dirs would need `docker exec cat`.
+  /* One picture out of a session file, as image bytes.
+   *
+   * The transcript points here instead of carrying the base64, so this is called
+   * for the pictures that are actually on screen and not for the rest. The browser
+   * caches the result (the URL carries the file's size and mtime, so a session that
+   * changed invalidates it), and it is a plain image response - which is also less
+   * memory in the page than a data URL, since the decoded bitmap replaces the
+   * base64 text rather than sitting alongside it. */
+  if (req.url.startsWith('/api/session-image')) {
+    const u = new URL(req.url, 'http://x');
+    const p = u.searchParams.get('path') || '';
+    const wantLine = parseInt(u.searchParams.get('line') || '', 10);
+    const wantPart = parseInt(u.searchParams.get('part') || '0', 10);
+    const ref = sessionRef(p);
+    if (!ref || !Number.isFinite(wantLine) || wantLine < 1) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'bad path or line' }));
+      return;
+    }
+    try {
+      /* Straight to the line when the transcript has already indexed this file.
+       *
+       * The fallback is the old behaviour - read forward - which is O(position);
+       * with the index it is one short read whatever the line. The index is built
+       * by /api/session-messages, which is what drew the transcript the picture is
+       * being requested for, so in the normal case it is already there. */
+      /* Read the line, and say what actually went wrong when it cannot be used.
+       *
+       * `found` used to mean "a line was read" while a parse failure was swallowed
+       * into entry = null, so every such failure came out as the same message -
+       * "that image is no longer at that line" - which is a claim about the SESSION
+       * being wrong rather than about the reader being wrong. That is what made
+       * issue #38 read as a missing image: the line was there, the read of it was
+       * broken, and the error blamed the file. */
+      let entry = null;
+      let read = false;               // a line was located and read
+      let badJson = false;            // ... but it did not parse as one entry
+      const stampNow = await sessionStamp(ref);
+      const offsets = stampNow ? indexGet(indexKey(ref, stampNow)) : null;
+      const at = offsets && offsets.length >= wantLine ? offsets[wantLine - 1] : null;
+      if (at != null) {
+        const raw = await readLineAt(ref, at);
+        if (raw != null) {
+          read = true;
+          try { entry = JSON.parse(raw); } catch { entry = null; badJson = true; }
+        }
+      }
+      if (!read) {
+        // no index (or the file moved under it): read forward, as before
+        let line = 0;
+        for await (const raw of sessionLines(ref)) {
+          if (++line !== wantLine) continue;
+          read = true;
+          try { entry = JSON.parse(raw); } catch { entry = null; badJson = true; }
+          break;
+        }
+      }
+      if (badJson) {
+        // Neither the session's fault nor the picture's. Say which, so the next
+        // person looks at the reader instead of hunting for a lost image.
+        res.writeHead(500, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ error: `line ${wantLine} could not be read as one session entry` }));
+        return;
+      }
+      const content = entry && entry.message && entry.message.content;
+      const block = Array.isArray(content) ? content[wantPart] : null;
+      if (!read || !block || block.type !== 'image' || typeof block.data !== 'string') {
+        // Genuinely nothing to serve: a wrong line or part, or a session rewritten
+        // under a URL that named a position in the old one.
+        res.writeHead(404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ error: 'that image is no longer at that line' }));
+        return;
+      }
+      const mime = String(block.mimeType || 'image/png');
+      const data = /^data:/i.test(block.data) ? block.data.slice(block.data.indexOf(',') + 1) : block.data;
+      const bytes = Buffer.from(data, 'base64');
+      const etag = `"${crypto.createHash('sha1').update(`${ref.path || ref.container}:${wantLine}:${wantPart}:${data.length}`).digest('hex')}"`;
+      if (req.headers['if-none-match'] === etag) {
+        res.writeHead(304, { ETag: etag, 'Cache-Control': 'private, max-age=31536000, immutable' });
+        res.end();
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': mime,
+        'Content-Length': bytes.length,
+        ETag: etag,
+        // immutable: the URL changes whenever the file does, so this can be cached
+        // for as long as the browser likes and never be revalidated
+        'Cache-Control': 'private, max-age=31536000, immutable',
+      });
+      res.end(bytes);
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ error: `read failed: ${e.message}` }));
+    }
+    return;
+  }
+
   if (req.url.startsWith('/api/session-messages')) {
-    const p = new URL(req.url, 'http://x').searchParams.get('path') || '';
+    const purl = new URL(req.url, 'http://x');
+    const p = purl.searchParams.get('path') || '';
+    // `?inline=1` puts the picture bytes back into the response, exactly as this
+    // endpoint behaved before. There is no flag for the other way round: naming
+    // the pictures is the default, because it is what makes a session open in
+    // under a second instead of downloading every picture ever pasted into it.
+    const inlineImages = purl.searchParams.get('inline') === '1' || purl.searchParams.get('inline') === 'true';
     if (!p) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'missing path' }));
@@ -1414,25 +2386,101 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'path must stay inside the session dir' }));
       return;
     }
+    let gz = null;
+    let w = null;
     try {
-      const text = await readSessionRef(ref);
-      if (text == null) throw new Error('session file could not be read');
-      const messages = [];
+      // Both halves of that are measured, not assumed:
+      //
+      //  - Base64 is already high-entropy, so gzipping an image-heavy session
+      //    costs seconds of CPU to save a fraction of it (1315 ms to save 17 of
+      //    70 MB on a real one).
+      //  - Compressing anything at all is a loss on loopback, where the transfer
+      //    is free and the CPU is not. Measured on the same machine: a 21 MB
+      //    session went from 275 ms to 458 ms with compression on, and a 4.5 MB
+      //    one from 76 ms to 93 ms - all of it spent compressing bytes that were
+      //    going to arrive in a millisecond anyway. Over the LAN the same
+      //    compression is a 4x smaller transfer, which is worth far more.
+      //
+      // So: is the client on this machine? Is the file mostly pictures? Only then
+      // is it worth a CPU core.
+      //
+      // Note the order, which cost a day: asking for the file's size is itself
+      // work - a `docker exec stat` in container mode is ~90 ms of container
+      // startup - so it happens only when the answer can change the outcome. On
+      // loopback the whole question is skipped and the response starts streaming
+      // immediately, which is the common case.
+      const remote = String((req.socket && req.socket.remoteAddress) || '');
+      const local = !remote || remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+      const wantsGzip = /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''));
+      let compress = false;
+      let stamp = '';
+      if (wantsGzip && !local) {
+        const size = await sessionSize(ref);
+        if (size > 256 * 1024) compress = (await imageDensity(ref)) < 0.35;
+      }
+      // the token on every image reference, so a session that changes invalidates
+      // the browser's cached copies of the pictures in it
+      if (!inlineImages) {
+        try {
+          const st = ref.kind === 'docker'
+            ? String(await dockerCapture(ref.container, ['stat', '-c', '%s-%Y', ref.path], 20000) || '').trim()
+            : (() => { const s = fs.statSync(ref.path); return `${s.size}-${Math.floor(s.mtimeMs)}`; })();
+          stamp = st;
+        } catch { /* no token: the URL still works, it is just not cache-busted */ }
+      }
+      if (compress) {
+        gz = zlib.createGzip({ level: 1 });
+        gz.on('error', () => { /* the client hung up; the socket is already gone */ });
+        gz.pipe(res);
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        // no Content-Length on purpose: the length is not known until the last
+        // line is parsed, and inventing one is what made this a 378 ms wait
+        ...(gz ? { 'Content-Encoding': 'gzip', Vary: 'Accept-Encoding' } : {}),
+        'Cache-Control': 'no-store',
+      });
+      // A bigger socket buffer, so a chunked transcript is not reported "full"
+      // every 16 KB - that alone turned streaming into a slow drip.
+      try { res._writableState.highWaterMark = 1 << 20; } catch { /* older node */ }
+      // Built AFTER the gzip decision, and pointed at whatever actually carries
+      // the bytes. Writing to `res` while the header said gzip produced plain
+      // JSON with a gzip label on it, which no browser can read.
+      w = writeStream(gz || res);
+      w.add(`{"path":${JSON.stringify(p)},"messages":[`);
+      await w.flush();
+      let first = true, n = 0, parent = null, line = 0, stripped = 0, saved = 0;
       const compactions = [];
-      let parent = null;
-      for (const line of text.split('\n')) {
-        if (!line.trim()) continue;
-        let e; try { e = JSON.parse(line); } catch { continue; }
+      /* Record where each line starts while the file is being read anyway, so
+       * /api/session-image can seek straight to one instead of reading up to it.
+       * The stamp is taken unconditionally now: it is one stat, it keys the index,
+       * and the picture URLs need it in the same form. */
+      let stampKey = stamp;
+      if (!stampKey) { try { stampKey = await sessionStamp(ref); } catch { /* no index */ } }
+      const lineOffsets = [];
+      const wantIndex = !!stampKey && !inlineImages;
+      for await (const raw of sessionLines(ref, wantIndex ? (off) => lineOffsets.push(off) : undefined)) {
+        line++;
+        if (!raw.trim()) continue;
+        let e; try { e = JSON.parse(raw); } catch { continue; }
+        if (!e) continue;
         // The header records where a fork came from - deleting a fork can send
         // you back to its original session instead of a blank one.
-        if (e && e.type === 'session' && e.parentSession) parent = e.parentSession;
-        if (e && e.type === 'message' && e.message) {
+        if (e.type === 'session' && e.parentSession) parent = e.parentSession;
+        if (e.type === 'message' && e.message) {
           // entryId travels with the message so the UI can offer "fork from
-          // here" while reading a session that the agent has not loaded.
-          messages.push({ ...e.message, timestamp: e.message.timestamp ?? e.timestamp, entryId: e.id || null });
-        } else if (e && e.type === 'compaction' && e.summary) {
+          // here" while reading a session the agent has not loaded.
+          const m = { ...e.message, timestamp: e.message.timestamp ?? e.timestamp, entryId: e.id || null };
+          if (!inlineImages) {
+            const r = externaliseImages(m, p, line, stamp);
+            stripped += r.n; saved += r.saved;
+          }
+          w.add((first ? '' : ',') + JSON.stringify(m));
+          first = false;
+          if (w.size >= WRITE_CHUNK) await w.flush();
+        } else if (e.type === 'compaction' && e.summary) {
           // Compactions are their own entry type (not messages), so they are
-          // missing from get_messages — without these the "conversation
+          // missing from get_messages - without these the "conversation
           // compacted" markers vanished as soon as the page was reloaded.
           compactions.push({
             summary: e.summary,
@@ -1442,10 +2490,24 @@ const server = http.createServer(async (req, res) => {
             timestamp: e.timestamp || null,
           });
         }
+        // Hand the thread back every so often, and check whether anything was
+        // waiting on us (the agent's stream, another request) before the next
+        // batch. Without this a long read froze every socket on the bridge.
+        if (++n % 250 === 0) {
+          await breathe();
+          if (res.writableEnded || res.destroyed) return;
+        }
       }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ path: p, messages, compactions, parent }));
+      w.add(`],"compactions":${JSON.stringify(compactions)},"parent":${JSON.stringify(parent)}` +
+        (stripped ? `,"imagesOut":${stripped},"imageBytes":${saved}` : '') + '}');
+      await w.flush();
+      // Only worth keeping if it lines up with what was actually written out.
+      if (wantIndex && lineOffsets.length >= line) indexPut(indexKey(ref, stampKey), lineOffsets);
+      if (gz) gz.end(); else res.end();
     } catch (e) {
+      try { if (gz) gz.destroy(); } catch { /* already gone */ }
+      if (w) { try { w.buf.length = 0; w.size = 0; } catch { /* gone */ } }
+      if (res.headersSent) { try { res.end(); } catch { /* gone */ } return; }
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: `read failed: ${e.message}` }));
     }
@@ -1965,6 +3027,15 @@ const server = http.createServer(async (req, res) => {
         '.webp': 'image/webp', '.avif': 'image/avif', '.bmp': 'image/bmp', '.svg': 'image/svg+xml',
         '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.m4v': 'video/x-m4v',
         '.ogv': 'video/ogg', '.mkv': 'video/x-matroska',
+        // Audio: the "when the agent finishes" sound the user picked. Without a
+        // correct type the browser downloads it and then refuses to decode it,
+        // which shows up as a notification that silently never plays. (.webm is
+        // listed once, as video: it is both, and video is what this app plays
+        // far more of - an audio/webm response still decodes as audio.)
+        '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.oga': 'audio/ogg',
+        '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.flac': 'audio/flac', '.opus': 'audio/opus',
+        '.weba': 'audio/webm',
+        '.cur': 'image/x-icon', '.ico': 'image/x-icon',
       };
       const st = fs.statSync(file);
       const type = types[path.extname(file).toLowerCase()] || 'application/octet-stream';
@@ -2032,7 +3103,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Exact route: "/api/upload-raw" also starts with "/api/upload", and reading a
-  // raw body as JSON gave "Unexpected token ' '" on the first big upload.
+  // raw body as JSON gave "Unexpected token '\0'" on the first big upload.
   if (req.url.startsWith('/api/upload?') || req.url === '/api/upload') {
     if (req.method !== 'POST') { res.writeHead(405).end(); return; }
     let body = '';
@@ -2310,8 +3381,9 @@ const server = http.createServer(async (req, res) => {
       };
       providers[id] = entry;
     }
+    const response = { file: PI_AUTH_FILE, providers };
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ file: PI_AUTH_FILE, providers }));
+    res.end(JSON.stringify(response));
     return;
   }
   if (req.url.startsWith('/api/auth-login')) {
@@ -2328,7 +3400,7 @@ const server = http.createServer(async (req, res) => {
           const auth = readJsonSafe(PI_AUTH_FILE) || {};
           auth[id] = { type: 'api_key', key };
           try {
-            fs.writeFileSync(PI_AUTH_FILE, JSON.stringify(auth, null, 2));
+            writeJsonAtomic(PI_AUTH_FILE, auth);
           } catch (e) {
             throw new Error(`write failed: ${e.message}`);
           }
@@ -2364,7 +3436,7 @@ const server = http.createServer(async (req, res) => {
       }
       delete auth[id];
       try {
-        fs.writeFileSync(PI_AUTH_FILE, JSON.stringify(auth, null, 2));
+        writeJsonAtomic(PI_AUTH_FILE, auth);
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: `write failed: ${e.message}` }));
@@ -2377,6 +3449,327 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(405).end();
     return;
   }
+
+/* ── pi's extensions, skills, packages and AGENTS.md ──────────────────────
+ *
+ * The management tab (issue #46). Everything here is read or written under
+ * PI_AGENT_DIR and nowhere else, and nothing runs a shell: a name off the wire is
+ * data, it is reduced to a basename, and the path it produces has to be a direct
+ * child of the directory it belongs to.
+ *
+ * Enable/disable does NOT have its own mechanism. pi stores it as +path / -path /
+ * !pattern entries inside the `extensions`, `skills`, `prompts` and `themes`
+ * arrays of settings.json, and resolves them in isEnabledByOverrides()
+ * (core/package-manager.js): anything not matched is enabled, `-rel` and `!rel`
+ * disable, `+rel` re-enables. A pattern is the path relative to the agent dir, so
+ * disabling the gitea skill writes "skills": ["-skills/gitea"]. This writes the
+ * same format rather than inventing a second one - pi has to agree, or the switch
+ * would look on and do nothing.
+ *
+ * There is deliberately no install here. Adding an extension means the agent will
+ * load and run it, and this bridge has no authentication - only the Host/Origin
+ * gate that stops a page on another origin driving it (issue #23). "Install" over
+ * an unauthenticated port is "run my code on that machine", so it is left out
+ * rather than shipped behind a confirmation nobody reads. The tab says so. */
+const PI_EXT_DIR = path.join(PI_AGENT_DIR, 'extensions');
+const PI_SKILLS_DIR = path.join(PI_AGENT_DIR, 'skills');
+const PI_AGENTS_FILE = path.join(PI_AGENT_DIR, 'AGENTS.md');
+const RESOURCE_ARRAYS = { extensions: 'extensions', skills: 'skills' };
+
+/* A name that is exactly one path segment. Rejects "", ".", "..", anything with a
+ * separator or a control character, and anything unreasonably long. */
+function safeResourceName(name) {
+  const n = String(name == null ? '' : name).trim();
+  if (!n || n === '.' || n === '..') return null;
+  if (n.length > 200) return null;
+  if (/[\\/\u0000-\u001f]/.test(n)) return null;
+  if (n.includes('..')) return null;
+  return n;
+}
+
+/* The one path a resource of this kind is allowed to be. basename() cannot escape
+ * on its own, but the check is kept anyway: this is the value that decides what a
+ * delete removes, and the guard has to be visible next to the rm - which is the
+ * lesson from the two injection bugs this file has already had. */
+function resourcePath(kind, name) {
+  const safe = safeResourceName(name);
+  if (!safe) return null;
+  const root = kind === 'skills' ? PI_SKILLS_DIR : PI_EXT_DIR;
+  if (path.basename(safe) !== safe) return null;
+  const full = path.join(root, safe);
+  if (!full.startsWith(root + path.sep)) return null;
+  return full;
+}
+
+function readPiSettings() {
+  try {
+    const j = JSON.parse(fs.readFileSync(PI_SETTINGS_FILE, 'utf8'));
+    return j && typeof j === 'object' ? j : {};
+  } catch { return {}; }
+}
+
+function writePiSettings(settings) {
+  // The same shape pi's own SettingsManager writes (JSON.stringify(x, null, 2)),
+  // so its loader and this writer cannot disagree about the file.
+  writeJsonAtomic(PI_SETTINGS_FILE, settings);
+}
+
+/* pi's override resolution, reduced to what a single row needs: is this resource
+ * enabled? `rel` is the path relative to the agent dir, posix-separated. */
+function resourceEnabled(patterns, rel, name) {
+  const list = Array.isArray(patterns) ? patterns.filter((p) => typeof p === 'string') : [];
+  const overrides = list.filter((p) => p.startsWith('!') || p.startsWith('+') || p.startsWith('-'));
+  const accepts = (p) => p === rel || p === name;
+  const excludes = overrides.filter((p) => p.startsWith('!')).map((p) => p.slice(1));
+  const includes = overrides.filter((p) => p.startsWith('+')).map((p) => p.slice(1));
+  const forceOut = overrides.filter((p) => p.startsWith('-')).map((p) => p.slice(1));
+  let enabled = true;
+  if (excludes.some(accepts)) enabled = false;
+  if (includes.some(accepts)) enabled = true;
+  if (forceOut.some(accepts)) enabled = false;
+  return enabled;
+}
+
+/* Set one resource's override, replacing any earlier entry for it - what pi's
+ * config selector does, and what stops the array growing a line per click.
+ * enabled === null removes the override entirely. */
+function setResourceOverride(list, rel, enabled) {
+  const keep = (Array.isArray(list) ? list : []).filter((p) => {
+    if (typeof p !== 'string') return true;
+    const body = (p.startsWith('!') || p.startsWith('+') || p.startsWith('-')) ? p.slice(1) : p;
+    return body !== rel;
+  });
+  if (enabled === null) return keep;
+  keep.push(`${enabled ? '+' : '-'}${rel}`);
+  return keep;
+}
+
+/* Loose resources: a .ts/.js file (or a directory holding one) under extensions/,
+ * a directory holding SKILL.md under skills/. Anything else is ignored rather than
+ * listed as something this tab cannot act on. Packages are entries in
+ * settings.json, not files here, so they are listed separately. */
+function listLooseResources(kind) {
+  const root = kind === 'skills' ? PI_SKILLS_DIR : PI_EXT_DIR;
+  const out = [];
+  let entries;
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue;
+    const full = path.join(root, e.name);
+    if (e.isDirectory()) {
+      const entry = kind === 'skills'
+        ? fs.existsSync(path.join(full, 'SKILL.md'))
+        : (fs.existsSync(path.join(full, 'index.ts')) || fs.existsSync(path.join(full, 'index.js')));
+      if (!entry) continue;
+      let modified = 0;
+      try { modified = fs.statSync(full).mtimeMs; } catch { /* gone */ }
+      out.push({ name: e.name, kind: 'dir', rel: kind + '/' + e.name, modified });
+    } else if (e.isFile()) {
+      if (kind === 'skills') continue;                     // a skill is a directory holding SKILL.md
+      if (!/\.(ts|js|mjs|cjs)$/i.test(e.name)) continue;
+      let size = 0, modified = 0;
+      try { const st = fs.statSync(full); size = st.size; modified = st.mtimeMs; } catch { /* gone */ }
+      out.push({ name: e.name, kind: 'file', rel: kind + '/' + e.name, size, modified });
+    }
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+/* The global AGENTS.md, plus the per-project ones pi would pick up walking up from
+ * the agent's working directory. The project files are read-only here: they sit at
+ * arbitrary ancestor paths, and writing one would be a write anywhere on disk. */
+function agentContextFiles() {
+  const out = [];
+  out.push({
+    path: PI_AGENTS_FILE, scope: 'global', exists: fs.existsSync(PI_AGENTS_FILE),
+    writable: true, name: path.basename(PI_AGENTS_FILE),
+  });
+  const names = ['AGENTS.override.md', 'AGENTS.md', 'AGENTS.MD', 'CLAUDE.md', 'CLAUDE.MD'];
+  let dir = path.resolve(WORKSPACE_DIR);
+  /* Deduped case-insensitively: AGENTS.md and AGENTS.MD are one file on Windows and
+   * macOS, and listing the same file twice under two of its own spellings is the
+   * kind of thing that makes a list look broken. */
+  const seen = new Set();
+  const key = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+  for (let hops = 0; hops < 24; hops++) {
+    for (const n of names) {
+      const p = path.join(dir, n);
+      if (key(p) === key(PI_AGENTS_FILE) || seen.has(key(p))) continue;
+      seen.add(key(p));
+      if (!fs.existsSync(p)) continue;
+      let size = 0;
+      try { size = fs.statSync(p).size; } catch { /* gone */ }
+      out.push({
+        path: p, scope: dir === path.resolve(WORKSPACE_DIR) ? 'project' : 'parent',
+        exists: true, writable: false, name: n, size,
+      });
+    }
+    const up = path.dirname(dir);
+    if (up === dir) break;
+    dir = up;
+  }
+  return out;
+}
+
+function jsonOut(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify(obj));
+}
+
+if (req.url.startsWith('/api/pi-extensions')) {
+  const only = req.url.split('?')[0];
+  if (req.method === 'GET' && only === '/api/pi-extensions') {
+    const settings = readPiSettings();
+    const extPatterns = settings[RESOURCE_ARRAYS.extensions] || [];
+    const skillPatterns = settings[RESOURCE_ARRAYS.skills] || [];
+    const extensions = listLooseResources('extensions')
+      .map((r) => Object.assign({}, r, { enabled: resourceEnabled(extPatterns, r.rel, r.name), source: 'local' }));
+    const skills = listLooseResources('skills')
+      .map((r) => Object.assign({}, r, { enabled: resourceEnabled(skillPatterns, r.rel, r.name), source: 'local' }));
+    const packages = (Array.isArray(settings.packages) ? settings.packages : []).map((p, i) => ({
+      index: i,
+      source: typeof p === 'string' ? p : ((p && p.source) || ''),
+      form: typeof p === 'string' ? 'string' : 'object',
+      filters: (p && typeof p === 'object')
+        ? Object.fromEntries(Object.entries(p).filter(([k]) => k !== 'source'))
+        : null,
+    }));
+    jsonOut(res, 200, {
+      agentDir: PI_AGENT_DIR,
+      settingsFile: PI_SETTINGS_FILE,
+      extensions: extensions, skills: skills, packages: packages,
+      counts: { extensions: extensions.length, skills: skills.length, packages: packages.length },
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && only === '/api/pi-extensions/toggle') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1 << 20) req.destroy(); });
+    req.on('end', () => {
+      let j = null; try { j = JSON.parse(body || '{}'); } catch { j = null; }
+      const kind = j && String(j.type || '');
+      if (!j || !RESOURCE_ARRAYS[kind] || typeof j.enabled !== 'boolean') {
+        return jsonOut(res, 400, { error: 'need {type: "extensions"|"skills", name, enabled}' });
+      }
+      const name = safeResourceName(j.name);
+      const full = name ? resourcePath(kind, name) : null;
+      if (!full || !fs.existsSync(full)) return jsonOut(res, 400, { error: 'no such resource' });
+      const rel = kind + '/' + name;
+      const settings = readPiSettings();
+      settings[RESOURCE_ARRAYS[kind]] = setResourceOverride(settings[RESOURCE_ARRAYS[kind]], rel, j.enabled);
+      // A list that is back to nothing has no reason to stay in the file.
+      if (Array.isArray(settings[RESOURCE_ARRAYS[kind]]) && settings[RESOURCE_ARRAYS[kind]].length === 0) {
+        delete settings[RESOURCE_ARRAYS[kind]];
+      }
+      try { writePiSettings(settings); }
+      catch (e) { return jsonOut(res, 500, { error: 'could not write settings.json: ' + e.message }); }
+      jsonOut(res, 200, { ok: true, name: name, rel: rel, enabled: j.enabled, settingsFile: PI_SETTINGS_FILE });
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && only === '/api/pi-extensions/delete') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1 << 20) req.destroy(); });
+    req.on('end', () => {
+      let j = null; try { j = JSON.parse(body || '{}'); } catch { j = null; }
+      const kind = j && String(j.type || '');
+      if (!j || !RESOURCE_ARRAYS[kind]) return jsonOut(res, 400, { error: 'need {type: "extensions"|"skills", name}' });
+      const name = safeResourceName(j.name);
+      const full = name ? resourcePath(kind, name) : null;
+      if (!full || !fs.existsSync(full)) return jsonOut(res, 400, { error: 'no such resource' });
+      try { fs.rmSync(full, { recursive: true, force: true }); }
+      catch (e) { return jsonOut(res, 500, { error: 'could not remove it: ' + e.message }); }
+      const settings = readPiSettings();
+      settings[RESOURCE_ARRAYS[kind]] = setResourceOverride(settings[RESOURCE_ARRAYS[kind]], kind + '/' + name, null);
+      if (Array.isArray(settings[RESOURCE_ARRAYS[kind]]) && settings[RESOURCE_ARRAYS[kind]].length === 0) {
+        delete settings[RESOURCE_ARRAYS[kind]];
+      }
+      try { writePiSettings(settings); } catch { /* it is gone either way */ }
+      jsonOut(res, 200, { ok: true, removed: full });
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && only === '/api/pi-extensions/package') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1 << 20) req.destroy(); });
+    req.on('end', () => {
+      let j = null; try { j = JSON.parse(body || '{}'); } catch { j = null; }
+      const action = j && String(j.action || '');
+      const source = j && typeof j.source === 'string' ? j.source.trim() : '';
+      if (!j || (action !== 'add' && action !== 'remove')) {
+        return jsonOut(res, 400, { error: 'need {action: "add"|"remove", source}' });
+      }
+      if (!source || source.length > 300) return jsonOut(res, 400, { error: 'need a source' });
+      /* A source beginning with "-" is read by npm as a flag rather than a package
+       * once pi installs it, so it is refused here rather than stored and refused
+       * later by something that does not know what it is looking at. */
+      if (source.startsWith('-')) return jsonOut(res, 400, { error: 'a package source cannot start with "-"' });
+      if (/[\u0000-\u001f]/.test(source)) return jsonOut(res, 400, { error: 'a package source cannot contain control characters' });
+      const settings = readPiSettings();
+      const list = Array.isArray(settings.packages) ? settings.packages.slice() : [];
+      const sourceOf = (p) => (typeof p === 'string' ? p : ((p && p.source) || ''));
+      if (action === 'remove') {
+        const next = list.filter((p) => sourceOf(p) !== source);
+        if (next.length === list.length) return jsonOut(res, 404, { error: 'that package is not in the list' });
+        settings.packages = next;
+      } else {
+        if (list.some((p) => sourceOf(p) === source)) return jsonOut(res, 409, { error: 'that package is already listed' });
+        list.push(source);
+        settings.packages = list;
+      }
+      if (Array.isArray(settings.packages) && settings.packages.length === 0) delete settings.packages;
+      try { writePiSettings(settings); }
+      catch (e) { return jsonOut(res, 500, { error: 'could not write settings.json: ' + e.message }); }
+      jsonOut(res, 200, {
+        ok: true, packages: settings.packages || [],
+        note: action === 'add' ? 'listed in settings.json - pi fetches it the next time it starts, not from here' : undefined,
+      });
+    });
+    return;
+  }
+
+  res.writeHead(405).end();
+  return;
+}
+
+if (req.url.startsWith('/api/pi-agents')) {
+  const only = req.url.split('?')[0];
+  if (req.method === 'GET' && only === '/api/pi-agents') {
+    const files = agentContextFiles().map((f) => {
+      let content = '';
+      try { content = fs.readFileSync(f.path, 'utf8'); } catch { /* unreadable */ }
+      return Object.assign({}, f, {
+        content: f.writable ? content : content.slice(0, 20000),
+        truncated: !f.writable && content.length > 20000,
+        bytes: content.length,
+      });
+    });
+    jsonOut(res, 200, { global: files[0], files: files, workspace: WORKSPACE_DIR });
+    return;
+  }
+  if (req.method === 'POST' && only === '/api/pi-agents') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 4 << 20) req.destroy(); });
+    req.on('end', () => {
+      let j = null; try { j = JSON.parse(body || '{}'); } catch { j = null; }
+      if (!j || typeof j.content !== 'string') return jsonOut(res, 400, { error: 'need {content}' });
+      if (j.content.length > 4 * 1024 * 1024) return jsonOut(res, 413, { error: 'too large' });
+      try {
+        if (j.content.trim() === '') { try { fs.rmSync(PI_AGENTS_FILE, { force: true }); } catch { /* gone */ } }
+        else fs.writeFileSync(PI_AGENTS_FILE, j.content, 'utf8');
+      } catch (e) { return jsonOut(res, 500, { error: 'could not write it: ' + e.message }); }
+      jsonOut(res, 200, { ok: true, path: PI_AGENTS_FILE, bytes: j.content.length });
+    });
+    return;
+  }
+  res.writeHead(405).end();
+  return;
+}
+
 
   if (req.url.startsWith('/api/pi-providers')) {
     if (req.method === 'GET') {
@@ -2461,13 +3854,7 @@ const server = http.createServer(async (req, res) => {
             provider.apiKey = file.providers[id].apiKey;
           }
           file.providers[id] = provider;
-          try {
-            writeModelsFile(file);
-          } catch (e) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: `write failed: ${e.message}` }));
-            return;
-          }
+          writeModelsFile(file);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, file: PI_MODELS_FILE, id }));
         } catch (e) {
@@ -2666,12 +4053,34 @@ function startAgent() {
     childEnv.PI_CODING_AGENT_SESSION_DIR = SESSION_DIR;
     childEnv.PI_CODING_AGENT_DIR = PI_AGENT_DIR;
   }
-  const child = spawn(PI_COMMAND, {
-    shell: true, // pi is an npm .cmd shim on Windows; shell handles both platforms
-    cwd: hostSpawnDir(),
-    env: childEnv,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: !isWin, // POSIX: own process group so killTree can kill the whole tree
+  let child;
+  try {
+    child = spawn(PI_COMMAND, {
+      shell: true, // pi is an npm .cmd shim on Windows; shell handles both platforms
+      cwd: hostSpawnDir(),
+      env: childEnv,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      detached: !isWin, // POSIX: own process group so killTree can kill the whole tree
+    });
+  } catch (e) {
+    console.error(`could not start the agent (${PI_COMMAND}): ${e.message}`);
+    broadcast({
+      bridge: 'agent_exit',
+      error: `Failed to start "${PI_COMMAND}": ${e.message}. ` +
+             `Is the pi coding agent installed and on PATH? (npm install -g @mariozechner/pi-coding-agent)`,
+    });
+    return null;
+  }
+
+  // Writing to an agent that is on its way out raises EPIPE / ECONNRESET on the
+  // next flush, not on the write itself - so `child.stdin.writable` is true at
+  // the moment the decision is made and the failure arrives a tick later, with
+  // nobody listening. That is an unhandled 'error' event and it kills the whole
+  // bridge: no agent, no other tab, no WebSocket. It happens on every restart
+  // (/reload, a changed model, a /login) and every idle shutdown, whenever a
+  // command from a client is still in flight.
+  child.stdin.on('error', (err) => {
+    if (DEBUG_RPC) console.log(`[rpc] agent stdin closed: ${err.message}`);
   });
 
   let buf = '';
@@ -2724,20 +4133,16 @@ function startAgent() {
   });
 
   child.on('error', (err) => {
-    broadcast({
-      bridge: 'agent_exit',
-      error: `Failed to start "${PI_COMMAND}": ${err.message}. ` +
-             `Is the pi coding agent installed and on PATH? (npm install -g @mariozechner/pi-coding-agent)`,
-    });
-  });
-
-  child.on('error', (err) => {
     // Without this, a command the shell cannot run at all (a bad path, a missing
     // docker, a workspace that does not exist here) failed in complete silence:
     // the console showed the startup banner and nothing else, and the UI sat
     // there empty with no reason given.
     console.error(`could not start the agent (${PI_COMMAND}): ${err.message}`);
-    broadcast({ bridge: 'agent_stderr', text: `Could not start the agent: ${err.message}` });
+    broadcast({
+      bridge: 'agent_exit',
+      error: `Failed to start "${PI_COMMAND}": ${err.message}. ` +
+             `Is the pi coding agent installed and on PATH? (npm install -g @mariozechner/pi-coding-agent)`,
+    });
   });
 
   child.on('exit', (code, signal) => {
@@ -2855,6 +4260,33 @@ function resumeInto(last) {
 }
 
 server.on('upgrade', (req, socket, head) => {
+  /* The socket is the whole agent: every RPC, including `bash`, goes over it. A
+   * WebSocket handshake carries Origin, so a page on another site can open one to
+   * this bridge - and the same-origin policy does not stop it establishing the
+   * connection, only reading the result. Same two checks as an HTTP write
+   * (issue #23). */
+  const refused = (() => {
+    const host = hostOnly(req.headers.host);
+    if (!host) return 'no Host header';
+    if (!allowedHostNames().has(host)) return `Host "${host}" is not an address this bridge answers on`;
+    const origin = req.headers.origin;
+    if (!origin) return null;                     // not a browser
+    try {
+      const u = new URL(String(origin));
+      const selfProto = req.socket && req.socket.encrypted ? 'https:' : 'http:';
+      if (hostOnly(u.host) === host && u.protocol === selfProto) return null;
+    } catch { return `Origin "${String(origin).slice(0, 60)}" is not a URL`; }
+    return `Origin "${String(origin).slice(0, 60)}" is not this bridge`;
+  })();
+  if (refused) {
+    console.warn(`refused websocket ${String(req.url).slice(0, 60)}: ${refused}`);
+    try {
+      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    } catch { /* already gone */ }
+    socket.destroy();
+    return;
+  }
+
   const parsed = splitProxyPath(req.url);
   if (parsed) {
     proxyWss.handleUpgrade(req, socket, head, (client) => proxyWss.emit('connection', client, req, parsed));
@@ -2995,6 +4427,12 @@ function onFatalServerError(err) {
 
 server.on('error', onFatalServerError);
 wss.on('error', onFatalServerError);
+// Same story one level up: a TCP connection that is reset before the request
+// even parses (a browser that gave up on a slow one) arrives here. Without a
+// listener Node prints it and, for some codes, tears the process down.
+server.on('clientError', (err, socket) => {
+  try { socket.destroy(); } catch { /* already gone */ }
+});
 
 server.listen(PORT, HOST, () => {
   listening = true;

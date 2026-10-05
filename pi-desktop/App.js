@@ -131,14 +131,15 @@ export default function App() {
    * first and show a native "bridge not reachable" screen instead.
    */
   const checkBridge = useCallback(async () => {
-    if (!httpBase || httpBase.includes('undefined')) {
+    const base = httpBase; // capture once to avoid race
+    if (!base || base.includes('undefined')) {
       setBridgeOk(false);
       return false;
     }
     try {
       const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
       const timer = setTimeout(() => ctl && ctl.abort(), 2500);
-      const r = await fetch(`${httpBase}/api/health`, ctl ? { signal: ctl.signal } : undefined);
+      const r = await fetch(`${base}/api/health`, ctl ? { signal: ctl.signal } : undefined);
       clearTimeout(timer);
       const ok = !!r && r.ok;
       setBridgeOk(ok);
@@ -150,15 +151,24 @@ export default function App() {
   }, [httpBase]);
 
   useEffect(() => {
-    checkBridge();
-    // Keep checking only while it is down, so a running bridge is not polled.
-    const t = setInterval(() => {
-      setBridgeOk((prev) => {
-        if (prev === false) checkBridge();
-        return prev;
-      });
-    }, 4000);
-    return () => clearInterval(t);
+    /* Only poll while the bridge is down.
+     *
+     * The guard used to live *inside* the callback (it called checkBridge only
+     * when the previous state was false), which left the interval itself running
+     * for the whole life of the app - a wakeup every four seconds whether or not
+     * the bridge was healthy. That is a phone's battery for no information. The
+     * interval is now cleared as soon as a check succeeds and re-armed when one
+     * fails, so a working bridge is checked once. */
+    let t = null;
+    const arm = () => {
+      if (t) return;
+      t = setInterval(async () => {
+        const ok = await checkBridge();
+        if (ok && t) { clearInterval(t); t = null; }
+      }, 4000);
+    };
+    checkBridge().then((ok) => { if (!ok) arm(); });
+    return () => { if (t) clearInterval(t); };
   }, [checkBridge]);
 
   useEffect(() => {
@@ -229,15 +239,16 @@ export default function App() {
         const ev = msg.assistantMessageEvent || {};
         const live = liveRef.current;
         if (!live) break;
+        const liveId = live.id; // capture once to avoid race
         if (ev.type === 'text_delta') {
-          patchMessage(live.id, (m) => ({ ...m, text: (m.text || '') + (ev.delta || '') }));
+          patchMessage(liveId, (m) => ({ ...m, text: (m.text || '') + (ev.delta || '') }));
           scrollBottom();
         } else if (ev.type === 'thinking_delta') {
-          patchMessage(live.id, (m) => ({ ...m, thinking: (m.thinking || '') + (ev.delta || '') }));
+          patchMessage(liveId, (m) => ({ ...m, thinking: (m.thinking || '') + (ev.delta || '') }));
         } else if (ev.type === 'toolcall_start') {
-          patchMessage(live.id, (m) => ({ ...m, tools: [...(m.tools || []), { name: ev.toolName || 'tool', args: '' }] }));
+          patchMessage(liveId, (m) => ({ ...m, tools: [...(m.tools || []), { name: ev.toolName || 'tool', args: '' }] }));
         } else if (ev.type === 'toolcall_delta') {
-          patchMessage(live.id, (m) => {
+          patchMessage(liveId, (m) => {
             const tools = [...(m.tools || [])];
             if (tools.length) tools[tools.length - 1] = { ...tools[tools.length - 1], args: (tools[tools.length - 1].args || '') + (ev.delta || '') };
             return { ...m, tools };
@@ -249,9 +260,10 @@ export default function App() {
         const m = msg.message || {};
         const live = liveRef.current;
         if (m.role === 'assistant' && live) {
+          const liveId = live.id; // capture once to avoid race
           const text = blockText(m.content);
           const thinking = blockThinking(m.content);
-          patchMessage(live.id, (cur) => ({
+          patchMessage(liveId, (cur) => ({
             ...cur,
             text: text || cur.text,
             thinking: thinking || cur.thinking,
@@ -390,13 +402,18 @@ export default function App() {
   /* ── actions ── */
   const send = useCallback(async () => {
     const text = input.trim();
-    if (!text || !bridgeRef.current || !connected) return;
+    if (!text || !connected) return;
+    const b = bridgeRef.current;
+    if (!b) {
+      appendMessage({ id: nextId(), role: 'system', text: 'Agent is not connected yet — try again in a moment.' });
+      return;
+    }
     setInput('');
     try {
       // steering: a message sent mid-turn is delivered at the next tool boundary
       const cmd = { type: 'prompt', message: text };
       if (streaming) cmd.streamingBehavior = 'steer';
-      await bridgeRef.current.rpc(cmd);
+      await b.rpc(cmd);
     } catch (e) {
       appendMessage({ id: nextId(), role: 'system', text: `send failed: ${e.message}` });
     }
@@ -421,10 +438,12 @@ export default function App() {
 
   const pickSession = useCallback(async (s) => {
     setShowSessions(false);
+    const b = bridgeRef.current;
+    if (!b) { Alert.alert('Not connected', 'The bridge is not connected yet.'); return; }
     try {
-      await bridgeRef.current.rpc({ type: 'switch_session', sessionPath: s.path });
+      await b.rpc({ type: 'switch_session', sessionPath: s.path });
       setSessionName(s.name || '');
-      await loadState(bridgeRef.current);
+      await loadState(b);
     } catch (e) {
       Alert.alert('Session switch failed', e.message);
     }
@@ -432,11 +451,13 @@ export default function App() {
 
   const newSession = useCallback(async () => {
     setShowSessions(false);
+    const b = bridgeRef.current;
+    if (!b) { Alert.alert('Not connected', 'The bridge is not connected yet.'); return; }
     try {
-      await bridgeRef.current.rpc({ type: 'new_session' });
+      await b.rpc({ type: 'new_session' });
       setMessages([]);
       setSessionName('');
-      await loadState(bridgeRef.current);
+      await loadState(b);
     } catch (e) {
       Alert.alert('New session failed', e.message);
     }
@@ -446,8 +467,10 @@ export default function App() {
     const name = renameText.trim();
     setShowRename(false);
     if (!name) return;
+    const b = bridgeRef.current;
+    if (!b) { Alert.alert('Not connected', 'The bridge is not connected yet.'); return; }
     try {
-      await bridgeRef.current.rpc({ type: 'set_session_name', name });
+      await b.rpc({ type: 'set_session_name', name });
       setSessionName(name);
       await refreshSessions();
     } catch (e) {
@@ -460,12 +483,11 @@ export default function App() {
     const p = port.trim();
     if (!h) { Alert.alert('Missing host', 'Enter your PC\'s IP address.'); return; }
     const next = await saveSettings({ host: h, port: p, setupDone: true });
-    if (next) {
-      setSettings(next);
-      setShowSetup(false);
-      setShowSettings(false);
-      setConnectNonce((n) => n + 1);
-    }
+    if (!next) { Alert.alert('Save failed', 'Could not save settings.'); return; }
+    setSettings(next);
+    setShowSetup(false);
+    setShowSettings(false);
+    setConnectNonce((n) => n + 1);
   }, [host, port]);
 
   const setShortProvider = useCallback((key) => {
@@ -503,17 +525,15 @@ export default function App() {
     return [...groups.entries()];
   }, [models]);
 
-  if (!settings) {
-    return (
-      <View style={[styles.root, styles.center]}>
-        <StatusBar barStyle="light-content" />
-        <ActivityIndicator color={C.accent} />
-      </View>
-    );
-  }
-
+  /* The chat column, memoized. It has to be built *before* the early return
+   * below: `settings` is null on the first render, so a useMemo placed after
+   * that return is not called on the first render and is called on every one
+   * after it. React counts hooks per render and fails with "Rendered more
+   * hooks than during the previous render" the moment settings load — which is
+   * on the second render, always. It reads no setting, so it is safe to build
+   * up here. */
   /* ── chat column ── */
-  const chat = (
+  const chat = useMemo(() => (
     <View style={styles.chatWrap}>
       <View style={styles.header}>
         <View style={styles.headerLeft}>
@@ -600,7 +620,17 @@ export default function App() {
         </View>
       </KeyboardAvoidingView>
     </View>
-  );
+  ), [webuiMode, streaming, input, connected, sessionName, agentReady, ctxPct, ctxColor, modelLabel, messages, listRef, stop, send]);
+
+  if (!settings) {
+    return (
+      <View style={[styles.root, styles.center]}>
+        <StatusBar barStyle="light-content" />
+        <ActivityIndicator color={C.accent} />
+      </View>
+    );
+  }
+
 
   return (
     <SafeAreaView style={styles.root} edges={['top', 'left', 'right', 'bottom']}>

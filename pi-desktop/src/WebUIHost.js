@@ -5,12 +5,18 @@
  * it needs no native module: point react-native-webview at the bridge's WebUI
  * and the UI is identical to the browser one by definition.
  */
-import React, { useState } from 'react';
+import React, { memo, useState } from 'react';
 import { View, Text, StyleSheet, ActivityIndicator } from 'react-native';
 import { WebView } from 'react-native-webview';
 
-export function WebUIHost({ url }) {
+export const WebUIHost = memo(function WebUIHost({ url }) {
   const [error, setError] = useState(null);
+
+  /* No cleanup effect here. Clearing state in an unmount cleanup sets state on a
+   * component that is going away, which React warns about and which does
+   * nothing useful: the state is discarded with the component anyway. There was
+   * a `useEffect(() => () => setError(null), [])` doing exactly that. */
+
   if (error) {
     return (
       <View style={styles.center}>
@@ -36,7 +42,7 @@ export function WebUIHost({ url }) {
       />
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   host: { flex: 1, backgroundColor: '#101318' },

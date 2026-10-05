@@ -70,7 +70,7 @@ On first launch the app asks for:
 
 | field | value |
 | --- | --- |
-| Host / IP | your PC's LAN IP, e.g. `192.168.1.39` (not `localhost` — on a phone that means the phone) |
+| Host / IP | your PC's LAN IP, e.g. `192.168.1.50` (not `localhost` — on a phone that means the phone) |
 | Port | `3080` (the default in `start-webui.bat`) |
 
 The choice is stored with AsyncStorage and reused on every later launch; change

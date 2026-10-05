@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { memo, useState } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
 import { Markdown } from './Markdown';
 
@@ -17,7 +17,7 @@ const C = {
  *       text, thinking, tools: [{name, args, result}],
  *       streaming, error }
  */
-export function MessageBubble({ m }) {
+export const MessageBubble = memo(function MessageBubble({ m }) {
   const [showThinking, setShowThinking] = useState(false);
   const [openTool, setOpenTool] = useState(null);
 
@@ -89,7 +89,7 @@ export function MessageBubble({ m }) {
       </View>
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   row: { paddingVertical: 3, paddingHorizontal: 10 },

@@ -28,11 +28,31 @@ export async function loadSettings() {
   }
 }
 
-/** Persist a partial settings patch. Never throws. */
+/**
+ * Persist a partial settings patch. Never throws.
+ *
+ * Reads the current settings straight out of storage rather than through
+ * loadSettings(), so a save cannot interleave with a load that started before it
+ * and write back a stale copy.
+ *
+ * Returns the merged settings on success, and null on failure. null is
+ * deliberate: the caller in App.js tests it and shows "Could not save settings."
+ * Returning DEFAULTS here instead made that check unreachable, so a failed save
+ * looked like it worked and quietly reset the host the user had just typed to
+ * localhost.
+ */
 export async function saveSettings(patch) {
   try {
-    const current = await loadSettings();
-    const next = { ...current, ...patch };
+    // Read current settings directly to avoid race condition
+    let current;
+    try {
+      const raw = await AsyncStorage.getItem(KEY);
+      current = raw ? JSON.parse(raw) : {};
+      if (!current || typeof current !== 'object') current = {};
+    } catch {
+      current = {};
+    }
+    const next = { ...DEFAULTS, ...current, ...patch };
     await AsyncStorage.setItem(KEY, JSON.stringify(next));
     return next;
   } catch {

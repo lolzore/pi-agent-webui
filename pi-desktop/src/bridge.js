@@ -14,21 +14,27 @@ export class Bridge {
     this.closing = false;
     this.retryDelay = 1000;
     this.retryTimer = null;
+    this.isConnecting = false;       // Re-entrancy lock
   }
 
   connect() {
+    // Re-entrancy lock: prevent multiple concurrent connect() calls
+    if (this.isConnecting) return;
     if (this.ws && (this.ws.readyState === 0 || this.ws.readyState === 1)) return; // CONNECTING/OPEN
+    this.isConnecting = true;
     this.closing = false;
     let ws;
     try {
       ws = new WebSocket(this.url);
     } catch (e) {
+      this.isConnecting = false;
       this.scheduleReconnect();
       return;
     }
     this.ws = ws;
 
     ws.onopen = () => {
+      this.isConnecting = false;
       this.connected = true;
       this.retryDelay = 1000;
       if (this.onState) this.onState('on');
@@ -49,13 +55,17 @@ export class Bridge {
     };
 
     ws.onclose = () => {
+      this.isConnecting = false;
       this.connected = false;
       this.rejectAll('connection closed');
       if (this.onState) this.onState('off');
       if (!this.closing) this.scheduleReconnect();
     };
 
-    ws.onerror = () => { /* onclose follows */ };
+    ws.onerror = () => {
+      this.isConnecting = false;
+      /* onclose follows */
+    };
   }
 
   scheduleReconnect() {

@@ -4,16 +4,16 @@
 // macOS only), and a desktop window has no notch, status bar or home indicator
 // to inset around. So on Windows these are plain no-ops: SafeAreaView is a
 // regular View and the insets are all zero.
-import React from 'react';
+import React, { memo } from 'react';
 import { View } from 'react-native';
 
-export const SafeAreaView = React.forwardRef(function SafeAreaView({ edges, mode, ...rest }, ref) {
+export const SafeAreaView = memo(React.forwardRef(function SafeAreaView({ edges, mode, ...rest }, ref) {
   return <View ref={ref} {...rest} />;
-});
+}));
 
-export function SafeAreaProvider({ children }) {
+export const SafeAreaProvider = memo(function SafeAreaProvider({ children }) {
   return <>{children}</>;
-}
+});
 
 const ZERO_INSETS = { top: 0, right: 0, bottom: 0, left: 0 };
 

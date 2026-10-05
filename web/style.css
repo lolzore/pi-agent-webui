@@ -22,6 +22,18 @@
   --ui-alpha: 1;
   --outline-color: #000;
   --avatar-size: 34px;
+  /* Spacing scale */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+  /* Z-index scale */
+  --z-base: 1;
+  --z-dropdown: 10;
+  --z-sticky: 100;
+  --z-modal: 1000;
+  --z-toast: 1100;
 }
 
 /* ───────────────────────── background media ─────────────────────────
@@ -41,10 +53,30 @@
   will-change: transform;
 }
 
+/* Reset */
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
+
+/* Form controls do not inherit a font family.
+ *
+ * Every button, input, select and textarea on the page - the ones in the
+ * transcript and the ones in the composer - was rendering in the browser's
+ * default sans-serif regardless of the font chosen in settings, because a form
+ * control only inherits *some* properties from its parent by default, and
+ * `font-family` is not one of them. `inherit` lets each one follow whatever it
+ * sits in: the chat font inside the conversation, the interface font inside the
+ * settings dialog. */
+button, input, select, textarea { font-family: inherit; }
 body {
-  font: 14px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif;
+  /* The chosen font is the font of the *interface*, not only of the transcript.
+   *
+   * It was set on `#chat` and the composer only, so the sidebar, the menus, the
+   * settings dialog and every button kept the system face - one window, two
+   * typefaces, with the font the reader chose applying to the smallest part of
+   * it, and none of it to the sidebar they are reading the whole time. Monospace
+   * is left alone wherever it is asked for: code, tool output, diffs and the
+   * numeric counters are read by shape and position. */
+  font: 14px/1.5 var(--chat-font);
   background: var(--bg);
   color: var(--text);
   overflow: hidden;
@@ -57,8 +89,6 @@ body {
   width: 260px; min-width: 260px;
   background: color-mix(in srgb, var(--bg-panel) calc(var(--ui-alpha) * 100%), transparent);
   border-right: 1px solid color-mix(in srgb, var(--border) calc(var(--ui-alpha) * 100%), transparent);
-  backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 12px));
-  -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 12px));
   display: flex; flex-direction: column;
 }
 body.sidebar-hidden #sidebar { display: none; }
@@ -158,13 +188,14 @@ body.sidebar-hidden #sidebar { display: none; }
 .ellipsis { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* ───────────────────────── main / topbar ───────────────────────── */
-#main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+/* position: relative anchors the jump-to-top button to the chat column instead
+   of the viewport, so it sits over the transcript and not over the side panel
+   or the reels drawer. */
+#main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
 #topbar {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 12px; border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--bg-panel) calc(var(--ui-alpha) * 100%), transparent);
-  backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
-  -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
 }
 .session-name {
   flex: 1; min-width: 60px;
@@ -343,8 +374,6 @@ input::placeholder { color: var(--text-dim); opacity: .75; }
 .msg.system .bubble {
   background: color-mix(in srgb, #12161d calc(var(--ui-alpha) * 100%), transparent);
   border: 1px solid color-mix(in srgb, var(--border) calc(var(--ui-alpha) * 100%), transparent);
-  backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 8px));
-  -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 8px));
   font-family: var(--mono); font-size: 12.5px;
   white-space: pre-wrap; word-break: break-word;
   max-height: 280px; overflow-y: auto;
@@ -433,7 +462,13 @@ body.hide-thinking details.thinking { display: none; }
      by the elastic parts (the model and thinking pills, which truncate) and never
      by the layout. */
   flex-wrap: nowrap;
-  min-height: 44px;
+  /* height, not min-height. `min-height` let the row grow a pixel or two when a
+     child was fractionally taller than the reserved box, and every one of those
+     pixels moved the composer and the whole transcript above it - the context
+     readout visibly hopping up and down. The row now has exactly one height and
+     anything that does not fit is truncated inside it. */
+  height: 46px; overflow: hidden;
+  position: relative;
 }
 /* The ring, the ctx label and the total never shrink and never paint outside
    their box (that is what ran the ctx label into the token counter). */
@@ -449,12 +484,35 @@ body.hide-thinking details.thinking { display: none; }
    reserved for the longest form so the row never rewraps as the seconds tick.
    An empty counter reserves nothing at all. */
 #stats-bar > span { font-variant-numeric: tabular-nums; white-space: nowrap; min-width: 0; }
+/* Every counter in this row has its line box pinned, for the same reason
+ * #ctx-label does (issue #2): the value is rewritten from a timer, and a replaced
+ * text node is re-shaped from scratch, which can land the ink a pixel or two
+ * higher or lower even when the text is identical. #ctx-label and the ring were
+ * fixed that time and the rest of the row was not, which is issue #42 - "every
+ * text in the composer bar is jumping up and down (except the ring)". The
+ * writers go through setText() now as well; this is the belt to that pair of
+ * braces, and it holds if a value legitimately changes. */
+#stat-turn, #stat-tokens, #stat-cost { line-height: 16px; height: 16px; display: inline-block; }
 #stat-turn { min-width: 12ch; }
 #stat-turn:empty, #stat-cost:empty { min-width: 0; }
 #stat-tokens, #stat-cost { min-width: 12ch; }
 #stat-tokens:empty, #stat-cost:empty { min-width: 0; }
 #stats-bar select { max-width: 150px; font-size: 11.5px; padding: 3px 6px; }
-.ctx-ring { display: inline-flex; align-items: center; }
+/* ── the context ring and its label ──────────────────────────────────────
+ * This pair is the one readout that changes several times a second while the
+ * agent is working, and it is what the eye is drawn to. Two things kept it
+ * moving:
+ *
+ *  - the ring is an <svg> inline element, so it sat on the text baseline and
+ *    every digit change inside it re-ran baseline alignment for the whole row.
+ *    Made a fixed-size block instead.
+ *  - the label's own width changed with its content ("[573.9K/1.0Mctx]" vs
+ *    "[1.24M/1.0Mctx]"), which pushed everything to its right along, and the
+ *    last of those - the thinking pill - sat far enough right that the nudge was
+ *    read as the whole strip bouncing. It now has a reserved width.
+ */
+.ctx-ring { display: inline-flex; align-items: center; flex: 0 0 auto; width: 38px; height: 38px; }
+.ctx-ring svg { display: block; }
 .ctx-ring .ring-bg { stroke: var(--bg-hover); }
 .ctx-ring .ring-fg { stroke: var(--accent); transition: stroke-dasharray .4s; }
 .ctx-ring.warn .ring-fg { stroke: var(--yellow); }
@@ -463,12 +521,67 @@ body.hide-thinking details.thinking { display: none; }
 .ctx-ring text { fill: var(--text); font-size: 12px; font-weight: 600; }
 .ctx-label {
   font-family: var(--mono); font-size: 11px; color: var(--text-dim);
-  white-space: nowrap; min-width: 1px;
+  white-space: nowrap;
   /* never shrink below the text and never paint outside the box - it used to do
      both, over the token counter */
   flex: 0 0 auto; overflow: hidden; text-overflow: ellipsis;
+  text-align: left; font-variant-numeric: tabular-nums;
+  /* The line box is pinned.
+   *
+   * `line-height` was inherited as the number 1.5 from `body { font: 14px/1.5 … }`,
+   * so this box was 1.5 x 11px and its exact height came from whichever font the
+   * digits happened to resolve to. A re-shaped run could then measure a hair
+   * differently, and because the row centres its items the whole label moved -
+   * which is the 2px the recording in issue #2 shows, identical glyphs shifting
+   * 42..61 <-> 44..63 with the ring and the counters beside it perfectly still.
+   * An explicit px line-height and height make the box independent of font
+   * metrics, so there is nothing left for a re-shape to move. 16px also matches
+   * the 16.5px the inherited value produced, so nothing about the layout
+   * changes. */
+  line-height: 16px;
+  height: 16px;
 }
+/* No reserved width here on purpose.
+ *
+ * The context counter pads its own text to a fixed width (see `ctxLabel`), so
+ * the box is always exactly as wide as the text and there is no hole in front of
+ * it. A `min-width` was here to stop the counter resizing as the digits changed,
+ * and it did - by making the counter as wide as the widest label it would ever
+ * hold, which left a visible gap between it and the token counter for as long as
+ * the text was shorter than that. It also put the gap back in every state the
+ * padded text does not cover, which is how a shorter label got the same hole
+ * back on a different machine. */
+.ctx-label { min-width: 0; }
 #stat-tokens { font-family: var(--mono); font-size: 11.5px; }
+
+/* ── notifications, as a dialog (issue #4) ───────────────────────────────
+ * The list used to be a dropdown anchored to the bell. Asked for "bigger text, in
+ * the middle of the window, with a Done button like the settings dialog" - so it
+ * is a <dialog> now, reusing the styling every other panel already uses, and the
+ * text is at the chat font size rather than 12.5px. */
+dialog#notices-dialog {
+  width: 60vw; min-width: 380px; max-width: 680px;
+}
+.notices-list {
+  max-height: 58vh; overflow-y: auto; margin: 10px 0 6px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.notice-row {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 7px 9px; border-radius: 7px; border: 1px solid transparent;
+  cursor: pointer; font-size: var(--chat-size, 14px); line-height: 1.45;
+}
+.notice-row:hover { background: var(--bg-hover); border-color: var(--border); }
+.notice-row.error { border-color: color-mix(in srgb, var(--red) 50%, transparent); }
+.notice-row .n-time { flex: 0 0 auto; font: 11px var(--mono); color: var(--text-dim); }
+.notice-row .n-kind {
+  flex: 0 0 auto; font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px;
+  color: var(--text-dim);
+}
+.notice-row .n-text { flex: 1; min-width: 0; }
+.notice-empty { padding: 18px 6px; text-align: center; color: var(--text-dim); }
+.notices-foot { margin-top: 6px; }
+.notices-spacer { flex: 1; }
 
 /* settings dialog */
 .settings-grid {
@@ -491,6 +604,11 @@ body.hide-thinking details.thinking { display: none; }
 .avatar-row { display: flex; align-items: center; gap: 8px; }
 .rate-row { display: flex; align-items: center; gap: 8px; }
 .rate-row input[type="range"] { flex: 1; }
+/* a path / URL field next to its own buttons: the field takes the free space
+   and the buttons keep their size (the shared `input[type=range] { flex: 1 }`
+   above would otherwise stretch the sliders in the same rows) */
+.rate-row.sound-row input[type="text"],
+.rate-row.cursor-row input[type="text"] { flex: 1; min-width: 0; }
 .check-label {
   display: flex !important; align-items: center; gap: 6px;
   color: var(--text) !important; font-size: 12.5px; cursor: pointer;
@@ -502,7 +620,11 @@ dialog {
   background: var(--bg-panel); color: var(--text);
   border: 1px solid var(--border); border-radius: var(--radius);
   padding: 18px; max-width: 92vw;
-  font: 13px/1.5 "Segoe UI", system-ui, sans-serif;
+  /* the chosen font, not a hardcoded one: this used to name the system face
+     outright, so every dialog - settings, setup, crop, confirm - was in a
+     different typeface from the rest of the window, and `h3`, `p` and `label`
+     inside them inherited that instead of the font the reader chose */
+  font: 13px/1.5 var(--chat-font);
 }
 dialog::backdrop { background: rgba(0, 0, 0, .6); }
 
@@ -511,6 +633,46 @@ dialog#settings-dialog {
   border: 1px solid var(--border); border-radius: var(--radius);
   padding: 18px; min-width: 380px; max-width: 520px;
 }
+
+/* One size for every tab (issue #35).
+ *
+ * The dialog was sized by its content, and the tabs have wildly different amounts
+ * of it - General is long, Shorts is three rows - so the window resized every time
+ * you switched tab and the buttons moved with it. Navigating settings meant
+ * chasing the Done button around.
+ *
+ * So the dialog has one height now and the *panel* scrolls inside it: the title,
+ * the tab strip and the buttons stay exactly where they are whatever tab is up.
+ *
+ * `[open]` is load-bearing. A <dialog> is hidden by the user-agent rule
+ * `dialog:not([open]) { display: none }`, and an author `display: flex` would
+ * out-specify it - a closed dialog would then be laid out and visible. Scoping to
+ * [open] leaves the UA rule in charge of hiding it. */
+dialog#settings-dialog[open] {
+  display: flex;
+  flex-direction: column;
+  width: 520px;
+  max-width: 92vw;
+  height: min(660px, 84vh);
+}
+dialog#settings-dialog > h3,
+dialog#settings-dialog > .tabs,
+dialog#settings-dialog > .dialog-buttons,
+dialog#settings-dialog > .hint { flex: 0 0 auto; }
+dialog#settings-dialog .tab-panel {
+  flex: 1 1 auto;
+  min-height: 0;                 /* else the grid refuses to shrink and overflows */
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* room for the scrollbar so the labels do not shift when one tab needs it and
+     the next does not */
+  scrollbar-gutter: stable;
+  padding-right: 2px;
+}
+/* The grid's own top margin plus the panel's scroll container left the first row
+ * sitting lower on a short tab than on a long one; pinning it to the top makes
+ * every tab start in the same place. */
+dialog#settings-dialog .tab-panel .settings-grid { margin-top: 2px; }
 dialog#settings-dialog::backdrop { background: rgba(0,0,0,.55); }
 dialog#settings-dialog h3 { margin: 0 0 4px; }
 
@@ -568,12 +730,34 @@ dialog#setup-dialog h3 { margin: 0 0 2px; }
 
 /* "Viewing another session" banner (the agent keeps running in its own). */
 .view-banner {
-  padding: 6px 14px; font-size: 12px; color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  border-bottom: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  padding: 7px 14px; font-size: 12px; color: var(--text);
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-panel));
+  /* A box, not a seam: this line has to be readable at a glance while you are
+   * reading the transcript behind it, and a 30%-alpha underline left the text
+   * floating on the chat with no edge to stop at. The inset ring is the outline
+   * the banner never had, and the accent bar on the left marks it as a notice
+   * rather than as part of the conversation. */
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 34%, transparent);
   display: flex; align-items: center; gap: 8px;
+  min-height: 34px;
+}
+.view-banner::before {
+  content: ''; flex: 0 0 auto; align-self: stretch; min-height: 18px;
+  width: 3px; border-radius: 2px; background: var(--accent);
 }
 .view-banner .btn { margin-left: auto; flex: none; }
+/* the banner text is the one line in the app that reports "you are looking at
+   the wrong conversation" - it has to stay legible over any background, so it
+   follows the outline setting like the chat text does */
+body.text-outline .view-banner,
+body.text-outline .banner {
+  text-shadow:
+    1px 0 0 var(--outline-color), -1px 0 0 var(--outline-color),
+    0 1px 0 var(--outline-color), 0 -1px 0 var(--outline-color),
+    1px 1px 0 var(--outline-color), -1px 1px 0 var(--outline-color),
+    1px -1px 0 var(--outline-color), -1px -1px 0 var(--outline-color);
+}
 
 /* ───────────────────────── chat ───────────────────────── */
 /* The scroller of the conversation. overflow-anchor off: content lands above
@@ -601,6 +785,25 @@ html, body { overscroll-behavior: none; }
  * scrolls behind them and shows through the translucent panels, blurred by the
  * backdrop filter they already have. */
 #composer-dock { position: sticky; bottom: 0; z-index: 3; flex: none; }
+
+/* The chat font is a font for *reading*, so everything you read goes through it:
+ * the transcript, what you type, and the lines that talk about your own run -
+ * queued messages, extension status and widgets, the edit banner, attachment
+ * names, the counters.
+ *
+ * It used to be set on `#chat` and the input only, so choosing a font changed
+ * the conversation and left every line around it in the system font. Sitting in
+ * one dock, half in the chosen face and half in another, is what "the font
+ * won't apply to every single text" was.
+ *
+ * Monospace is left alone on purpose: code, tool output, diffs and the numeric
+ * counters are read by shape and position, and a proportional face breaks both
+ * the alignment and the distinction between them and prose. */
+#composer-dock,
+.edit-banner,
+.attachments,
+.view-banner,
+.banner { font-family: var(--chat-font); }
 .msg { max-width: 860px; margin: 0 auto 14px; }
 .msg .who {
   font-size: calc(11px * var(--chat-scale)); font-weight: 700; letter-spacing: 0.4px;
@@ -612,8 +815,6 @@ html, body { overscroll-behavior: none; }
   background: color-mix(in srgb, var(--bg-panel) calc(var(--ui-alpha) * 100%), transparent);
   border: 1px solid var(--border);
   border-radius: var(--radius); padding: 10px 14px;
-  backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 10px));
-  -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 10px));
 }
 .msg.user .bubble {
   background: color-mix(in srgb, #1a2231 calc(var(--ui-alpha) * 100%), transparent);
@@ -648,6 +849,19 @@ html, body { overscroll-behavior: none; }
   margin: 6px 0; padding: 2px 12px; border-left: 3px solid var(--accent-dim);
   color: var(--text-dim);
 }
+/* a picture the bridge named but that has since moved: a compaction rewrote the
+   session and the line the reference pointed at is no longer that image */
+.msg img.msg-img.img-missing {
+  min-height: 60px; min-width: 120px;
+  border: 1px dashed var(--border); background: var(--bg-elev);
+  position: relative;
+}
+.msg img.msg-img.img-missing::after {
+  content: 'image no longer in this session';
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; color: var(--text-dim);
+}
 .msg img.msg-img {
   max-width: 220px; max-height: 180px; border-radius: 8px;
   border: 1px solid var(--border); display: block; margin: 6px 0; cursor: zoom-in;
@@ -665,8 +879,6 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
   border-radius: 8px;
   margin: 8px 0;
   background: color-mix(in srgb, #141821 calc(var(--ui-alpha) * 100%), transparent);
-  backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 10px));
-  -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 10px));
   font-size: calc(12.5px * var(--chat-scale));
 }
 .tool-card .tool-head {
@@ -723,10 +935,17 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
    updates - used to resize the whole dock, and with it the visible conversation.
    That was "the UI jumps up and down while the agent is running". */
 .queue-bar, .widget-bar, .status-bar {
-  scrollbar-gutter: stable;
   max-width: 860px; width: calc(100% - 24px); margin: 0 auto;
   font-size: calc(12px * var(--chat-scale)); color: var(--text-dim);
 }
+/* The queue and widget bars really do scroll, and reserving their gutter keeps
+ * their contents from shuffling sideways as they do.
+ *
+ * The status line must not have it. It is one line and never scrolls, so a
+ * reserved gutter is 15px of empty strip along the right-hand edge with nothing
+ * in it - which is the strip that was reported as a scrollbar that should not be
+ * there. */
+.queue-bar, .widget-bar { scrollbar-gutter: stable; }
 .queue-bar {
   padding: 2px 0;
   /* one line, always: the chips used to wrap onto a second line as more messages
@@ -753,20 +972,81 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
 .status-bar {
   padding: 2px 4px; display: flex; gap: 14px; flex-wrap: wrap;
   /* one line, always: it used to grow to two when a second status appeared, which
-     moved everything below it */
-  height: 1.6em; max-height: 1.6em; overflow-y: auto;
+     moved everything below it.
+     The box has to be tall enough for a line *and* its padding: `1.6em` on a 12px
+     font is 19.2px, which is 3px short of the 18px line plus 4px of padding -
+     and 3px of overflow in an `auto` box is enough for Chromium to draw a
+     scrollbar. A 15px scrollbar crammed into a 19px strip across the top of the
+     page, for a status line that is never meant to scroll. `hidden` says what is
+     meant: a second line is clipped, not made scrollable. */
+  height: calc(1.5em + 4px); max-height: calc(1.5em + 4px); overflow: hidden;
 }
 /* While the agent is running, a bar that has been cleared for a moment keeps its
    box. Extensions set and clear their status/widget constantly during a run (an
    MCP server connecting, the sub-agent widget), and every appear/disappear
    resized the dock - the composer and stats row went with it. Released on run end,
    so nothing is wasted while idle. */
-body.run-active .queue-bar.hidden,
-body.run-active .widget-bar.hidden,
-body.run-active .status-bar.hidden {
+/* Only a bar that has actually shown something keeps its space while the agent
+ * runs.
+ *
+ * Every bar was reserved for the whole run, so a bridge with one status line and
+ * no widget still opened ~99px of blank dock the moment the agent started -
+ * widget 50px + status 22px + queue 27px - and gave it all back when it stopped.
+ * That is "after agent starts UI element is too high up" (issue #6): the composer
+ * sits under a taller dock with nothing in the space above it.
+ *
+ * The reason for reserving at all still holds and is kept. An extension clears
+ * its widget for a frame between updates, and letting the bar collapse and
+ * re-open resized the dock and moved the conversation with it. But that only
+ * needs to apply to a bar that has already appeared: one that never had content
+ * has nothing to protect, and its reserved height is pure gap. */
+body.run-active .queue-bar.hidden[data-had-content],
+body.run-active .widget-bar.hidden[data-had-content],
+body.run-active .status-bar.hidden[data-had-content] {
   /* .hidden is display:none !important, so this has to out-specify it */
   display: block !important; visibility: hidden;
 }
+/* NOT reserved, and this is deliberate: the edit strip and the attachment
+   thumbnails. They are the two things in the dock that only appear because the
+   user just did something (edit a message, attach a file), and both sit between
+   the status bar and the composer. Reserving their height "just in case" left a
+   permanent invisible gap of ~100px exactly there - the status bar with the MCP
+   line floating near the top of an empty box. A shift that follows an action the
+   user just took is understood; dead space nobody asked for is not. */
+
+/* A batch of older messages, built away from the chat and moved in as a whole.
+ * `display: contents` means the wrapper generates no box at all: its children
+ * lay out exactly as if they had been appended to #chat directly, so the
+ * transcript is unchanged by this and no second layout pass happens. It exists
+ * only so that a batch of history is one DOM operation instead of one per
+ * message. */
+.older-batch { display: contents; }
+
+/* ── jump to top ─────────────────────────────────────────────────────────
+ * A long transcript is a very long way up, and the mouse wheel is not a
+ * scrollbar you can throw. The button floats just above the composer, on the
+ * right, and appears only when there is somewhere to go (and, on a session that
+ * is still rendering, waits until the top is real) - it lands on message 1, not
+ * on "near the top".
+ *
+ * Its offset is set from JS (see updateJumpTop) rather than hard-coded: the
+ * composer grows with the draft and the text size, and a fixed bottom would put
+ * the button inside the message box or behind the composer depending on how
+ * much you had typed. */
+#btn-jump-top {
+  position: absolute; right: 20px; bottom: 96px; z-index: 4;
+  width: 36px; height: 36px; padding: 0; border-radius: 50%;
+  display: none; align-items: center; justify-content: center;
+  font-size: 16px; line-height: 1;
+  background: color-mix(in srgb, var(--bg-elev) 94%, transparent);
+  border: 1px solid var(--border);
+  box-shadow: 0 3px 14px rgba(0, 0, 0, .5);
+  color: var(--text-dim);
+}
+#btn-jump-top.show { display: flex; }
+#btn-jump-top:hover { color: var(--accent); border-color: var(--accent); }
+#btn-jump-top.busy { color: var(--accent); }
+#btn-jump-top.busy .ico { display: inline-block; animation: spin .8s linear infinite; }
 
 /* No slab behind the whole composer strip: only the actual controls carry a
  * background, so typing more (or adding attachments) never stretches a dark bar
@@ -776,8 +1056,6 @@ body.run-active .status-bar.hidden {
   padding: 3px 8px;
   border-radius: var(--radius);
   background: color-mix(in srgb, var(--bg-panel) calc(var(--ui-alpha) * 100%), transparent);
-  backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
-  -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
 }
 /* the live turn clock in the status bar, frozen into the total when it settles */
 #stat-turn.live { color: var(--accent); }
@@ -792,10 +1070,46 @@ body.run-active .status-bar.hidden {
   max-width: 860px; margin: 0 auto 6px; display: flex; gap: 8px; flex-wrap: wrap;
 }
 .attachment { position: relative; }
-.attachment img {
-  width: 64px; height: 64px; object-fit: cover;
-  border-radius: 8px; border: 1px solid var(--border); display: block;
+/* A thumbnail you cannot see anything in. The picture is a real button with a
+ * small eye on it; clicking opens it full size, and clicking off it (or Esc)
+ * closes that - the same viewer a message image uses. */
+.attachment-view {
+  display: block; position: relative; padding: 0; margin: 0;
+  border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+  background: var(--bg-elev); cursor: zoom-in; line-height: 0;
 }
+.attachment-view img {
+  width: 64px; height: 64px; object-fit: cover; display: block;
+}
+.attachment-eye, .img-chip-eye {
+  position: absolute; right: 3px; bottom: 3px;
+  display: flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; border-radius: 6px;
+  background: rgba(10, 12, 16, .72); color: var(--text);
+  pointer-events: none; line-height: 0;
+  transition: color .12s ease, background .12s ease;
+}
+.attachment-view:hover .attachment-eye, .img-chip:hover .img-chip-eye {
+  background: var(--accent); color: #fff;
+}
+/* A picture a tool returned, in the place its result is written */
+.img-chip {
+  display: inline-flex; align-items: center; gap: 7px;
+  vertical-align: middle; margin: 3px 0;
+  padding: 3px 9px 3px 3px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-elev); color: var(--text); cursor: zoom-in;
+  font-family: inherit; font-size: calc(12px * var(--chat-scale));
+  transition: border-color .12s ease;
+}
+.img-chip:hover { border-color: var(--accent); }
+.img-chip-thumb {
+  width: 30px; height: 30px; object-fit: cover; border-radius: 5px;
+  display: block; background: var(--bg-hover);
+}
+.img-chip .img-chip-eye {
+  position: static; width: 18px; height: 18px; background: transparent; color: var(--text-dim);
+}
+.img-chip:hover .img-chip-eye { background: transparent; color: var(--accent); }
 .attachment .rm {
   position: absolute; top: -6px; right: -6px; width: 18px; height: 18px;
   border-radius: 50%; background: var(--red); color: #fff; border: none;
@@ -805,31 +1119,54 @@ body.run-active .status-bar.hidden {
   max-width: 860px; margin: 0 auto;
   display: flex; gap: 8px; align-items: flex-end;
   position: relative;
-  /* The dark layer covers the whole box again (the buttons strip alone looked
-   * like a stray strip), and the outline is the accent one instead of a thin
-   * neutral border which read as a leftover edge. */
-  background: color-mix(in srgb, var(--bg-panel) calc(var(--ui-alpha) * 100%), transparent);
-  backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
-  -webkit-backdrop-filter: blur(calc((1 - var(--ui-alpha)) * 14px));
-  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  border-radius: var(--radius); padding: 8px;
+  /* No border AND no background on the strip. The border was one ring too many
+   * (the `+` had its own, the input had a focus ring inside that), and the
+   * background was a slab that grew upward with the draft - so a multi-line
+   * message was wrapped in a dark band that stretched past the buttons beside
+   * it. Each control below carries its own fill and edge, and nothing is left
+   * behind to follow the text upward. */
+  background: none; border: 0; padding: 0;
 }
 .composer-row > * { position: relative; z-index: 1; }
-/* Only ONE blue outline: the ring around what you typed. The row keeps a
- * neutral border on focus, so a second accent layer does not wrap the empty
- * space around the input. */
-.composer-row:focus-within { border-color: var(--accent); }
-.composer-row.has-text #input,
-#input:focus {
-  border-radius: 7px;
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 38%, transparent);
+/* The bare icon buttons (attach, mic, stop) match the message box exactly -
+ * same fill, same edge - so the row reads as one set of boxes rather than three
+ * floating glyphs next to an input. */
+.composer-row .btn.icon,
+.composer-row .btn.stop {
+  background: color-mix(in srgb, var(--bg-elev) calc(var(--ui-alpha) * 100%), transparent);
 }
+/* A visible edge. --border on its own is #2c333f, which on this theme is a
+ * couple of shades off the page - the outline was technically there and looked
+ * like nothing, which is the same complaint as "the + has no border". Lifted
+ * toward the accent so a box is a box without being loud. */
+.composer-row .btn.icon,
+.composer-row .btn.stop,
 #input {
-  flex: 1; resize: none; border: none; outline: none;
-  background: transparent; color: var(--text);
-  font: 14px/1.45 inherit; font-family: var(--chat-font); font-size: var(--chat-size);
-  max-height: 200px; padding: 4px 2px;
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
 }
+/* ...except the stop button, which is the one control here that does something
+ * irreversible and has always said so with a red edge. The rule above is more
+ * specific than `.btn.stop`, so it quietly repainted that edge in accent blue
+ * and the button went back to looking like the two harmless ones beside it. */
+.composer-row .btn.stop { border-color: var(--red); }
+.composer-row .btn.stop:hover { border-color: color-mix(in srgb, var(--red) 72%, #fff); }
+.composer-row .btn.icon:hover,
+.composer-row .btn.stop:hover { border-color: var(--accent); }
+/* One outline, on the thing that holds the text: a real border rather than a
+ * box-shadow ring, so growing with the text carries the top edge upward and
+ * nothing else has to move. */
+#input {
+  flex: 1; resize: none; outline: none;
+  background: color-mix(in srgb, var(--bg-elev) calc(var(--ui-alpha) * 100%), transparent);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font: 14px/1.45 inherit; font-family: var(--chat-font); font-size: var(--chat-size);
+  max-height: 200px; padding: 7px 11px;
+  border-radius: 8px;
+  transition: border-color .12s ease;
+}
+#input:focus { border-color: var(--accent); }
+.composer-row.has-text #input { border-color: color-mix(in srgb, var(--accent) 62%, var(--border)); }
 #btn-mic.recording { background: var(--red); border-color: var(--red); animation: pulse 1s infinite; }
 #btn-send svg, #btn-mic svg, #btn-stop svg { display: block; }
 
@@ -942,10 +1279,18 @@ body { display: flex; }
  * the border made it look selected while you were reading a different one */
 .session-item.live { border-color: color-mix(in srgb, var(--green) 50%, transparent); }
 .live-dot {
-  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
-  background: var(--green); margin-right: 6px; vertical-align: 1px;
+  /* flex: 0 0 auto is the fix: as a plain flex child the dot had flex-shrink: 1,
+   * so a long session name squeezed it - a 7px circle became a 1px sliver next
+   * to the text, which is what made it look "squished together". It also sits
+   * beside the fold arrow, so both indicators have to hold their size. */
+  display: inline-block; flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--green); margin-right: 2px;
+  /* the pulse grows a halo, which is clipped on a flex row that is exactly as
+   * wide as its content - give the dot its own room so the ring is visible */
+  box-sizing: content-box; padding: 1px;
   animation: live-pulse 1.2s ease-in-out infinite;
 }
+.session-item .s-name > .name-text { flex: 0 1 auto; min-width: 0; }
 @keyframes live-pulse {
   0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(80, 200, 120, .5); }
   50% { opacity: .55; box-shadow: 0 0 0 4px rgba(80, 200, 120, 0); }
@@ -978,23 +1323,132 @@ body { display: flex; }
 
 /* Scrollbars follow the theme colour: the grey ones read as part of the
  * browser rather than part of the app, and on the sidebar they were hard to see
- * against the panel at all. */
-::-webkit-scrollbar { width: 11px; height: 11px; }
+ * against the panel at all.
+ *
+ * The width is the *hit area*, not just how it looks: an 11px track left about
+ * four usable pixels of thumb next to the window edge, which is genuinely hard
+ * to grab. 12px is the smallest width that is still comfortable to hit one-handed,
+ * and it is what this uses now - 15px was tried and read as a slab, 20px worse
+ * still, and a 9px thumb on a 15px track kept being reported as "way too big".
+ * The thumb is the track minus its
+ * border, 3px a side for 6px of visible thumb: kept lighter than the space it
+ * lives in, so it still reads as a scrollbar. */
+::-webkit-scrollbar { width: 12px; height: 12px; }
 ::-webkit-scrollbar-thumb {
   /* a transparent border + background-clip keeps the thumb visually thinner than
    * the track that reserves the space */
-  background: color-mix(in srgb, var(--accent) 50%, transparent);
-  border: 2px solid transparent; background-clip: padding-box; border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 62%, transparent);
+  border: 3px solid transparent; background-clip: padding-box; border-radius: 6px;
+  min-height: 32px;
 }
-::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--accent) 78%, transparent); background-clip: padding-box; }
-::-webkit-scrollbar-track { background: color-mix(in srgb, var(--accent) 9%, transparent); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--accent) 88%, transparent); background-clip: padding-box; }
+::-webkit-scrollbar-track { background: color-mix(in srgb, var(--accent) 9%, transparent); border-radius: 6px; }
+::-webkit-scrollbar-track:hover { background: color-mix(in srgb, var(--accent) 15%, transparent); }
 ::-webkit-scrollbar-corner { background: transparent; }
-/* standards version (Firefox, Chrome 121+) */
-/* The highlight you drag over text is the one accent-coloured thing the plain
- * theme did not set, which left the browser's default blue next to everything
- * else - and left it out of gamer mode entirely. */
+/* The little arrows Chromium puts at each end of a scrollbar, which no other
+ * browser draws and which turn a 12px track into something that reads as a
+ * control rather than a scrollbar. */
+::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+
+/* ── Firefox's scrollbar ─────────────────────────────────────────────────
+ * The webkit rules above do nothing in Firefox. All it honours is
+ * scrollbar-color and scrollbar-width, and with the default width it draws the
+ * classic control: a wide track with a square thumb and an arrow button at each
+ * end. That is the bar in the screenshot - and `thin` is what takes the buttons
+ * away and narrows it, which is why `thin` is here after all. The comment that
+ * used to sit here said `thin` was "on purpose avoided"; that was a judgement
+ * about the 11px track, and it was the wrong trade, because the alternative
+ * Firefox look has arrow buttons.
+ *
+ * Measured in Chromium on this machine, with a custom ::-webkit-scrollbar asking
+ * for 30px, and what it actually reserved:
+ *
+ *     the webkit rule alone                   -> 30 px
+ *     + scrollbar-width: auto                 -> 30 px
+ *     + scrollbar-color: <blue> <faint blue>  -> 15 px
+ *     + scrollbar-width: thin                 -> 10 px
+ *
+ * Two things follow, and the second one corrected an earlier claim here.
+ *
+ *  1. Setting `scrollbar-color` takes Chromium off the ::-webkit-scrollbar path
+ *     entirely - the third line is the native bar, coloured. That rule is set on
+ *     `*` further down, so IN CURRENT CHROMIUM everything above this comment is
+ *     inert: the rounded accent-coloured pill it draws comes from scrollbar-color,
+ *     not from these webkit rules. They are kept because they are still the only
+ *     thing Safari and pre-121 Chromium understand, but they are no longer what
+ *     makes the bar look right here.
+ *  2. So `thin` would not break Chromium's bar; it would narrow it from 15px to
+ *     10px. Scoping it to Firefox is therefore about leaving alone the bar that is
+ *     already right, not about rescuing it - the 15px one is closer to the 12px
+ *     this stylesheet intends, and it is the width in the screenshot worth keeping.
+ *
+ * Hence: `auto` globally, and `thin` only where ::-webkit-scrollbar does not
+ * exist. Firefox loses its arrow buttons; Chromium changes not at all. */
+
 ::selection { background: color-mix(in srgb, var(--accent) 42%, transparent); color: var(--text); }
-* { scrollbar-color: color-mix(in srgb, var(--accent) 55%, transparent) color-mix(in srgb, var(--accent) 10%, transparent); scrollbar-width: thin; }
+* { scrollbar-color: color-mix(in srgb, var(--accent) 68%, transparent) color-mix(in srgb, var(--accent) 10%, transparent); scrollbar-width: auto; }
+
+/* Applied AFTER the rule above on purpose: both are `*`, so whichever comes last
+ * wins where nothing more specific says otherwise. The two `scrollbar-width: none`
+ * declarations in this file (.queue-bar, #stats-bar) are more specific and are
+ * unaffected, which is what they want - those are deliberately hidden bars. */
+@supports not selector(::-webkit-scrollbar) {
+  * { scrollbar-width: thin; }
+}
+
+/* ── frosted panels ───────────────────────────────────────────────────────
+ * The blur used to be on every bubble, tool card, panel and button strip, sized
+ * from the chat-transparency slider. At full opacity that slider asks for
+ * blur(0px) - but Chromium still promotes each of those elements to its own
+ * compositing layer and keeps a backdrop snapshot alive, and a long transcript
+ * is hundreds of them. That is the single biggest GPU/CPU cost in a quiet tab:
+ * the page looked still but never went idle.
+ *
+ * So the blur now only exists when it is actually visible. `body.ui-blur` is set
+ * from applySettings() whenever the panels are not fully opaque, and only then
+ * are the filters declared at all. */
+body.ui-blur #sidebar { backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+body.ui-blur #topbar { backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+body.ui-blur .msg.system .bubble { backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+/* NOT on .msg .bubble or .tool-card.
+ *
+ * A backdrop-filter makes the browser keep a backdrop snapshot for that element
+ * and recomposite it - per element, and again on every scroll frame. Applying it
+ * to the message bubble and the tool card means one snapshot per message in the
+ * transcript: on a long session that is thousands of them, and scrolling
+ * re-composites every one on screen continuously. That is issue #3, "scrolling
+ * in the webui makes the gpu usage skyrocket" - it appears as soon as "chatbox
+ * transparency" is below 100% (which turns body.ui-blur on for every bubble),
+ * which is 25% on this machine.
+ *
+ * The chrome keeps its blur: the sidebar, the topbar and the composer are a
+ * handful of fixed elements, so their snapshots are bounded and they are what the
+ * setting is really for. The transcript gets the same look from its translucent
+ * background colour, which costs nothing per frame. */
+body.ui-blur #stats-bar,
+body.ui-blur .composer-row .btn.icon,
+body.ui-blur .composer-row .btn.stop,
+body.ui-blur #input { backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+body.ui-blur #view-banner,
+body.ui-blur .banner { backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+
+/* ── custom cursor ───────────────────────────────────────────────────────
+ * A custom pointer is a one-image setting: the picture, its size, and the spot
+ * inside it that is the actual tip. --cursor is assembled in applySettings() as
+ * `url("<src>") <x> <y>, auto`, so switching it on is one class on <html> and
+ * switching it off is removing it.
+ *
+ * It is applied with !important on purpose: without it the dozens of
+ * `cursor: pointer` rules scattered through this file would win over a bare
+ * `body` selector and the picture would only show on empty space. Text fields
+ * keep the I-beam so typing still reads as typing. */
+html.custom-cursor,
+html.custom-cursor *:not(iframe) { cursor: var(--cursor, auto) !important; }
+html.custom-cursor input,
+html.custom-cursor textarea,
+html.custom-cursor [contenteditable] { cursor: var(--cursor, auto), text !important; }
+html.custom-cursor a,
+html.custom-cursor button { cursor: var(--cursor, auto), pointer !important; }
 
 /* ───────────────────────── long content ─────────────────────────────────
  * A model can emit one enormous unbroken line (a minified file, a URL, a base64
@@ -1135,6 +1589,13 @@ body.text-outline .session-item .s-meta { text-shadow: none; }
   background: color-mix(in srgb, color-mix(in srgb, var(--accent) 10%, var(--bg-elev)) calc(var(--ui-alpha) * 100%), transparent);
 }
 #thinking-select option { color: var(--text); background: var(--bg-elev); }
+#thinking-btn.pill {
+  max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) calc(max(var(--ui-alpha), 0.35) * 100%), transparent);
+  background: color-mix(in srgb, color-mix(in srgb, var(--accent) 12%, transparent) calc(var(--ui-alpha) * 100%), transparent);
+  font-size: 11.5px; padding: 3px 10px;
+}
 .model-menu {
   position: fixed; z-index: 60;
   background: var(--bg-elev); border: 1px solid var(--border);
@@ -1147,12 +1608,12 @@ body.text-outline .session-item .s-meta { text-shadow: none; }
   color: var(--text); padding: 6px 8px; font-size: 12.5px;
   flex: 1; min-width: 0;
 }
-#model-refresh { flex: 0 0 auto; padding: 4px 9px; font-size: 13px; line-height: 1.1; }
-#model-refresh .ico { display: inline-block; }
-/* spin the glyph, not the button box */
-#model-refresh.spinning .ico { animation: model-refresh-spin .7s linear infinite; }
-#model-refresh.spinning { color: var(--accent); }
-@keyframes model-refresh-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+/* The model list has no refresh button: the list is already re-read from the
+   agent whenever it restarts, whenever the picker is opened, and on every
+   /model. A reload was one more thing to click and one more thing that could
+   look broken. The spin keyframe itself is still used - the jump-to-top button
+   shows it while a long session renders. */
+@keyframes spin { to { transform: rotate(360deg); } }
 .model-list { max-height: 46vh; overflow-y: auto; display: flex; flex-direction: column; }
 .model-group {
   font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px;
@@ -1293,7 +1754,9 @@ body.hide-tools .msg.tool { display: none; }
 #crop-dialog { max-height: 92vh; overflow: auto; }
 .crop-stage { max-height: 52vh; }
 .crop-stage.circle { width: min(320px, 46vh); aspect-ratio: 1 / 1; }
-.load-older { max-width: 860px; margin: 4px auto 10px; text-align: center; }
+/* (.load-older used to live here. There is no longer a "load N older messages"
+   button: the whole session is rendered in one pass now, so there is nothing
+   left to load on request.) */
 
 /* the cropper sizes its stage inline; these keep the frame inside it */
 .crop-stage { overflow: hidden; }
@@ -1329,3 +1792,21 @@ body.hide-tools .msg.tool { display: none; }
   color: var(--text-dim);
 }
 .banner-x { margin-left: 8px; padding: 2px 8px; line-height: 1.2; }
+
+/* ── the Extensions tab (issue #46) ──────────────────────────────────────
+ * The rows reuse .prov-row / .prov-info / .prov-id / .prov-meta, which the
+ * Pi providers tab already uses, so a disabled resource only needs to look off
+ * and the section headings only need to exist. */
+#tab-extensions .ext-head {
+  margin: 2px 0 6px; font-size: 12.5px; font-weight: 600; letter-spacing: .02em;
+  display: flex; align-items: center; gap: 6px;
+}
+#tab-extensions .ext-count {
+  font-size: 11px; font-weight: 500; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; line-height: 15px;
+}
+#tab-extensions .prov-id.ext-off { color: var(--text-dim); text-decoration: line-through; text-decoration-thickness: 1px; }
+#tab-extensions .prov-row { align-items: center; }
+#tab-extensions .prov-row .btn { flex: 0 0 auto; }
+#tab-extensions textarea { width: 100%; font-family: var(--mono); font-size: 12px; margin-top: 6px; }
+#tab-extensions .prov-section:first-of-type { margin-top: 4px; }

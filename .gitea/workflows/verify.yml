@@ -1,0 +1,119 @@
+# Run the verification suite on every push and pull request.
+#
+# Gitea Actions reads this file with a GitHub-Actions-compatible runner, so a
+# stock `act_runner` with the `ubuntu-latest` label works as-is.
+#
+# The suite is `verify-matrix.sh`, the same script used by hand. It covers:
+#
+#   1. syntax      every JS file parses (node --check; JSX via @babel/parser)
+#   2. unit        sessionLines over a 6001-line file with multi-byte characters
+#                  on every read boundary; the atomic JSON write; the ?dir=
+#                  validator; and, when a container is given, both injection
+#                  payloads
+#   3. integration a live bridge: page, assets, session list, transcript, raw
+#                  JSONL, path traversal, and the browser-driven checks
+#   4. docker      the image builds, the container serves the UI and health, and
+#                  a throwaway container takes the injection and docker-session
+#                  checks
+#
+# Two things to know about it in CI:
+#
+#   * The browser checks need Chrome or Chromium on PATH. GitHub's ubuntu images
+#     have google-chrome; a bare act_runner image may not, and those checks then
+#     report SKIP rather than passing - which is deliberate, a skip is not a pass.
+#
+#   * The container checks need a docker daemon. Without one, section 4 reports
+#     SKIP and sections 1-3 still run. Mounting the socket is enough:
+#         -v /var/run/docker.sock:/var/run/docker.sock
+#
+# Set ACTIONS_STEP_DEBUG or run `./verify-matrix.sh -x` locally if a step fails;
+# the script prints the failing command's stderr under each FAIL.
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # The bridge's only dependency (ws). Everything the desktop app needs is
+      # for the Windows native build and is not used by the checks.
+      - name: Install bridge dependencies
+        run: npm --prefix bridge ci --no-audit --no-fund || npm --prefix bridge install --no-audit --no-fund
+
+      # The desktop checks' tooling, not the whole React Native tree.
+      #
+      # The pi-desktop checks (JSX parse and lint) resolve what they load from the
+      # app's own node_modules. Installing the app's full dependency set on a
+      # runner is hundreds of megabytes of native toolchain for two static checks;
+      # these are all they actually load, and PI_RN_MODULES says where they are.
+      #
+      # The list is short but not guessable in either direction:
+      #
+      #  * the lint check asks for the react and react-hooks plugins by name, so
+      #    leaving them out fails later with "Cannot find module
+      #    'eslint-plugin-react'" rather than at install time;
+      #  * the major versions have to match what the app pins (@babel/core ^7,
+      #    eslint ^8). Taking the newest of everything does not resolve at all -
+      #    @babel/plugin-syntax-jsx@8 wants @babel/core@8 while
+      #    @babel/eslint-parser@7 wants @babel/core@7, so npm gives up with
+      #    ERESOLVE. Verified that this exact set installs and that both checks
+      #    pass against it alone.
+      - name: Install the desktop checks' tooling
+        run: |
+          mkdir -p /tmp/rn-deps
+          cd /tmp/rn-deps
+          npm init -y >/dev/null 2>&1
+          npm install --no-audit --no-fund \
+            'eslint@^8' '@babel/core@^7' '@babel/parser@^7' \
+            '@babel/eslint-parser@^7' '@babel/plugin-syntax-jsx@^7' \
+            eslint-plugin-react eslint-plugin-react-hooks \
+            || echo "install failed - the desktop checks will report SKIP"
+          echo "PI_RN_MODULES=/tmp/rn-deps/node_modules" >> "$GITHUB_ENV"
+
+      # A container image for the injection and docker-session checks. Built
+      # rather than pulled so it matches the Dockerfile in this commit. If the
+      # build cannot reach the registry, the section reports SKIP and the rest
+      # still runs.
+      - name: Build the container image
+        run: docker build -t webui-pi-webui:latest .
+        continue-on-error: true
+
+      # The name is fixed, so a previous run's container has to go first. The
+      # runner cleans up the containers it makes for the job, but not one a step
+      # creates on the host daemon - and a leftover from the run before made this
+      # step fail with a name conflict, which is what run #4 of this workflow hit.
+      - name: Start a throwaway container for the container-facing checks
+        id: ctr
+        continue-on-error: true
+        run: |
+          docker rm -f ci-verify >/dev/null 2>&1 || true
+          docker run -d --name ci-verify --entrypoint sleep webui-pi-webui:latest 900
+          echo "name=ci-verify" >> "$GITHUB_OUTPUT"
+
+      - name: verify-matrix.sh
+        env:
+          # Section 2's injection test plants its payloads in this container.
+          PI_TEST_CONTAINER: ${{ steps.ctr.outputs.name }}
+        run: ./verify-matrix.sh --docker
+
+      - name: Container logs, if a container check failed
+        if: failure()
+        run: docker logs ci-verify 2>&1 | tail -50 || true
+
+      # Always, so the next run does not inherit it.
+      - name: Remove the throwaway container
+        if: always()
+        run: docker rm -f ci-verify >/dev/null 2>&1 || true

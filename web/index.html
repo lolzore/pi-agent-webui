@@ -71,7 +71,6 @@
     <div id="chat"></div>
 
     <div id="composer-dock">
-    <div id="queue-bar" class="queue-bar hidden"></div>
     <div id="widget-bar" class="widget-bar hidden"></div>
     <div id="status-bar" class="status-bar hidden"></div>
 
@@ -82,6 +81,11 @@
         <button id="btn-cancel-edit" class="btn small">cancel edit</button>
       </div>
       <div id="attachments" class="attachments hidden"></div>
+      <!-- What you have queued to send belongs next to the box you queue it in.
+           It used to be the first thing in the dock, which put it above the status
+           and widget lines *and* the composer and the stats row - a row about your
+           own messages, parked at the far end of everything else. -->
+      <div id="queue-bar" class="queue-bar hidden"></div>
       <div class="composer-row">
         <button id="btn-attach" class="btn icon" title="Attach image / PDF / audio / video">+</button>
         <input id="file-input" type="file" accept="image/*,application/pdf,audio/*,video/*,.pdf" multiple hidden>
@@ -120,10 +124,14 @@
     <div id="model-menu" class="model-menu hidden">
       <div class="model-search-row">
         <input id="model-search" type="search" placeholder="Search models…" autocomplete="off" spellcheck="false">
-        <button id="model-refresh" class="btn icon" title="Reload the model list (and re-scan llama.cpp servers)"><span class="ico">⟳</span></button>
       </div>
       <div id="model-list" class="model-list"></div>
     </div>
+
+    <!-- Jump to the very first message. Shown only when the transcript is
+         scrolled away from the top, so it costs nothing while you are at the
+         bottom where the conversation actually happens. -->
+    <button id="btn-jump-top" class="btn" title="Jump to the very top of this session" aria-label="Jump to the very top of this session"><span class="ico">↑</span></button>
   </main>
 
   <!-- ══════════ Reels panel (in-app split — plays inside the website) ══════════ -->
@@ -269,6 +277,21 @@
 
 <!-- Settings dialog -->
 <!-- What one subagent wrote, read from the extension's own artifact file. -->
+  <!-- Notifications, as a dialog rather than a dropdown (issue #4).
+       "bigger text, in the middle of the window, closed with a Done button like
+       the settings dialog" - so it has its own element here and reuses the
+       dialog styling the settings, crop, ask and subagent panels already share. -->
+  <dialog id="notices-dialog">
+    <h3>Notifications</h3>
+    <p class="setup-sub" id="notices-sub">Everything the app has reported, newest first. Click a row to copy its details.</p>
+    <div id="notices-list" class="notices-list"></div>
+    <div class="dialog-row notices-foot">
+      <button id="notices-clear" class="btn small">clear</button>
+      <span class="notices-spacer"></span>
+      <button id="notices-done" class="btn primary">Done</button>
+    </div>
+  </dialog>
+
   <dialog id="subagent-dialog">
     <h3 id="subagent-title">subagent</h3>
     <div id="subagent-meta" class="dim"></div>
@@ -290,6 +313,7 @@
     <button class="tab" data-tab="appearance">Appearance</button>
     <button class="tab" data-tab="shorts">Shorts</button>
     <button class="tab" data-tab="providers">Pi providers</button>
+    <button class="tab" data-tab="extensions">Extensions</button>
   </div>
 
   <div class="tab-panel" id="tab-general">
@@ -309,6 +333,13 @@
         <input id="set-avatar-size" type="range" min="16" max="96" step="2" value="34">
         <span id="set-avatar-size-val">34px</span>
       </div>
+      <label>Animated avatars</label>
+      <div class="rate-row">
+        <input id="set-avatar-animate" type="range" min="0" max="9" step="1" value="9">
+        <span id="set-avatar-animate-val">all of them</span>
+      </div>
+      <label></label>
+      <div class="hint">How many messages keep a moving profile picture. The slider runs <b>none of them</b> → 1 … 8 → <b>all of them</b>, with no hidden ceiling behind that last one. Each animated message is a live video decoder, so on a very long transcript the numbers are cheaper; they all pause while this tab is in the background.</div>
       <label>Thinking</label>
       <label class="check-label"><input id="set-show-thinking" type="checkbox"> show thinking blocks</label>
       <label></label>
@@ -325,6 +356,21 @@
       <label class="check-label"><input id="set-done-notify" type="checkbox"> desktop notification</label>
       <label></label>
       <label class="check-label"><input id="set-done-only-unfocused" type="checkbox"> only when this window is not focused</label>
+      <label>Notification sound</label>
+      <div class="rate-row sound-row">
+        <input id="set-done-sound-file" type="text" placeholder="your own sound: an audio file, or a URL" spellcheck="false" autocomplete="off">
+        <button id="btn-done-sound-upload" class="btn small" title="Pick an audio file on this machine">upload…</button>
+        <button id="btn-done-sound-test" class="btn small" title="Play the notification sound now">test</button>
+        <button id="btn-done-sound-clear" class="btn small" title="Go back to the built-in chime">clear</button>
+        <input id="done-sound-input" type="file" accept="audio/*,.mp3,.wav,.ogg,.m4a,.aac,.flac,.webm" hidden>
+      </div>
+      <label></label>
+      <div class="hint" id="done-sound-note">mp3 / wav / ogg / m4a — stored on this machine, never sent to the model. The built-in two-note chime is used until you pick one.</div>
+      <label>Agent</label>
+      <div class="rate-row">
+        <button id="btn-reload-pi" class="btn small" title="Reload what pi loads from disk: extensions, skills, prompt templates, keybindings and themes. Nothing you wrote in this session is lost — the conversation is replayed from the session file.">/reload</button>
+        <span class="hint">re-reads extensions, skills, prompts, keybindings, themes</span>
+      </div>
       <label>Network</label>
       <label class="check-label"><input id="set-lan" type="checkbox"> let other devices on this network open this WebUI</label>
       <label></label>
@@ -448,6 +494,26 @@
         <input id="set-font-size" type="range" min="12" max="20" step="1">
         <span id="set-font-size-val">14px</span>
       </div>
+      <label>Custom cursor</label>
+      <div class="rate-row cursor-row">
+        <input id="set-cursor-file" type="text" placeholder="pointer picture: a PNG, or a URL" spellcheck="false" autocomplete="off">
+        <button id="btn-cursor-upload" class="btn small" title="Pick a cursor picture on this machine">upload…</button>
+        <button id="btn-cursor-clear" class="btn small" title="Go back to the normal pointer">clear</button>
+        <input id="cursor-input" type="file" accept="image/png,image/webp,image/gif,image/svg+xml,.png" hidden>
+      </div>
+      <label></label>
+      <div class="hint" id="cursor-note">Your picture is redrawn at the size below and written out as a PNG, because a browser silently ignores a CSS cursor that is too large or in a format it will not use as one. The hotspot is the pixel that sits on the real pointer tip — usually the top-left corner (0, 0). Everything gets the picture, including text fields; the browser's own text caret is kept.</div>
+      <label>Cursor size</label>
+      <div class="rate-row">
+        <input id="set-cursor-size" type="range" min="16" max="128" step="2">
+        <span id="set-cursor-size-val">32px</span>
+      </div>
+      <label>Hotspot X / Y</label>
+      <div class="rate-row">
+        <input id="set-cursor-hot-x" type="range" min="0" max="127" step="1">
+        <input id="set-cursor-hot-y" type="range" min="0" max="127" step="1">
+        <span id="set-cursor-hot-val">0, 0</span>
+      </div>
     </div>
   </div>
 
@@ -518,6 +584,60 @@
       <div id="auth-logged-in" class="prov-list auth-logged-in"></div>
       <p class="hint">Subscription / OAuth logins (ChatGPT, Claude, GitHub Copilot, OpenRouter, xAI…) open a browser flow — run <code>/login &lt;provider&gt;</code> in a pi terminal for those.</p>
     </div>
+  </div>
+
+  <!-- Extensions / Skills / Packages / AGENTS.md (issue #46). Everything here
+       reads and writes under ~/.pi/agent, and enable/disable writes pi's own
+       +path/-path entries in settings.json rather than a second mechanism of our
+       own. There is no install button on purpose - see the note at the end. -->
+  <div class="tab-panel hidden" id="tab-extensions">
+    <p class="hint" style="margin-top:2px">
+      From <code id="ext-agent-dir">~/.pi/agent</code>. Disabling writes
+      <code>+path</code>/<code>-path</code> into <code id="ext-settings-file">settings.json</code> — pi's own
+      setting, so pi and this tab always agree. Press <b>reload agent</b> after a change to apply it.
+    </p>
+
+    <div class="prov-section">
+      <h4 class="ext-head">Extensions <span class="ext-count" id="ext-ext-count"></span></h4>
+      <div id="ext-extensions" class="prov-list"></div>
+    </div>
+
+    <div class="prov-section" style="margin-top:12px">
+      <h4 class="ext-head">Skills <span class="ext-count" id="ext-skill-count"></span></h4>
+      <div id="ext-skills" class="prov-list"></div>
+    </div>
+
+    <div class="prov-section" style="margin-top:12px">
+      <h4 class="ext-head">Packages <span class="ext-count" id="ext-pkg-count"></span></h4>
+      <p class="hint" style="margin:2px 0 6px">Entries in <code>settings.json</code> → <code>packages</code>. Removing one is
+        immediate; adding one only lists it — pi fetches it the next time it starts.</p>
+      <div id="ext-packages" class="prov-list"></div>
+      <div class="rate-row prov-actions">
+        <input id="ext-pkg-source" type="text" placeholder="npm:pi-something  ·  git:host/user/repo" autocomplete="off" spellcheck="false" style="flex:1">
+        <button id="btn-ext-pkg-add" class="btn small">add to list</button>
+      </div>
+    </div>
+
+    <div class="prov-section" style="margin-top:12px">
+      <h4 class="ext-head">AGENTS.md</h4>
+      <p class="hint" style="margin:2px 0 6px">
+        The global file is <code>&lt;agent dir&gt;/AGENTS.md</code> and is editable here. The per-project files
+        are shown for reference only — they live at whatever paths the project uses, and writing one would
+        be a write anywhere on disk. Saving an empty box deletes the global file.
+      </p>
+      <div id="ext-agents-list" class="prov-list"></div>
+      <textarea id="ext-agents-text" rows="10" spellcheck="false" placeholder="# Instructions for the agent&#10;"></textarea>
+      <div class="rate-row prov-actions">
+        <button id="btn-ext-agents-save" class="btn small primary">save global AGENTS.md</button>
+      </div>
+    </div>
+
+    <p class="hint" style="margin-top:10px; border-top:1px solid var(--border); padding-top:8px">
+      <b>No install button, on purpose.</b> An extension is code the agent loads and runs. This bridge
+      has no password — only a check that the request came from this page rather than another origin —
+      so &quot;install&quot; here would mean &quot;run my code on that machine&quot; for anyone who can reach the port.
+      Install from a pi terminal with <code>pi install …</code>, then press reload agent.
+    </p>
   </div>
   <div class="dialog-buttons">
     <button id="settings-close" class="btn primary">Done</button>

@@ -1,6 +1,6 @@
 // Lightweight markdown → React Native renderer (no dependencies).
 // Handles: code fences, inline code, bold, italic, links, headings, lists.
-import React from 'react';
+import React, { memo } from 'react';
 import { Text, View, StyleSheet, Linking } from 'react-native';
 
 const C = {
@@ -14,6 +14,10 @@ const C = {
 
 /* ── inline: tokenize **bold**, *italic*, `code`, [text](url) ── */
 
+/**
+ * Parse inline markdown tokens into React Native Text elements.
+ * Extracted outside the component to avoid recreation on every render.
+ */
 function parseInline(text, keyBase) {
   const out = [];
   let i = 0;
@@ -74,7 +78,7 @@ function parseInline(text, keyBase) {
 
 /* ── block level ── */
 
-export function Markdown({ text, baseFontSize = 15 }) {
+export const Markdown = memo(function Markdown({ text, baseFontSize = 15 }) {
   if (!text) return null;
   const blocks = [];
   let key = 0;
@@ -138,7 +142,7 @@ export function Markdown({ text, baseFontSize = 15 }) {
   }
 
   return <View style={{ gap: 4 }}>{blocks}</View>;
-}
+});
 
 const styles = StyleSheet.create({
   codeBlock: {

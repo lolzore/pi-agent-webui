@@ -1,17 +1,74 @@
 # dependencies and runtime artifacts (all auto-installed/downloaded on launch)
 bridge/node_modules/
+pi-desktop/node_modules/
 bridge/whisper/
 uploads/
 workspace/
+workspace;C/
 
 # machine-specific pi agent source choice (native vs docker container name)
 bridge/agent-source.txt
 
-# local UI preferences (may contain an uploaded avatar)
+# local UI preferences (may contain an uploaded avatar, a cloud TTS API key,
+# and absolute paths to files on this machine)
 webui-settings.json
+bridge/settings-local.json
+bridge/settings-remote.json
+
+# security switch: `{"lan": true}` binds the bridge to every network interface
+# and the bridge has no authentication. Never commit a machine's choice -
+# bridge/lan.example.json documents the options.
+bridge/lan.json
 
 # logs
 *.log
 
 # last active session, remembered across bridge/agent restarts
 last-session.json
+last-session-docker-pi-test.json
+webui-last-session-*.json
+
+# scratch used by the verification suite and by local bridge runs
+.vtmp/
+.verify-tmp/
+.verify-tmp.*/
+
+# ── build output ────────────────────────────────────────────────────────
+# The Windows native build is ~2.5 GB of intermediates. The hand-written
+# native source (windows/PiAgent/*.h/.cpp/.vcxproj and the package manifest)
+# IS tracked; only the generated trees are not.
+pi-desktop/windows/**/obj/
+pi-desktop/windows/**/x64/
+pi-desktop/windows/**/Generated Files/
+pi-desktop/windows/**/bin/
+pi-desktop/windows/**/.vs/
+
+# intermediate and binary artifacts, wherever they land
+*.pdb
+*.pch
+*.obj
+*.iobj
+*.ipdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.msix
+*.appx
+*.msixbundle
+*.nupkg
+*.tgz
+
+# NuGet / MSBuild restore output
+project.assets.json
+project.nuget.cache
+packages.lock.json
+*.nuget.g.props
+*.nuget.g.targets
+
+# scratch files from a probe run - never part of the suite
+verify/.tmp-*.js
+
+# Metro scratch next to the desktop project (a local build leaves it behind)
+pi-desktop/.bundle/

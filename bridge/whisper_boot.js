@@ -23,6 +23,10 @@ const { spawn, execFile, execSync } = require('child_process');
 
 const WHISPER_PORT = process.env.WHISPER_PORT || '8081';
 
+/* Config: URLs and revisions can be overridden via environment variables. */
+const BIN_ZIP_URL = process.env.WHISPER_BIN_URL || 'https://github.com/ggml-org/whisper.cpp/releases/download/b5130/whisper-bin-x64.zip';
+const MODEL_REVISION = process.env.WHISPER_MODEL_REVISION || '5359861c739e955e79d9a303bcbc70fb988958b1';
+
 /* The models offered in the UI. Sizes are the ggml .bin downloads; the notes
  * are what actually matters when choosing (accuracy vs speed vs machine). */
 const WHISPER_MODELS = [
@@ -41,7 +45,7 @@ const DEFAULT_MODEL = process.env.WHISPER_MODEL || 'ggml-base.en.bin';
 const VENDOR_DIR = path.join(__dirname, 'whisper');
 // Note: whisper.cpp's semantic-version releases ship source only; the Windows
 // binaries are attached to the tagged nightly builds (b5130 etc.).
-const BIN_ZIP_URL = 'https://github.com/ggml-org/whisper.cpp/releases/download/b5130/whisper-bin-x64.zip';
+// BIN_ZIP_URL is now defined above with env var override.
 
 /* Everything this module downloads is checked against a published SHA-256 before
  * it is used, and a download that does not match is deleted instead of run. The
@@ -59,7 +63,6 @@ const BIN_ZIP_URL = 'https://github.com/ggml-org/whisper.cpp/releases/download/b
  *
  * A model that is not listed here is still downloaded (a user may type any id),
  * with a warning that nothing could be verified. */
-const MODEL_REVISION = process.env.WHISPER_MODEL_REVISION || '5359861c739e955e79d9a303bcbc70fb988958b1';
 const MODEL_URL = (m) => `https://huggingface.co/ggerganov/whisper.cpp/resolve/${MODEL_REVISION}/${m}`;
 const BIN_ZIP_SHA256 = 'f9ec6c52a2e949b62ab51fa21d0d497958f9e41c3010c157c4e42932d5316f3c';
 const MODEL_SHA256 = {
@@ -80,9 +83,11 @@ let whisperStart = null;   // in-flight promise, so two clicks cannot download t
 function tcpReachable(port) {
   return new Promise((resolve) => {
     const s = net.connect(Number(port), '127.0.0.1');
-    s.on('connect', () => { s.destroy(); resolve(true); });
-    s.on('error', () => resolve(false));
-    s.setTimeout(1500, () => { s.destroy(); resolve(false); });
+    let settled = false;
+    const done = (val) => { if (!settled) { settled = true; try { s.destroy(); } catch { /* already gone */ } resolve(val); } };
+    s.on('connect', () => done(true));
+    s.on('error', () => done(false));
+    s.setTimeout(1500, () => done(false));
   });
 }
 
@@ -110,7 +115,7 @@ function download(url, dest, onProgress, expected, what) {
           got += c.length;
           hash.update(c);
           const pct = total ? Math.floor((got / total) * 100) : 0;
-          if (onProgress) onProgress(got, total);
+          if (onProgress) { try { onProgress(got, total); } catch { /* progress callback must not break the download */ } }
           if (pct >= lastPct + 10) { lastPct = pct; console.log(`  downloading ${path.basename(dest)} … ${pct}%`); }
         });
         res.pipe(out);
@@ -139,28 +144,47 @@ function download(url, dest, onProgress, expected, what) {
 
 function unzip(zip, destDir) {
   return new Promise((resolve, reject) => {
-    execFile('powershell', ['-NoProfile', '-Command',
-      `Expand-Archive -LiteralPath "${zip}" -DestinationPath "${destDir}" -Force`],
-      { timeout: 300000 }, (err) => (err ? reject(err) : resolve()));
+    if (process.platform === 'win32') {
+      execFile('powershell', ['-NoProfile', '-Command',
+        `Expand-Archive -LiteralPath "${zip}" -DestinationPath "${destDir}" -Force`],
+        { timeout: 300000 }, (err) => (err ? reject(err) : resolve()));
+    } else {
+      // Non-Windows: use unzip command (available on macOS/Linux)
+      execFile('unzip', ['-o', zip, '-d', destDir], { timeout: 300000 }, (err) => (err ? reject(err) : resolve()));
+    }
   });
 }
 
+let cachedServerExe = null;
 function findServerExe(dir) {
-  const files = [];
-  (function walk(d) {
-    for (const f of fs.readdirSync(d, { withFileTypes: true })) {
-      const p = path.join(d, f.name);
-      if (f.isDirectory()) walk(p); else files.push(p);
-    }
-  })(dir);
-  return files.find((p) => /whisper[-.]?server(\.exe)?$/i.test(p))
-    || files.find((p) => /(^|\\|\/)server\.exe$/i.test(p))
-    || null;
+  if (cachedServerExe) return cachedServerExe;
+  try {
+    const files = [];
+    (function walk(d) {
+      for (const f of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, f.name);
+        if (f.isDirectory()) walk(p); else files.push(p);
+      }
+    })(dir);
+    cachedServerExe = files.find((p) => /whisper[-.]?server(\.exe)?$/i.test(p))
+      || files.find((p) => /(^|\\|\/)server\.exe$/i.test(p))
+      || null;
+    return cachedServerExe;
+  } catch {
+    return null;
+  }
 }
 
 async function startWhisper(modelId) {
   if (whisperStart) return whisperStart;      // one download at a time
-  whisperStart = doStartWhisper(modelId).finally(() => { whisperStart = null; });
+  whisperStart = doStartWhisper(modelId).finally(() => {
+    whisperStart = null;
+    // If the start failed, ensure whisperProc is cleaned up
+    if (whisperState.state === 'failed' && whisperProc) {
+      try { whisperProc.kill('SIGKILL'); } catch { /* already gone */ }
+      whisperProc = null;
+    }
+  });
   return whisperStart;
 }
 
@@ -200,7 +224,9 @@ async function doStartWhisper(modelId) {
       whisperState = { state: 'failed', model: modelName, url: null, detail: 'could not unpack the whisper.cpp download', got: 0, total: 0 };
       return null;
     }
-    if (!fs.existsSync(model)) {
+    let modelExists = true;
+    try { await fs.promises.access(model); } catch { modelExists = false; }
+    if (!modelExists) {
       console.log(`whisper STT: downloading model ${modelName}…`);
       const info = WHISPER_MODELS.find((m) => m.id === modelName);
       whisperState = { state: 'downloading', model: modelName, url: null, detail: `model ${modelName} (${info ? info.size : ''})`.trim(), got: 0, total: 0 };
@@ -228,6 +254,13 @@ async function doStartWhisper(modelId) {
     return null;
   } catch (e) {
     console.log('whisper STT: setup skipped (' + e.message + ')');
+    // Clean up any partially-started process
+    if (whisperProc) {
+      try { whisperProc.kill('SIGKILL'); } catch { /* already gone */ }
+      whisperProc = null;
+    }
+    // Invalidate cached server exe so a retry can find a newly downloaded one
+    cachedServerExe = null;
     whisperState = { state: 'failed', model: modelName, url: null, detail: e.message, got: 0, total: 0 };
     return null;
   }
@@ -247,7 +280,8 @@ function stopWhisper() {
   whisperProc = null;
   try {
     if (process.platform === 'win32') {
-      execSync(`taskkill /F /T /PID ${p.pid}`, { stdio: 'ignore' });
+      try { execSync(`taskkill /F /T /PID ${p.pid}`, { stdio: 'ignore' }); }
+      catch { p.kill('SIGKILL'); }
     } else {
       p.kill('SIGKILL');
     }

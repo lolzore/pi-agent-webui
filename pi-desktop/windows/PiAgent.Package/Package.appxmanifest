@@ -8,12 +8,12 @@
 
   <Identity
     Name="PiAgent"
-    Publisher="CN=TheBlueChips"
+    Publisher="CN=PiAgent"
     Version="1.0.0.0" />
 
   <Properties>
     <DisplayName>PiAgent</DisplayName>
-    <PublisherDisplayName>TheBlueChips</PublisherDisplayName>
+    <PublisherDisplayName>Pi Agent</PublisherDisplayName>
     <Logo>Images\StoreLogo.png</Logo>
   </Properties>
 
