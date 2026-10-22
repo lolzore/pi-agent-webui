@@ -6,14 +6,14 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates curl ripgrep \
  && rm -rf /var/lib/apt/lists/*
 
-# Which pi the container runs. The default matches the package this WebUI is
-# developed against; @mariozechner/pi-coding-agent (the original pi-mono
-# package) works as well. Built as an argument so a build can pick a different
-# one without editing the file. @latest is left out on purpose: the RPC surface
-# is what the bridge talks to, and a silent major bump should not be able to
-# break an image that used to build.
+# Which pi the container runs. The default matches the package/version this
+# WebUI is developed and tested against; @mariozechner/pi-coding-agent (the
+# original pi-mono package) works as well. Built as an argument so a build can
+# pick a different one without editing the file. The version is pinned rather
+# than @latest: the RPC surface is what the bridge talks to, and a silent major
+# bump should not be able to break an image that used to build.
 ARG PI_PACKAGE=@earendil-works/pi-coding-agent
-ARG PI_VERSION=latest
+ARG PI_VERSION=1.3.0
 RUN npm install -g "${PI_PACKAGE}@${PI_VERSION}"
 
 WORKDIR /app

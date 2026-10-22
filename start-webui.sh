@@ -11,15 +11,50 @@
 #   ./start-webui.sh docker <container>  # pi inside that container
 #   ./start-webui.sh reset               # forget the choice and ask again
 #   PORT=3090 ./start-webui.sh           # a different port (a busy one is fine too)
+#   INSTANCE=2 ./start-webui.sh          # a second, separate agent on this PC
+#                                        #   (its own pi home, its own port: 3082)
+#   INSTANCE=2 PI_WEBUI_PORT=3090 ./start-webui.sh   # …on a port you pick
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRIDGE_DIR="$ROOT/bridge"
 SOURCE_FILE="$BRIDGE_DIR/agent-source.txt"
-PORT="${PORT:-3080}"
+PORT="${PORT:-}"
+INSTANCE="${INSTANCE:-}"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ── a second agent on this PC ──────────────────────────────────────────────
+# pi keeps everything it owns under $HOME/.pi/agent - sessions, auth.json,
+# skills, models, settings.json - and the bridge's defaults follow HOME the same
+# way. So one variable gives a genuinely separate agent: INSTANCE=2 runs it on
+# port 3082 with its home under ~/.pi/webui-instances/2. Nothing is shared
+# unless it is linked in on purpose (auth.json or models.json, for one), and
+# the instance switcher in the UI finds it on its own once it is up.
+if [ -n "$INSTANCE" ]; then
+  case "$INSTANCE" in *[!0-9]*|'') die "INSTANCE must be a number (1, 2, 3 …)." ;; esac
+  [ "$INSTANCE" -gt 0 ] || die "INSTANCE must be a number (1, 2, 3 …)."
+  REAL_HOME="$HOME"
+  export HOME="${PI_WEBUI_INSTANCE_HOME:-$REAL_HOME/.pi/webui-instances/$INSTANCE}"
+  mkdir -p "$HOME"
+  # HOME is not always enough: pi's own variables override it, and a shell that
+  # has them exported (PI_CODING_AGENT_DIR) would point the second agent at the
+  # first one's config. Pin every name the two programs read to this home.
+  export PI_CODING_AGENT_DIR="$HOME/.pi/agent"
+  export PI_CODING_AGENT_SESSION_DIR="$PI_CODING_AGENT_DIR/sessions"
+  export PI_AGENT_DIR="$PI_CODING_AGENT_DIR"
+  export PI_SESSION_DIR="$PI_CODING_AGENT_SESSION_DIR"
+  # Keep the managed installer pointed at the install this launcher already
+  # uses; a fresh HOME has no version cache of its own.
+  export PI_MANAGED_INSTALL_ROOT="${PI_MANAGED_INSTALL_ROOT:-$REAL_HOME/.pi/agent/install}"
+  PI_INSTANCE_NOTE="instance $INSTANCE — separate home at $HOME"
+  # The instance port is its own: an inherited PORT (people export it for their
+  # first WebUI) must not put the second agent on top of the first. Pick a port
+  # with PI_WEBUI_PORT when the default does not suit.
+  PORT="${PI_WEBUI_PORT:-$((3080 + INSTANCE))}"
+fi
+PORT="${PORT:-3080}"
 
 # ── dependencies ───────────────────────────────────────────────────────────
 command -v node >/dev/null 2>&1 || die "node is not installed (Node 18+ is needed to run the bridge)."
@@ -123,6 +158,7 @@ export WORKSPACE_DIR="${WORKSPACE_DIR:-$ROOT}"
 
 say ""
 say "Starting the Pi Agent WebUI on http://localhost:${PORT}"
+[ -n "${PI_INSTANCE_NOTE:-}" ] && say "  ${PI_INSTANCE_NOTE}"
 say "  agent     : $PI_COMMAND"
 say "  workspace : $WORKSPACE_DIR"
 say "  sessions  : $PI_SESSION_DIR"

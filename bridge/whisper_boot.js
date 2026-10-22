@@ -149,7 +149,7 @@ function unzip(zip, destDir) {
         `Expand-Archive -LiteralPath "${zip}" -DestinationPath "${destDir}" -Force`],
         { timeout: 300000 }, (err) => (err ? reject(err) : resolve()));
     } else {
-      // Non-Windows: use unzip command (available on macOS/Linux)
+      // Non-Windows: use the unzip command (available on Linux)
       execFile('unzip', ['-o', zip, '-d', destDir], { timeout: 300000 }, (err) => (err ? reject(err) : resolve()));
     }
   });

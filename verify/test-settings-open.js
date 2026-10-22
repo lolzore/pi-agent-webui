@@ -100,6 +100,29 @@ const getJson = (p) => new Promise((res, rej) => {
     $('set-font').dispatchEvent(new Event('focus'));
     await new Promise((r) => setTimeout(r, 2500));
     rows.afterFocus = $('font-list').childElementCount;
+    // The font box now opens the same menu component as the model/thinking
+    // pickers, not the browser's native <datalist> popup.
+    $('settings-dialog').showModal();
+    $('set-font').click();
+    await new Promise((r) => setTimeout(r, 500));
+    rows.fontMenu = !!document.querySelector('#settings-dialog .model-menu');
+    rows.fontRows = document.querySelectorAll('#settings-dialog .model-menu .model-item').length;
+    const fm = document.querySelector('#settings-dialog .model-menu');
+    rows.fontMenuBelow = !!(fm && fm.getBoundingClientRect().top >= $('set-font').getBoundingClientRect().bottom - 2);
+    if (typeof closeAllMenus === 'function') closeAllMenus();
+    // The default-model picker is a searchable pretty-select too.
+    const generalTab = document.querySelector('#settings-tabs .tab[data-tab="general"]');
+    if (generalTab) generalTab.click();
+    await new Promise((r) => setTimeout(r, 250));
+    const dsel = $('set-default-model');
+    const dbtn = dsel && dsel.parentElement ? dsel.parentElement.querySelector('.pretty-select') : null;
+    if (dbtn) {
+      dbtn.click();
+      await new Promise((r) => setTimeout(r, 300));
+      rows.defaultSearch = !!document.querySelector('#settings-dialog .model-menu input[type="search"]');
+      if (typeof closeAllMenus === 'function') closeAllMenus();
+    }
+    $('settings-dialog').close();
     return rows;
   })()))()`));
 
@@ -117,6 +140,11 @@ const getJson = (p) => new Promise((res, rej) => {
   if (out.afterFocus < out.available) {
     fail(`using the font box built only ${out.afterFocus} of ${out.available} fonts - the list must still work`);
   }
+  if (!out.fontMenu) fail('the font picker did not open the shared .model-menu component');
+  if (out.fontRows < 5) fail(`the font menu has only ${out.fontRows} rows - the presets/font list is missing`);
+  if (!out.fontMenuBelow) fail('the font menu opened above the field instead of below it');
+  if (!out.defaultSearch) fail('the default-model picker is not searchable');
+  console.log(`  font menu: ${out.fontRows} rows in the shared menu component`);
   console.log('  PASS opening settings builds no font list, and the font box still gets one');
   if (problems.length) fail(problems.slice(0, 3).join(' | '));
   ws.close(); cleanup();

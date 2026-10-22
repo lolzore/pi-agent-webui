@@ -292,11 +292,6 @@ body.sidebar-hidden #sidebar { display: none; }
 }
 .rtab:hover { color: var(--text); border-color: var(--accent-dim); }
 .rtab.active { background: var(--accent-dim); border-color: var(--accent); color: var(--text); }
-.reels-link-row {
-  display: flex; gap: 6px; padding: 8px 10px;
-  border-bottom: 1px solid var(--border);
-}
-.reels-link-row input { flex: 1; min-width: 0; }
 .reels-video { flex: 1; min-height: 0; position: relative; background: #000; }
 .reels-video iframe {
   position: absolute; inset: 0; width: 100%; height: 100%; border: 0;
@@ -308,10 +303,12 @@ body.sidebar-hidden #sidebar { display: none; }
   color: var(--text-dim); font-size: 13px;
 }
 .reels-placeholder p { margin: 0; max-width: 300px; }
-.reels-panel-foot {
-  padding: 8px 10px; border-top: 1px solid var(--border);
-  display: flex; justify-content: center;
-}
+/* The browser pane (issue #123): chrome on top, the page below. */
+#reels-browser { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+#reels-browser.hidden { display: none; }
+.reels-browser-bar { display: flex; align-items: center; gap: 4px; padding: 6px; }
+.reels-browser-bar input { flex: 1 1 auto; min-width: 0; }
+#reels-frame { flex: 1 1 auto; min-height: 0; width: 100%; border: 0; background: #fff; }
 
 /* ───────────────────────── controls ───────────────────────── */
 .btn {
@@ -441,6 +438,38 @@ input::placeholder { color: var(--text-dim); opacity: .75; }
   color: var(--text-dim); cursor: pointer; font-size: 13px; padding: 0;
 }
 .codebox .code-toggle:hover { color: var(--text); }
+/* Issue #175: the eye sits beside the collapse toggle on html/svg blocks. */
+.codebox .code-copy,
+.codebox .code-eye {
+  position: absolute; top: 4px; z-index: 2;
+  width: 20px; height: 20px; line-height: 18px; text-align: center;
+  background: var(--bg-hover); border: 1px solid var(--border); border-radius: 5px;
+  color: var(--text-dim); cursor: pointer; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.codebox .code-copy { right: 30px; }
+.codebox .code-eye { right: 56px; }
+.codebox .code-copy:hover, .codebox .code-eye:hover { color: var(--accent); border-color: var(--accent); }
+.codebox pre { padding-right: 82px; }
+/* The preview itself: a page in a sandboxed frame, or the svg as a picture. */
+#code-preview {
+  width: min(1000px, 92vw); height: min(760px, 86vh);
+  padding: 0; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-panel); color: var(--text);
+  display: none; flex-direction: column; overflow: hidden;
+}
+#code-preview[open] { display: flex; }
+#code-preview .code-preview-head {
+  display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
+  padding: 8px 10px; border-bottom: 1px solid var(--border);
+  font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .4px;
+}
+#code-preview .code-preview-spacer { flex: 1; }
+#code-preview-body { flex: 1; min-height: 0; display: flex; background: #fff; }
+#code-preview-body iframe.code-preview-frame { flex: 1; border: 0; background: #fff; }
+#code-preview-body img.code-preview-svg {
+  margin: auto; max-width: 100%; max-height: 100%; background: transparent;
+}
 .codebox.collapsed pre { display: none; }
 .codebox.collapsed::after {
   content: "code hidden"; display: block; padding: 8px 12px;
@@ -478,6 +507,13 @@ body.hide-thinking details.thinking { display: none; }
    a readable width; squeezing them to 50px was worse than clipping a number. */
 #stat-tokens, #stat-cost { flex: 0 1 auto; min-width: 44px; overflow: hidden; text-overflow: ellipsis; }
 #stats-bar select, #stats-bar .btn.pill { flex: 0 0 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* Issue #118: the two picker pills rewrite their label from every state sync.
+ * A replaced text node is re-shaped from scratch, and the resulting line box
+ * can be a fraction taller or shorter - which moved the pill's border and the
+ * little arrow up and down while the counters next to them stayed put. The
+ * line box and the height are pinned here, and the arrow is anchored to the
+ * baseline instead of 1px above it. */
+#model-btn.pill, #thinking-btn.pill { height: 23px; line-height: 16px; }
 #model-btn { max-width: 200px; }
 #stats-bar .stats-spacer { flex: 1; }
 /* Numbers that grow while the agent runs: fixed-width digits, and enough room
@@ -493,6 +529,39 @@ body.hide-thinking details.thinking { display: none; }
  * writers go through setText() now as well; this is the belt to that pair of
  * braces, and it holds if a value legitimately changes. */
 #stat-turn, #stat-tokens, #stat-cost { line-height: 16px; height: 16px; display: inline-block; }
+/* Issue #136: the same pinning for *every* child of the row, so a value change
+ * anywhere (the turn timer included) cannot nudge the row's centering and take
+ * the pills with it. */
+#stats-bar > span { height: 16px; line-height: 16px; }
+#stats-bar > .ctx-ring { height: 38px; line-height: 0; }
+/* Issue #151: 23px is odd, and centering an odd box in the 46px row leaves it
+ * at a half-pixel (46-23)/2 = 11.5. Firefox rounds that paint differently as
+ * the page's fractional scroll offset drifts while the transcript streams, so
+ * the pills hopped a pixel up and down while everything else in the dock stood
+ * still (the video is 1px, 75.5 <-> 76.5). 24 is the natural height anyway
+ * (16px line + 6px padding + 2px border) and centers at 11, an integer, so the
+ * pills move with the row and never against it. */
+#stats-bar > .btn.pill { height: 24px; line-height: 16px; }
+/* The visible label of the two picker pills is a span with a fixed line box.
+ *
+ * A bare text node in a <button> takes its inline-box height from whichever
+ * font shaped the text. A fallback font (a CJK model name, an emoji, a provider
+ * name the chosen font does not cover) made that box taller, and Firefox then
+ * re-centred it inside the 16px line - the pill border and the absolutely
+ * positioned arrow stood still while the text itself hopped up and down. Flex
+ * centres the fixed-height span instead, so the text is placed from the same box
+ * for every label and every font. */
+#stats-bar > #model-btn.pill,
+#stats-bar > #thinking-btn.pill {
+  display: flex; align-items: center; justify-content: flex-start;
+  padding-top: 0; padding-bottom: 0;
+}
+#model-btn.pill > .pill-label,
+#thinking-btn.pill > .pill-label {
+  display: block; min-width: 0; max-width: 100%;
+  height: 16px; line-height: 16px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 #stat-turn { min-width: 12ch; }
 #stat-turn:empty, #stat-cost:empty { min-width: 0; }
 #stat-tokens, #stat-cost { min-width: 12ch; }
@@ -588,6 +657,16 @@ dialog#notices-dialog {
   display: grid; grid-template-columns: 110px 1fr; gap: 10px 12px;
   align-items: center; margin-top: 10px;
 }
+/* Issue #105: the grid used to place children by alternation (label, control,
+ * label, control…), so two consecutive check-labels - which #56 introduced
+ * with the pi auto-compaction box - shifted every row after them into the
+ * 110px label column, where the text wrapped into a strip and the right half
+ * of the dialog sat empty. Pin the columns instead: a label is column 1,
+ * everything it controls is column 2, check-labels included (they carry their
+ * own text). A row without a label simply leaves column 1 empty. */
+.settings-grid > label:not(.check-label) { grid-column: 1; }
+.settings-grid > .check-label,
+.settings-grid > :not(label) { grid-column: 2; }
 .settings-grid label { font-size: 12.5px; color: var(--text-dim); }
 .settings-grid input[type="text"], .settings-grid input[type="password"], .settings-grid select {
   width: 100%; max-width: none;
@@ -654,6 +733,11 @@ dialog#settings-dialog[open] {
   width: 520px;
   max-width: 92vw;
   height: min(660px, 84vh);
+  /* Do NOT give this dialog `contain`, `transform` or `will-change: transform`.
+   * The dropdowns opened while it is up are appended *inside* it (so they sit
+   * above the modal) and positioned with viewport coordinates; any of those
+   * properties makes the dialog their containing block, so every menu lands at
+   * the dialog's own offset - the "menus in the wrong position" report. */
 }
 dialog#settings-dialog > h3,
 dialog#settings-dialog > .tabs,
@@ -690,6 +774,10 @@ dialog#settings-dialog h3 { margin: 0 0 4px; }
 .tabs .tab.active { color: var(--text); font-weight: 600; border-bottom-color: var(--accent); }
 .tab-panel.hidden { display: none; }
 .hint { font-size: 11.5px; color: var(--text-dim); margin: 8px 0 0; }
+/* Issue #91: when the bridge predates /api/pi-config the compaction row says so
+ * instead of leaving a checkbox that can neither read nor write. */
+#set-pi-compaction-note { display: block; margin-top: 3px; color: var(--red); font-size: 11.5px; }
+#set-pi-compaction-note:empty { display: none; }
 
 /* first-launch setup dialog */
 dialog#setup-dialog {
@@ -784,7 +872,38 @@ html, body { overscroll-behavior: none; }
 /* The composer and the bars above it ride at the bottom of the scroller. Text
  * scrolls behind them and shows through the translucent panels, blurred by the
  * backdrop filter they already have. */
-#composer-dock { position: sticky; bottom: 0; z-index: 3; flex: none; }
+/* The dock is pinned one pixel ABOVE the scroller's bottom edge rather than exactly
+ * on it, and that one pixel is the whole fix for "every text in the composer bar is
+ * jumping up and down" (issue #42, reopened).
+ *
+ * This element is sticky INSIDE the transcript scroller on purpose - that is what
+ * makes the scrollbar run to the bottom of the window instead of stopping at the
+ * top of the composer. The cost is that its position is computed by the sticky
+ * constraint rather than by ordinary layout, so it depends on where the CONTENT
+ * ends. A transcript's content height is fractional (line boxes and margins), and
+ * it changes with every streamed token, so with `bottom: 0` the required offset
+ * lands on a half pixel over and over and the browser's rounding flips between the
+ * two choices. Measured while a reply streamed into a 140-message transcript,
+ * recording the dock's top edge every frame:
+ *
+ *     bottom: 0     ->  519, 518.5, 519, 518.5 ...   (flipping, and visible)
+ *     bottom: 1px   ->  518, 518, 518, 518 ...       (stable)
+ *     position: static  ->  still moving, and the dock ended up off the bottom
+ *
+ * One pixel up moves the constraint off the boundary the rounding flips over. It is
+ * an offset of one pixel on a dock that already sits over the transcript, so nothing
+ * visible moves: the composer keeps 10px of its own padding below the row, and the
+ * sticky behaviour is unchanged - scrolled to the very top of the transcript the dock
+ * is still pinned at the bottom of the window, which is the test that would fail if
+ * this ever stopped sticking. */
+#composer-dock { position: sticky; bottom: 1px; z-index: 3; flex: none; }
+/* The dock is the one thing that must not shimmer while the transcript scrolls
+ * behind it. A sticky element can land on a fractional device pixel, and
+ * Firefox re-rounds the text glyphs against a stationary border - the model
+ * label, thinking level, turn clock and the eye on an attachment appeared to
+ * move while the pill/pill border did not. Its own compositor layer gives the
+ * dock one rasterization origin instead of re-rounding each line. */
+#composer-dock { transform: translateZ(0); }
 
 /* The chat font is a font for *reading*, so everything you read goes through it:
  * the transcript, what you type, and the lines that talk about your own run -
@@ -804,7 +923,20 @@ html, body { overscroll-behavior: none; }
 .attachments,
 .view-banner,
 .banner { font-family: var(--chat-font); }
-.msg { max-width: 860px; margin: 0 auto 14px; }
+/* Issue #150: the settings menu took seconds because the whole transcript is
+ * laid out and painted - the reporter's session is 1453 messages and a 1.16M px
+ * tall chat, and showModal() has to repaint behind its top layer. Skipping the
+ * messages that are off screen (the browser remembers each one's real size once
+ * it has been on screen, so the scrollbar stays honest) took opening the dialog
+ * from ~120ms of blocked main thread to ~21ms, measured on that session. */
+.msg { max-width: 860px; margin: 0 auto 14px; content-visibility: auto; contain-intrinsic-size: auto 800px; }
+/* Issue #160: the message being streamed is the one thing that must never have
+ * its size estimated. Its content is replaced several times a second, so a
+ * remembered or placeholder size that lags a frame changes the transcript's
+ * height under the scroller - the view ends up showing the top of the message,
+ * snaps to the bottom, and repeats for the whole answer. It is on screen by
+ * definition, so skipping it buys nothing anyway. */
+.msg.streaming { content-visibility: visible; contain-intrinsic-size: none; }
 .msg .who {
   font-size: calc(11px * var(--chat-scale)); font-weight: 700; letter-spacing: 0.4px;
   text-transform: uppercase; color: var(--text-dim); margin-bottom: 3px;
@@ -954,6 +1086,15 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
   white-space: nowrap; scrollbar-width: none;
 }
 .queue-bar::-webkit-scrollbar { display: none; }
+/* Provider retry state (issue #83): one line, with the cancel control. */
+.retry-bar {
+  max-width: 860px; width: calc(100% - 24px); margin: 0 auto;
+  display: flex; align-items: center; gap: 8px;
+  font-size: calc(12px * var(--chat-scale)); color: var(--yellow);
+  padding: 2px 0;
+}
+.retry-bar.hidden { display: none; }
+.retry-bar .btn { flex: 0 0 auto; padding: 1px 8px; font-size: 11px; }
 .queue-chip {
   display: inline-block;
   background: color-mix(in srgb, var(--bg-elev) calc(var(--ui-alpha) * 100%), transparent);
@@ -969,6 +1110,42 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
   /* one height whatever it holds; anything longer scrolls inside it */
   height: calc(3.2em + 12px); overflow-y: auto;
 }
+/* goal-x's dashboard, rendered natively (issue #55). The extension's TUI widget
+   lines are unreadable in a browser, so the bridge reads the goal record and
+   this is the surface; click it for the task list. */
+.goal-bar {
+  /* The same box as the composer row and the stats bar (issue #127): it used
+   * to fill the whole dock, so it stuck out past the + and send buttons. */
+  max-width: 860px; width: calc(100% - 24px);
+  background: color-mix(in srgb, #141a26 calc(var(--ui-alpha) * 100%), transparent);
+  border: 1px solid color-mix(in srgb, var(--border) calc(var(--ui-alpha) * 100%), transparent);
+  border-radius: 8px; padding: 6px 10px; margin: 0 auto 4px;
+  cursor: pointer; font-size: 12px; color: var(--text);
+}
+.goal-bar .goal-head { display: flex; align-items: center; gap: 8px; }
+.goal-bar .goal-status {
+  flex: 0 0 auto; font-size: 10px; text-transform: uppercase; letter-spacing: .5px;
+  color: var(--text-dim); border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px;
+}
+.goal-bar.blocked .goal-status { color: var(--red); border-color: color-mix(in srgb, var(--red) 50%, transparent); }
+.goal-bar.paused .goal-status { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 50%, transparent); }
+.goal-bar.complete .goal-status { color: var(--green); border-color: color-mix(in srgb, var(--green) 50%, transparent); }
+.goal-bar .goal-objective { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.goal-bar .goal-count { flex: 0 0 auto; font-size: 11px; color: var(--text-dim); }
+.goal-bar .goal-note { margin-top: 3px; font-size: 11px; color: var(--yellow); }
+.goal-bar .goal-tasks { display: none; margin-top: 6px; max-height: 190px; overflow-y: auto; }
+.goal-bar.open .goal-tasks { display: block; }
+.goal-bar .goal-task { display: flex; gap: 7px; align-items: baseline; padding: 2px 0; font-size: 11.5px; }
+.goal-bar .goal-task.done { color: var(--text-dim); }
+.goal-bar .gt-mark { flex: 0 0 auto; width: 12px; color: var(--text-dim); }
+/* goal-x controls (issue #81): pause/resume/focus on the head, done/reopen per
+ * task. Small enough to sit in the bar without turning it into a toolbar. */
+.goal-bar .goal-actions { flex: 0 0 auto; display: flex; gap: 4px; }
+.goal-bar .goal-actions .btn, .goal-bar .gt-action { padding: 1px 7px; font-size: 11px; }
+.goal-bar .gt-title { flex: 1; min-width: 0; }
+.goal-bar .gt-action { flex: 0 0 auto; }
+.goal-bar .goal-task.done .gt-mark { color: var(--green); }
+.goal-bar .gt-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status-bar {
   padding: 2px 4px; display: flex; gap: 14px; flex-wrap: wrap;
   /* one line, always: it used to grow to two when a second status appeared, which
@@ -1298,6 +1475,13 @@ body { display: flex; }
 
 /* ── file attachments (PDF / audio / video) ── */
 .attachment.file { display: flex; align-items: center; gap: 8px; max-width: 260px; }
+/* Frames the bridge took from an uploaded video (issue #72). They travel to the
+ * model as images, and this strip is the user seeing what will be sent. */
+.attachment.file.has-frames { flex-wrap: wrap; max-width: 300px; }
+.attachment-frames { flex-basis: 100%; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.attachment-frames img { width: 34px; height: 26px; object-fit: cover; border-radius: 4px; border: 1px solid var(--border); display: block; }
+.attachment-frames-note { font-size: 11px; color: var(--text-dim); }
+.attachment-note { flex-basis: 100%; font-size: 11px; color: var(--text-dim); }
 .attachment.file .file-icon {
   flex: 0 0 auto; width: 34px; height: 34px; display: flex; align-items: center;
   justify-content: center; background: var(--accent-dim); color: var(--accent);
@@ -1312,6 +1496,22 @@ body { display: flex; }
   font-size: 10.5px; color: var(--text-dim); white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; max-width: 200px;
 }
+/* A video attachment is shown as a player, not a ▶ and a filename (issue #62). */
+.attachment.file:has(video.attachment-video) { max-width: 300px; }
+.attachment video.attachment-video {
+  display: block; width: 240px; max-height: 160px;
+  border-radius: 6px; background: #000;
+}
+/* The same file in the transcript. The bridge serves it back from the uploads
+   folder; a path that moved falls back to the reference text. */
+.msg-attach { margin: 6px 0; }
+.msg-attach video.msg-video {
+  display: block; max-width: min(420px, 100%); max-height: 280px;
+  border-radius: 8px; background: #000;
+}
+.msg-attach-name { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+.msg-attach-file { display: inline-block; font-size: 12.5px; color: var(--accent); }
+.msg-attach-bad { font: 11px var(--mono); color: var(--text-dim); word-break: break-all; }
 
 /* ── font picker ── */
 .font-row { display: flex; gap: 6px; align-items: center; }
@@ -1320,6 +1520,9 @@ body { display: flex; }
   border-radius: 6px; color: var(--text); padding: 5px 8px; font-size: 12.5px;
 }
 .font-row input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
+.font-row .btn { flex: none; }
+#set-font { cursor: pointer; }
+#set-font:focus { cursor: text; }
 
 /* Scrollbars follow the theme colour: the grey ones read as part of the
  * browser rather than part of the app, and on the sidebar they were hard to see
@@ -1537,6 +1740,8 @@ html.custom-cursor button { cursor: var(--cursor, auto), pointer !important; }
     max-height: 100dvh; border-radius: 0; margin: 0;
   }
   dialog#settings-dialog .settings-grid { grid-template-columns: 1fr; }
+  /* One column at this width, so the two-column pinning above is overridden. */
+  dialog#settings-dialog .settings-grid > * { grid-column: 1; }
   dialog#settings-dialog .settings-grid > label { margin-top: 6px; }
 
   /* anything tappable gets a real target */
@@ -1545,6 +1750,12 @@ html.custom-cursor button { cursor: var(--cursor, auto), pointer !important; }
   .model-menu { left: 8px; right: 8px; width: auto; }
   .model-item { padding: 9px 10px; }
 }
+
+/* The Shorts tab is one select, one checkbox and no prose. Give the checkbox
+ * its own breathing room; it used to sit flush under the select. */
+#tab-shorts .settings-grid { margin-bottom: 14px; }
+#tab-shorts .check-label { margin-top: 4px; }
+#tab-shorts .check-label input { margin-right: 8px; }
 
 /* Reels placeholder: the feed cannot be iframed, so the panel offers a real
    top-level window instead (a popup gets its own browsing context, where the
@@ -1626,6 +1837,15 @@ body.text-outline .session-item .s-meta { text-shadow: none; }
 .model-item:hover { background: var(--bg-hover); }
 .model-item.sel { background: var(--accent-dim); }
 .model-item .model-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A star keeps a model at the top of the picker (issue #61). It sits inside the
+   row, so it must not look like a button and must not pick the model. */
+.model-item .fav-star {
+  flex: 0 0 auto; width: 18px; padding: 0; border: 0; background: none;
+  color: var(--text-dim); font-size: 13px; line-height: 1; cursor: pointer;
+}
+.model-item .fav-star:hover { color: var(--yellow); }
+.model-item .fav-star.on { color: var(--yellow); }
+.model-item.missing .model-label { color: var(--text-dim); }
 .model-item .model-provider { font-size: 10.5px; color: var(--text-dim); flex-shrink: 0; }
 .model-empty { padding: 10px 8px; color: var(--text-dim); font-size: 12.5px; }
 
@@ -1677,16 +1897,44 @@ body.text-outline .session-item .s-meta { text-shadow: none; }
   font-size: 11.5px; padding: 3px 10px;
 }
 #thinking-btn.pill { max-width: 130px; }
-/* the tiny arrow that says "this opens a list" - both pickers have it now */
+/* The tiny arrow that says "this opens a list" - both pickers have it now.
+ *
+ * Issue #151: as an inline-block after the label it lived in the text's line
+ * box, so every time the label re-shaped (a model switch, a sync, a truncation)
+ * the arrow moved with it - the pills were pinned but their arrows still
+ * hopped. It is out of the flow now: absolute inside the pill, always 8px from
+ * the right edge and 2px above the middle, whatever the text does. The pill
+ * keeps room for it, so a long label truncates *before* the arrow instead of
+ * running under it. */
+#model-btn.pill, #thinking-btn.pill { position: relative; padding-right: 19px; }
+/* Issue #158: the terminals menu lists commands, not model names.
+ *
+ * Two things made it read as a different (and broken) menu: the expanded row
+ * inherited the one-line ellipsis every other row uses, so "click to expand"
+ * showed a truncated command anyway, and the list kept the model picker's 46vh
+ * cap, so the panel never grew to fit what you had just expanded. Commands are
+ * set in the monospace face here, an expanded row wraps to as many lines as it
+ * needs, and the list may use most of the window. */
+.model-menu.menu-terminals .model-list { max-height: 72vh; }
+.model-menu.menu-terminals .model-item { align-items: flex-start; }
+.model-menu.menu-terminals .model-item .model-label {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.model-menu.menu-terminals .model-item.term-expanded .model-label { white-space: normal; overflow-wrap: anywhere; }
+.model-menu.menu-terminals .model-item .model-provider { flex: 0 0 auto; padding-top: 1px; }
 #model-btn.pill::after, #thinking-btn.pill::after {
-  content: ''; display: inline-block; margin-left: 6px; vertical-align: 1px;
+  content: ''; position: absolute; right: 8px; top: 50%; margin-top: -2px;
   border-left: 3.5px solid transparent; border-right: 3.5px solid transparent;
   border-top: 4px solid currentColor; opacity: .85;
 }
 .model-menu .menu-sep { height: 1px; background: var(--border); margin: 4px 2px; }
 .model-item.danger .model-label { color: var(--red); }
+.model-item.disabled { opacity: .5; cursor: default; }
 .model-item .model-arrow { color: var(--text-dim); flex-shrink: 0; }
 .model-menu .menu-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+/* Two controls on one row (start + forget on a stopped instance, issue #119). */
+.model-menu .menu-controls { display: inline-flex; gap: 4px; margin-left: auto; }
 .model-menu .menu-dot.live-dot { background: var(--green); animation: live-pulse 1.2s ease-in-out infinite; }
 .model-menu .menu-dot.off-dot { background: #55606f; }
 
@@ -1713,6 +1961,8 @@ body.text-outline #stats-bar { text-shadow:
   box-shadow: 0 0 0 9999px rgba(0, 0, 0, .55);
 }
 .crop-stage.circle .crop-frame { border-radius: 50%; }
+#crop-fit-row .btn.on { background: var(--accent-dim); border-color: var(--accent); color: var(--text); }
+#crop-fit-row .btn:disabled { opacity: .45; }
 
 /* ── in-app confirmations / small forms ───────────────────────────────────── */
 #ask-dialog { width: min(460px, 92vw); }
@@ -1810,3 +2060,49 @@ body.hide-tools .msg.tool { display: none; }
 #tab-extensions .prov-row .btn { flex: 0 0 auto; }
 #tab-extensions textarea { width: 100%; font-family: var(--mono); font-size: 12px; margin-top: 6px; }
 #tab-extensions .prov-section:first-of-type { margin-top: 4px; }
+
+/* ── why a turn stopped (issue #59) ──────────────────────────────────────
+ * A failed turn has no content at all, so this block IS the message. Tinted like
+ * the other failure states in the transcript, and folded by default when the text
+ * is long - a provider can return a whole HTML error page. */
+.msg-error {
+  margin-top: 8px; border: 1px solid color-mix(in srgb, #ef4444 55%, transparent);
+  border-radius: 8px; background: color-mix(in srgb, #ef4444 10%, transparent);
+  overflow: hidden;
+}
+.msg-error > summary {
+  cursor: pointer; padding: 6px 9px; font-size: 12px; color: #fca5a5;
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; list-style: none;
+}
+.msg-error > summary::-webkit-details-marker { display: none; }
+.msg-error > summary::before { content: '▸ '; color: #fca5a5; }
+.msg-error[open] > summary::before { content: '▾ '; }
+.msg-error-head { font-weight: 600; }
+.msg-error-where {
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+}
+.msg-error-body {
+  margin: 0; padding: 8px 10px; border-top: 1px solid color-mix(in srgb, #ef4444 30%, transparent);
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.5; color: var(--text);
+  white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto;
+  user-select: text; cursor: text;
+}
+.msg-error-tools { display: flex; align-items: center; gap: 8px; padding: 6px 9px; }
+
+/* ── markdown tables (issue #60) ─────────────────────────────────────────
+ * They used to arrive as literal pipes in a paragraph. Overflow scrolls rather
+ * than wrapping: the columns in a table like pi's RPC listing are narrow and
+ * wrapping every cell makes it unreadable, and on a phone a wide table has to be
+ * swipeable anyway. */
+.md-table-wrap { overflow-x: auto; margin: 8px 0; }
+.md-table {
+  border-collapse: collapse; font-size: calc(12.5px * var(--chat-scale));
+  min-width: 50%;
+}
+.md-table th, .md-table td {
+  border: 1px solid var(--border); padding: 4px 8px; vertical-align: top;
+  white-space: nowrap;                  /* the wrap is the container's job */
+}
+.md-table th { background: color-mix(in srgb, var(--accent) 12%, transparent); font-weight: 600; }
+.md-table tr:nth-child(even) td { background: color-mix(in srgb, var(--text) 4%, transparent); }
+.md-table code.inline { white-space: nowrap; }

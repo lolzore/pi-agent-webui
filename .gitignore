@@ -72,3 +72,12 @@ verify/.tmp-*.js
 
 # Metro scratch next to the desktop project (a local build leaves it behind)
 pi-desktop/.bundle/
+
+# Local Playwright Chromium for the browser checks (downloaded, not vendored)
+.browsers/
+.npmcache/
+
+# pi/extension project state (goal-x ledgers, snapshots) - machine-local, not source
+.pi/
+pi-electron/node_modules/
+pi-electron/dist/

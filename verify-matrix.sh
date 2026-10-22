@@ -34,6 +34,12 @@ set -uo pipefail
 # is called. (MSYS2_ARG_CONV_EXCL does the same thing on some setups.)
 unset MSYS_NO_PATHCONV
 unset MSYS2_ARG_CONV_EXCL
+# pi's own config variables describe the developer's real install. Run from
+# inside a pi session (or any shell that exports them), a bridge that honours
+# PI_CODING_AGENT_DIR would ignore the scratch PI_AGENT_DIR below and read the
+# real agent dir - sessions, skills, models and all. The suite owns its paths.
+unset PI_CODING_AGENT_DIR
+unset PI_CODING_AGENT_SESSION_DIR
 
 cd "$(dirname "$0")"
 ROOT=$(pwd)
@@ -76,7 +82,7 @@ run()  { local label=$1; shift; : >"$TMP/err.txt"
 # ───────────────────────────── 1. syntax ─────────────────────────────
 head_ "1. syntax"
 # Plain JS: node --check is the right tool.
-for f in bridge/server.js web/app.js bridge/mock_agent.js verify/*.js; do
+for f in bridge/server.js bridge/goals.js bridge/routes/*.js web/*.js bridge/mock_agent.js verify/*.js; do
   [ -f "$f" ] || continue
   run "$f parses" node --check "$f"
 done
@@ -115,6 +121,12 @@ skip_ok "pi-desktop/*.js parses (JSX, via @babel/parser)" \
 skip_ok "pi-desktop/*.js lint (no-undef, rules-of-hooks, …)" \
     node "$V/test-lint-rn.js" pi-desktop/App.js pi-desktop/src/*.js
 
+# The desktop app (Electron): loads the WebUI, starts its own bridge on
+# Electron's bundled node, and gives the shorts feed a top-level view with the
+# right user agent. Skips when electron is not installed or there is no display.
+skip_ok "desktop app (Electron): the WebUI and a top-level shorts feed" \
+    node pi-electron/test/smoke.cjs
+
 # ───────────────────────── 2. unit ─────────────────────────
 head_ "2. unit"
 
@@ -133,10 +145,10 @@ fs.writeFileSync(path.join(dir,"verify.jsonl"),L.join("\n")+"\n");
 else bad "built verify.jsonl"; fi
 
 run "sessionLines: byte-identical, in order, all valid JSON, lazy" \
-    node "$V/test-session-lines.js" bridge/server.js "$SESSION_DIR/verify.jsonl"
+    node "$V/test-session-lines.js" bridge/sessions.js "$SESSION_DIR/verify.jsonl"
 
 run "writeJsonAtomic: whole file, no litter, failure-safe" \
-    node "$V/test-atomic-write.js" bridge/server.js
+    node "$V/test-atomic-write.js" bridge/llama.js
 
 # The ?dir= hole needs no container, so this one always runs. 77 means the test
 # could not build its fixture, which is a skip and not a pass.
@@ -179,7 +191,19 @@ head_ "3. integration — live bridge on :$PORT"
 # running bridge on :3080 - its command line is just `node bridge/server.js`, so
 # "every node running server.js" includes the one the user is actually using.)
 port_pid() {
-  netstat -ano 2>/dev/null | grep LISTENING | grep ":$1 " | awk '{print $5}' | head -1
+  local pid
+  # Windows (Git Bash, MSYS): the `-o` column is the PID. netstat without -o does
+  # not exist there, so this branch is inert on Linux and must stay first: the
+  # Linux netstat below prints the same "LISTENING" word but a different column
+  # layout, and parsing that as -o yields the peer address, not a PID.
+  pid=$(netstat -ano 2>/dev/null | grep LISTENING | grep ":$1 " | awk '{print $5}' | head -1)
+  if [ -n "$pid" ]; then printf '%s\n' "$pid"; return 0; fi
+  # Linux/macOS: lsof names the listener's PID directly.
+  pid=$(lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -1)
+  if [ -n "$pid" ]; then printf '%s\n' "$pid"; return 0; fi
+  # ss prints users:(("node",pid=123,fd=21)); pull the pid= out.
+  pid=$(ss -ltnp 2>/dev/null | grep ":$1 " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+  [ -n "$pid" ] && printf '%s\n' "$pid"
 }
 kill_port() {
   local pid
@@ -287,6 +311,11 @@ process.stdout.write(d.sessions[0].path);
 if [ -n "$SPATH" ]; then
   run "endpoints: page, assets, session list, messages, raw JSONL, traversal" \
       node "$V/test-endpoints.js" "http://127.0.0.1:$PORT" "$SPATH"
+  # Issue #62: both upload routes store a video and /api/upload-file serves it
+  # back with Range, while paths outside the uploads folder are refused.
+  run "uploads: a video goes in through both routes and is served back with ranges" \
+      env PI_TEST_AGENT_DIR="$EXT_DIR" \
+      node "$V/test-upload-video.js" "http://127.0.0.1:$((PORT + 1))"
 
   # The layer that can catch a mistake in web/app.js: a real browser, a real
   # console. Everything above it can pass while the transcript renders nothing.
@@ -302,7 +331,10 @@ if [ -n "$SPATH" ]; then
     [ -f "$cand" ] && { BROWSER="$cand"; break; }
   done
   if [ -z "$BROWSER" ]; then
-    for cand in google-chrome google-chrome-stable chromium chromium-browser microsoft-edge microsoft-edge-stable; do
+    # `chromium`/`chrome` cover a Playwright/`chrome-linux` install on PATH (see
+    # .browsers/ and the README's note on running the checks), which is how the
+    # browser layer runs on a machine with no system Chromium.
+    for cand in google-chrome google-chrome-stable chromium chromium-browser chrome chrome-headless-shell chromium-headless-shell microsoft-edge microsoft-edge-stable; do
       if command -v "$cand" >/dev/null 2>&1; then BROWSER=$(command -v "$cand"); break; fi
     done
   fi
@@ -328,6 +360,12 @@ if [ -n "$SPATH" ]; then
     # a rendered edit diff must still survive its result.
     run "tool cards: empty progress does not blank the card, diffs survive" \
         node "$V/test-tool-card.js" "http://127.0.0.1:$PORT" "$BROWSER"
+    # Issue #67: the streamed arguments preview kept only the last 4000/2000
+    # characters, so a long write lost its beginning while it streamed. This
+    # drives the real streaming events and checks the beginning survives, the
+    # cap says what it hides, and the finished card holds everything.
+    run "tool preview: a long stream keeps its beginning, names what it hides, finishes whole" \
+        node "$V/test-tool-preview.js" "http://127.0.0.1:$PORT" "$BROWSER"
     # Issue #34: the sidebar must stay on the row the reader was on when rows are
     # inserted, removed or reordered above it.
     run "sidebar: stays anchored on its row across a rebuild" \
@@ -339,6 +377,10 @@ if [ -n "$SPATH" ]; then
     # only that file.
     run "images: a picture on a line over 8 MB is served whole" \
         env PI_BIGIMG_DIR="$SESSION_DIR" node "$V/test-big-image.js" "http://127.0.0.1:$PORT"
+    # Issue #62: a video attachment is a player in the composer and in the
+    # transcript, not a filename and a raw path line.
+    run "video: a clip attaches with a playing preview and appears in the transcript" \
+        node "$V/test-video-attach.js" "http://127.0.0.1:$PORT" "$BROWSER"
     # Reported as "switching fast and the server kind of dies": the heartbeat
     # asked the agent (and closed the socket when a busy agent was slow) and
     # every click queued its own switch. It reports 77 - a SKIP - when the shared
@@ -349,12 +391,41 @@ if [ -n "$SPATH" ]; then
     # Issues #40, #47, #48, #42, #41 and #38's loop. All of them are decided in the
     # page, so no agent turn is needed. PI_TEST_KEEP_GOING=1 there reports every
     # failed check at once, which is how each one was shown to fail on the old code.
+    # Issue #53: abort() does not clear pi's queue, so a queued command was
+    # delivered on a later turn - pi 1.0.0 added clear_queue for exactly this. The check
+    # asks the AGENT what it still holds, because the page clears its own copy
+    # unconditionally and asserting on that said nothing.
+    skip_ok "stopping: the agent's pending queue is cleared, not left to be delivered" \
+        node "$V/test-stop-clears-queue.js" "http://127.0.0.1:$PORT" "$BROWSER"
+    # Issue #52: the row for a message that is not in the file yet used to be
+    # re-appended to whatever session was rendered, so a steered message showed up in
+    # a new chat. Both halves are checked - the same-session carry-over is issue #1.
+    run "pending rows: kept in their own session, never shown in another" \
+        node "$V/test-pending-row-session.js" "http://127.0.0.1:$PORT" "$BROWSER"
+    # Issue #51: the slash menu is appended to <body>, so nothing in the composer
+    # ever saw a click elsewhere on the page and it stayed up until Escape.
+    run "slash menu: an outside click closes it, using the box brings it back" \
+        node "$V/test-slash-menu.js" "http://127.0.0.1:$PORT" "$BROWSER"
+    # Issue #60: a markdown table used to arrive as literal pipes.
+    run "markdown: tables render, with alignment and inline markdown" \
+        node "$V/test-markdown-tables.js" "http://127.0.0.1:$PORT" "$BROWSER"
+    # Issue #59: a failed turn has content: [] and its reason in errorMessage, which
+    # the transcript never rendered - so the only trace was a toast that went away.
+    run "errors: a failed turn shows the provider's reason, not (empty message)" \
+        node "$V/test-error-detail.js" "http://127.0.0.1:$PORT" "$BROWSER"
+    # Issue #42 reopened: the whole composer dock shifted while the agent wrote,
+    # because it is sticky inside the transcript scroller and `bottom: 0` made the
+    # landing flip between two half-pixel roundings as the content height changed.
+    # The check measures the old value too, so it fails loudly if it ever stops
+    # being able to detect the regression.
+    run "composer: the dock does not shift while the transcript grows" \
+        node "$V/test-composer-jitter.js" "http://127.0.0.1:$PORT" "$BROWSER"
     # The scrollbar: Firefox needs `thin` (it is what removes the arrow buttons) and
     # Chromium must stay on `auto` (its bar is already right, and thin narrows it
     # 15px -> 10px). The two cannot share one value, so the CSS scopes it with
     # @supports. Chromium can only check that it is NOT caught by that guard; the
     # Firefox half is one reload away for a person to see.
-    run "scrollbar: Firefox gets `thin`, this browser is not caught by the guard" \
+    run 'scrollbar: Firefox gets `thin`, this browser is not caught by the guard' \
         node "$V/test-scrollbar.js" "http://127.0.0.1:$PORT" "$BROWSER"
     # Issue #45: the settings dialog must not build the 295-option system font list
     # while it is opening. It reports 77 (a SKIP) against a bridge that knows few
@@ -366,8 +437,162 @@ if [ -n "$SPATH" ]; then
     run "extensions: list, enable/disable writes pi's own format, paths stay inside" \
         env PI_TEST_AGENT_DIR="$EXT_DIR" \
         node "$V/test-extensions.js" "http://127.0.0.1:$((PORT + 1))" "$BROWSER"
+    # Issue #64: pi also loads user skills from ~/.agents/skills (this is where
+    # they live on Linux) and read-only project skills from .pi/.agents. This
+    # starts its own bridge with a scratch HOME so both roots are real.
+    run "skills: agent dir and ~/.agents are listed, toggles write pi's own pattern" \
+        node "$V/test-skills-linux.js" "$BROWSER"
+    # Issue #89: the settings layout bug was a stale stylesheet in a long-lived
+    # tab - new HTML with old CSS. Assets are now versioned with the running
+    # build and a changed build offers a reload; this also asserts the 510px
+    # layout from the issue's screenshot is one column with no overlap.
+    run "build: assets are versioned, the 510px settings layout holds, a new build offers a reload" \
+        node "$V/test-build-assets.js" "$BROWSER"
+    # Issue #105: the settings grid pins its columns, so a run of check-labels
+    # cannot shift the rows after it into the 110px label column.
+    run "settings grid: labels and controls stay in their columns at 1200px and 525px" \
+        node "$V/test-settings-grid.js" "$BROWSER"
+    # Issue #118: the picker pills rewrite their label from every state sync; a
+    # replaced text node moved their border and arrow up and down.
+    run "pill stability: the model/thinking pills keep their height and arrow when the label changes" \
+        node "$V/test-pill-stability.js" "$BROWSER"
+    # Issue #117: the settings click was fast but its first paint could lag on a
+    # heavy page; the dialog is its own layer now and records the frame time.
+    run "settings paint: the dialog reaches its first frame quickly over a heavy transcript" \
+        node "$V/test-settings-paint.js" "$BROWSER"
+    # Issue #121: the first-run wizard recommends packages before the
+    # preferences and installs the ticked ones on the way out.
+    run "setup packages: the wizard recommends, installs the ticked ones and finishes" \
+        node "$V/test-setup-packages.js" "$BROWSER"
+    # Regression: dropdowns opened while the settings dialog is up were offset
+    # by the dialog (a containing block from contain/will-change on it).
+    run "menu position: dropdowns inside the settings dialog sit next to their anchors" \
+        node "$V/test-menu-position.js" "$BROWSER"
+    # Issue #124: the top-bar terminals button (running bash tools, close).
+    run "terminals: the button counts the running bash tools and can close them" \
+        node "$V/test-terminals.js" "$BROWSER"
+    # Issue #123: the split pane can host a browser instead of a feed.
+    run "browser pane: the split pane hosts a browser that navigates and goes back" \
+        node "$V/test-browser-pane.js" "$BROWSER"
+    # Issue #137: a compaction that ends without a summary keeps a marker.
+    run "compaction noop: a summary-less compaction keeps its marker" \
+        node "$V/test-compaction-noop.js" "$BROWSER"
+    # Issue #149: a message sent while the agent streams stays below the reply
+    # it steered, without needing a reload.
+    run "steer order: a steered message stays below the reply it steered" \
+        node "$V/test-steer-order.js" "$BROWSER"
+    # Message text must never become real HTML (a <base> in a bullet broke every
+    # relative URL and made the page drop its own socket every 25s).
+    run "markdown escape: message text cannot put HTML into the page" \
+        node "$V/test-markdown-escape.js" "$BROWSER"
+
+    # Editing a message forks the session and resends it - and the active-branch
+    # tree is only fetched when a fork actually starts.
+    run "fork edit: editing a sent message forks and resends" \
+        node "$V/test-fork-edit.js" "$BROWSER"
+
+    # Issue #175: html/svg code blocks can be previewed, copied and closed -
+    # and the preview follows the code while the agent writes it.
+    run "code preview: html and svg blocks preview, copy, close, and follow live code" \
+        node "$V/test-code-preview.js" "$BROWSER"
+
+    # Issue #176: a new chat starts on the chosen default model.
+    run "default model: a new chat switches to it, and nothing changes when unset" \
+        node "$V/test-default-model.js" "$BROWSER"
+
+    # Issue #174: the llama.cpp models are not offered in the picker.
+    run "model filter: llama.cpp models are hidden, llama-server stays" \
+        node "$V/test-model-filter.js" "$BROWSER"
+
+    # The bridge starts the agent in the last session instead of switching to
+    # it (the stale-extension-ctx line, and the empty-transcript race).
+    run "resume: the agent is started in the last session, not switched to it" \
+        node "$V/test-resume-at-start.js"
+
+    # The General/Shorts/timer tweaks: pi location last, no "Open with", the
+    # Shorts tab is the desktop app's, and timers are whole seconds.
+    run "ui tweaks: pi location last, no Open with, desktop-only Shorts, whole-second timers" \
+        node "$V/test-ui-tweaks.js" "$BROWSER"
+
+    # Issue #157: the pi location (native/docker) is asked in the WebUI now.
+    run "agent source: the pi location is asked in the WebUI" \
+        node "$V/test-agent-source.js" "$BROWSER"
+
+    # Issue #160: a long streamed answer must stay pinned, and the streaming
+    # message must not have its size estimated.
+    run "stream scroll: a long answer stays pinned at the bottom" \
+        node "$V/test-stream-scroll.js" "$BROWSER"
+
+    # Issue #150, real cause: a slow speech service must not delay the dialog.
+    run "settings voices: a slow speech service does not delay the settings dialog" \
+        node "$V/test-settings-voices.js" "$BROWSER"
+    # Issue #129: a subagent run shows the model it used.
+    run "subagent model: a run's row names the model it used" \
+        node "$V/test-subagent-model.js" "$BROWSER"
+    # Issue #92: MCP servers in the settings. Own bridge and scratch agent dir;
+    # writes pi's mcp.json, so the file is the assertion.
+    run "mcp: list/add/toggle/remove in pi's mcp.json, project entries read-only" \
+        node "$V/test-mcp-config.js" "$BROWSER"
+    # Issue #72: an uploaded video becomes frames the model can see. Two
+    # bridges - the default one and PI_WEBUI_FFMPEG=off - so both paths are
+    # covered whatever the host has installed.
+    run "video frames: a clip reaches the model as images, and says so when ffmpeg is absent" \
+        node "$V/test-video-frames.js" "$BROWSER"
+    # Issue #79: the UI starts a second local agent through the real launcher.
+    # A `pi` stub on PATH keeps the second instance on the mock agent; its home
+    # and ports live under the scratch dir.
+    run "instances: the menu starts a second agent, finds it, and stops what it started" \
+        node "$V/test-start-instance.js" "$BROWSER"
+    # Issue #81: the goal bar acts on goal-x - pause/resume/focus as its own
+    # commands, task complete/reopen with the extension's gates, an evidence
+    # dialog for contracted tasks, and /goal-refresh after a file change.
+    run "goal controls: pause/resume/focus as commands, task gates, evidence dialog" \
+        node "$V/test-goal-controls.js" "$BROWSER"
+    # A provider retry is a state with a cancel (abort_retry). The cycle items
+    # that shipped with it were removed in #107.
+    run "retry bar: a provider retry is a state with a cancel, cleared on end or settle" \
+        node "$V/test-retry-bar.js" "$BROWSER"
+    # Issue #68: the Pi providers tab rendered only after the llama probe and
+    # never retried it, and the provider picker was a native <datalist> that
+    # does not open on a click. This starts a fake llama.cpp server mid-run to
+    # prove a later probe shows up without reopening the dialog.
+    run "providers: custom rows render, a late llama server appears, the picker opens on click" \
+        env PI_TEST_AGENT_DIR="$EXT_DIR" \
+        node "$V/test-providers-tab.js" "http://127.0.0.1:$((PORT + 1))" "$BROWSER"
+    # Issue #106: opening Settings must not start a llama-probe storm. The
+    # bridge caches an empty answer and the providers retries only run while
+    # that tab is shown; this test runs a bridge whose llama server is a closed
+    # port, so the slow path is deterministic.
+    # skip_ok: the check is about the *empty* answer being cached, so a
+    # llama-server running on this machine (loopback is always probed) means it
+    # cannot run here - that is a skip, not a failure.
+    skip_ok "llama probe: one probe on open, an empty answer cached, retries only on the providers tab" \
+        node "$V/test-llama-probe.js" "$BROWSER"
+    # Issue #61: a starred model is pinned to the top of the picker and the
+    # setting survives a reload (the bridge's copy, not just localStorage).
+    run "favourites: a starred model is pinned at the top and survives a reload" \
+        node "$V/test-favourites.js" "http://127.0.0.1:$PORT" "$BROWSER"
+    # Issue #57: two real bridges on this machine. The first discovers the
+    # second, the switcher adds and looks at it, its sessions replace the local
+    # ones, and coming back leaves nothing of the other instance behind.
+    run "instances: a second local bridge is found, switched to and left without leaks" \
+        node "$V/test-instances.js" "$BROWSER"
+    # Issue #55: goal-x's state rendered natively, and its TUI widget lines kept
+    # out of the browser widget bar. Self-contained: own bridge, own goals dir.
+    run "goals: the focused goal renders natively, refreshes, and hides when absent" \
+        node "$V/test-goals.js" "$BROWSER"
     run "compaction: marks are per-session, facts survive a reload, ring shows the estimate" \
         node "$V/test-compaction.js" "http://127.0.0.1:$PORT" "$BROWSER"
+    # Issue #63: pi's threshold/overflow compaction without retry runs after a
+    # completed response or mid-turn (where pi resumes itself), so the old
+    # unconditional nudge told a finished agent to continue. Only a turn the
+    # compaction actually stopped should be nudged.
+    run "compaction nudge: a finished agent is not told to continue, a stalled one is" \
+        node "$V/test-compaction-continue.js" "http://127.0.0.1:$PORT" "$BROWSER"
+    # Issue #56: pi's own auto-compaction (set_auto_compaction, persisted in
+    # settings.json) exposed as a checkbox next to the WebUI's own setting.
+    run "pi settings: the auto-compaction toggle reads, changes over RPC, and persists" \
+        node "$V/test-pi-config.js" "$BROWSER"
   else
     skip "no Chrome/Edge found for the browser check"
   fi
@@ -414,8 +639,15 @@ if [ "${1:-}" = "--docker" ]; then
       note "removed a leftover pi-webui container"
     fi
 
+    # Remember which image compose actually built before bringing the service
+    # down. Compose derives the image name from the checkout directory
+    # (<dir>-pi-webui), so looking only for "webui-pi-webui:latest" below made
+    # these checks silently skip in every checkout not named "webui". The CI
+    # hides that by pre-building webui-pi-webui; a plain clone did not.
+    VERIFY_IMG=""
     if $DC up -d pi-webui >"$TMP/up.log" 2>&1; then
       ok "container starts"
+      VERIFY_IMG=$(docker inspect -f '{{.Config.Image}}' pi-webui 2>/dev/null || echo "")
       DP=${PI_WEBUI_PORT:-3080}      up=0
       for _ in $(seq 1 60); do
         curl -fsS "http://127.0.0.1:$DP/api/health" >/dev/null 2>&1 && { up=1; break; }
@@ -442,10 +674,10 @@ if [ "${1:-}" = "--docker" ]; then
     # real sessions in it, and both of these tests plant files by clearing the
     # session directory. A container of our own from the same image is the same
     # code with none of the data.
+    # The CI pre-builds webui-pi-webui:latest; prefer it. Otherwise use the
+    # image name captured while the compose container was still up.
     if docker image inspect webui-pi-webui:latest >/dev/null 2>&1; then
       VERIFY_IMG=webui-pi-webui:latest
-    else
-      VERIFY_IMG=$(docker inspect -f '{{.Config.Image}}' pi-webui 2>/dev/null || echo "")
     fi
     docker rm -f pi-webui-verify >/dev/null 2>&1 || true
     if [ -n "$VERIFY_IMG" ] && docker run -d --name pi-webui-verify --entrypoint sleep "$VERIFY_IMG" 600 >/dev/null 2>&1; then

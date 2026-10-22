@@ -1,0 +1,76 @@
+# Publish the desktop app as a Forgejo release when a version tag is pushed.
+#
+# Everything is built on this runner - the Windows portable .exe and the
+# installer included - because electron-builder fetches the Windows Electron
+# binaries and its own NSIS toolchain. No Windows machine (or runner) is
+# involved, which is exactly why the desktop app moved off React Native
+# Windows: that build could only ever run on Windows.
+#
+#   git tag v0.1.3 && git push origin v0.1.3
+#
+# The tag sets the version, the artifacts are named from it, and the release
+# body points at what to download.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # The tag is the version, so the artifact names and the app itself agree
+      # with the release they are attached to.
+      - name: Take the version from the tag
+        run: npm --prefix pi-electron version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+
+      - name: Install the desktop app's dependencies
+        run: npm --prefix pi-electron ci --no-audit --no-fund
+
+      # The Windows target is the portable exe, which electron-builder can build
+      # on Linux without wine (verified: the exe's icon/version metadata is
+      # stamped and the packaged app starts its bridge). NSIS would need wine,
+      # which is why the release does not build the installer here.
+
+      - name: Build Linux and Windows packages
+        run: |
+          rm -rf pi-electron/dist
+          npm --prefix pi-electron run dist
+
+      - name: Publish the release
+        env:
+          TOKEN: ${{ github.token }}
+          SERVER: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          API="$SERVER/api/v1/repos/$REPO"
+          AUTH="Authorization: token $TOKEN"
+          BODY="Pi Agent desktop ${TAG#v} - the WebUI in a native window, with the real shorts feeds (a top-level webview, so X-Frame-Options does not apply).
+
+          **Linux** - AppImage (chmod +x, run) or .deb
+          **Windows** - portable .exe (run it anywhere, nothing to install) or the setup .exe
+
+          The app starts its own bridge and needs nothing installed: no node, no npm, no separate WebUI."
+          JSON=$(BODY="$BODY" node -e 'process.stdout.write(JSON.stringify({tag_name: process.env.TAG, name: "Pi Agent " + process.env.TAG, body: process.env.BODY, draft: false}))')
+          ID=$(curl -sS -H "$AUTH" -H 'Content-Type: application/json' -d "$JSON" "$API/releases" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).id||"")}catch{console.log("")}})')
+          if [ -z "$ID" ]; then
+            # the release already exists (a re-run of the same tag): reuse it
+            ID=$(curl -sS -H "$AUTH" "$API/releases/tags/$TAG" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).id))')
+          fi
+          for f in pi-electron/dist/*.AppImage pi-electron/dist/*.deb pi-electron/dist/*.exe; do
+            echo "uploading $(basename "$f")"
+            curl -sS -H "$AUTH" -F "attachment=@$f" "$API/releases/$ID/assets?name=$(basename "$f")" > /dev/null
+          done
+          echo "release $TAG published with the Linux and Windows artifacts"

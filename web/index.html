@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pi Agent</title>
 <link rel="stylesheet" href="style.css">
+<meta name="build" content="__BUILD__">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%235b9dff'/%3E%3Ctext x='50' y='68' font-size='52' text-anchor='middle' fill='white' font-family='Georgia'%3E%CF%80%3C/text%3E%3C/svg%3E">
 </head>
 <body>
@@ -42,7 +43,8 @@
       <!-- Subagents the agent has running right now: a job that takes minutes
            should not look like a spinner somewhere in the transcript. -->
       <button id="btn-subagents" class="btn small hidden" title="Subagents running in this session">sub-agents <span id="subagents-count">0</span></button>
-      <button id="btn-reels" class="btn">Reels</button>
+      <button id="btn-terminals" class="btn small hidden" title="No terminals running">terminals <span id="terminals-count">0</span></button>
+      <button id="btn-reels" class="btn hidden">Reels</button>
       <button id="reels-pill" class="reels-pill hidden" title="Close the split feed panel"><span>◧ Reels</span></button>
       <button id="btn-settings" class="btn icon" title="Settings: agent name, avatar, TTS voice, voice input, thinking, theme">⚙</button>
       <button id="btn-tts" class="btn toggle" title="Speak agent replies out loud (TTS)">TTS off</button>
@@ -71,6 +73,7 @@
     <div id="chat"></div>
 
     <div id="composer-dock">
+    <div id="goal-bar" class="goal-bar hidden"></div>
     <div id="widget-bar" class="widget-bar hidden"></div>
     <div id="status-bar" class="status-bar hidden"></div>
 
@@ -86,6 +89,9 @@
            and widget lines *and* the composer and the stats row - a row about your
            own messages, parked at the far end of everything else. -->
       <div id="queue-bar" class="queue-bar hidden"></div>
+      <!-- pi retries a failed provider call itself; this bar is that state, with
+           the abort_retry control (issue #83). -->
+      <div id="retry-bar" class="retry-bar hidden"></div>
       <div class="composer-row">
         <button id="btn-attach" class="btn icon" title="Attach image / PDF / audio / video">+</button>
         <input id="file-input" type="file" accept="image/*,application/pdf,audio/*,video/*,.pdf" multiple hidden>
@@ -112,9 +118,9 @@
         <span id="stat-turn" title="time the last turn took"></span>
         <span class="stats-spacer"></span>
         <select id="model-select" title="Model"></select>
-        <button id="model-btn" class="btn pill" title="Model">no model</button>
+        <button id="model-btn" class="btn pill" title="Model"><span class="pill-label">no model</span></button>
         <select id="thinking-select" title="Thinking level"></select>
-        <button id="thinking-btn" class="btn pill" title="Thinking level">off</button>
+        <button id="thinking-btn" class="btn pill" title="Thinking level"><span class="pill-label">off</span></button>
       </div>
     </div>
     </div>
@@ -143,24 +149,24 @@
         <button class="rtab" data-feed="instagram">Reels</button>
         <button class="rtab" data-feed="tiktok">TikTok</button>
         <button class="rtab" data-feed="youtube">Shorts</button>
+        <button class="rtab" data-feed="browser">Browser</button>
       </div>
       <button id="btn-reels-close" class="btn icon" title="Close panel (Esc)">✕</button>
     </div>
-    <div class="reels-link-row">
-      <input id="reels-link" type="text" placeholder="Paste a video link…" autocomplete="off" spellcheck="false">
-      <button id="btn-reels-play" class="btn small primary">play</button>
-    </div>
     <div id="reels-video" class="reels-video">
       <div class="reels-placeholder">
-        <p>Paste a video link above to play it right here — no new tab.</p>
-        <p class="hint">Instagram and TikTok refuse to be embedded (<code>X-Frame-Options: DENY</code>), so the infinite feed needs its own window. <b>Open the feed</b> below and it loads for real, docked beside the app.</p>
-        <div class="reels-placeholder-actions">
-          <button id="btn-reels-feed-inline" class="btn small primary">open the feed</button>
-        </div>
+        <p>The feed opens in the app window.</p>
       </div>
     </div>
-    <div class="reels-panel-foot">
-      <button id="btn-reels-feed" class="btn small" title="Opens the full infinite feed in a window docked to the right edge">open full feed in side window</button>
+    <div id="reels-browser" class="hidden">
+      <div class="reels-browser-bar">
+        <button id="reels-back" class="btn small" title="Back">‹</button>
+        <button id="reels-forward" class="btn small" title="Forward">›</button>
+        <button id="reels-reload" class="btn small" title="Reload">⟳</button>
+        <input id="reels-url" type="text" placeholder="Search or type a URL" autocomplete="off" spellcheck="false">
+        <button id="reels-go" class="btn small primary">go</button>
+      </div>
+      <iframe id="reels-frame" title="Browser pane" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads allow-modals"></iframe>
     </div>
   </aside>
 </div>
@@ -193,6 +199,11 @@
       <input id="crop-x" type="range" min="-1" max="1" step="0.01" value="0" title="horizontal">
       <input id="crop-y" type="range" min="-1" max="1" step="0.01" value="0" title="vertical">
     </div>
+    <label id="crop-fit-label">Picture</label>
+    <div class="rate-row" id="crop-fit-row">
+      <button id="crop-fit-cover" class="btn small" type="button">fill screen</button>
+      <button id="crop-fit-contain" class="btn small" type="button">fit picture</button>
+    </div>
   </div>
   <p class="hint" id="crop-hint"></p>
   <div class="dialog-buttons">
@@ -217,6 +228,24 @@
 <dialog id="setup-dialog">
   <h3>Welcome to Pi Agent</h3>
   <p class="setup-sub">One-time setup — everything here can be changed later in ⚙ Settings.</p>
+  <div class="settings-grid" id="setup-pi-grid">
+    <label>Pi location</label>
+    <div class="rate-row">
+      <select id="setup-pi-source">
+        <option value="native">on this machine</option>
+        <option value="docker">in a docker container</option>
+      </select>
+      <select id="setup-pi-container" class="hidden"></select>
+    </div>
+    <label></label>
+    <p class="hint" id="setup-pi-hint"></p>
+  </div>
+  <div id="setup-step-packages">
+    <p class="setup-sub">Recommended packages. Ticked ones are installed when you finish, and the agent
+      restarts to pick them up.</p>
+    <div id="setup-packages-list"></div>
+  </div>
+  <div id="setup-step-prefs" class="hidden">
   <div class="settings-grid">
     <label>Agent name</label>
     <input id="setup-agent-name" type="text" placeholder="pi" autocomplete="off">
@@ -235,7 +264,7 @@
     <label class="check-label"><input id="setup-gamer" type="checkbox"> gamer mode — let the theme colour drift through the rainbow</label>
     <label id="setup-gamer-speed-label" class="hidden">Colour cycle</label>
     <div class="rate-row hidden" id="setup-gamer-speed-row">
-      <input id="setup-gamer-speed" type="range" min="4" max="60" step="2" value="16">
+      <input id="setup-gamer-speed" type="range" min="1" max="60" step="1" value="16">
       <span id="setup-gamer-speed-val">16s</span>
     </div>
     <label>Text size</label>
@@ -254,12 +283,13 @@
     <label class="check-label"><input id="setup-done-notify" type="checkbox"> desktop notification</label>
     <label>Voice input</label>
     <label class="check-label"><input id="setup-voice-autosend" type="checkbox"> send as soon as the mic stops</label>
-    <label>Shorts feed</label>
+    <label id="setup-shorts-label">Shorts feed</label>
     <select id="setup-shorts-provider">
       <option value="instagram">Instagram Reels</option>
       <option value="tiktok">TikTok</option>
       <option value="youtube">YouTube Shorts</option>
       <option value="none">None (hide the button)</option>
+      <option value="browser">Browser (any URL, in the split pane)</option>
     </select>
     <label>Network</label>
     <label class="check-label"><input id="setup-lan" type="checkbox"> let other devices on this network open this WebUI</label>
@@ -269,6 +299,7 @@
     arrow, the timer at the bottom counts the whole task (and survives a reload), background images and videos have
     no size limit (they are stored, never sent to the model), and voice input can run on a local
     <b>Whisper</b> model from Settings → Voice.</p>
+  </div>
   <div class="dialog-buttons">
     <button id="setup-skip" class="btn">skip</button>
     <button id="setup-done" class="btn primary">Let's go</button>
@@ -350,6 +381,7 @@
       <label class="check-label"><input id="set-expand-tools" type="checkbox"> auto-expand tool call output</label>
       <label>Compaction</label>
       <label class="check-label"><input id="set-auto-continue" type="checkbox"> auto-continue the task after compaction</label>
+      <label class="check-label"><input id="set-pi-compaction" type="checkbox"> pi auto-compaction (pi's own threshold compaction)<span id="set-pi-compaction-note"></span></label>
       <label>When the agent finishes</label>
       <label class="check-label"><input id="set-done-sound" type="checkbox"> play a sound</label>
       <label></label>
@@ -375,8 +407,25 @@
       <label class="check-label"><input id="set-lan" type="checkbox"> let other devices on this network open this WebUI</label>
       <label></label>
       <div class="hint" id="lan-hint"></div>
+      <label>Default model</label>
+      <div class="rate-row">
+        <select id="set-default-model"></select>
+      </div>
+      <label></label>
+      <p class="hint">The model a new chat starts on. "Same as the last used model" keeps whatever the picker is set to.</p>
+      <label>Pi location</label>
+      <div class="rate-row">
+        <select id="set-pi-source">
+          <option value="native">on this machine</option>
+          <option value="docker">in a docker container</option>
+        </select>
+        <select id="set-pi-container" class="hidden"></select>
+      </div>
+      <label></label>
+      <p class="hint" id="set-pi-hint"></p>
     </div>
   </div>
+
 
   <div class="tab-panel hidden" id="tab-voice">
     <div class="settings-grid">
@@ -444,7 +493,7 @@
       <label class="check-label"><input id="set-gamer" type="checkbox"> gamer mode — let the theme colour drift through the rainbow</label>
       <label id="gamer-speed-label" class="hidden">Colour cycle</label>
       <div class="rate-row hidden" id="gamer-speed-row">
-        <input id="set-gamer-speed" type="range" min="4" max="60" step="2" value="16">
+        <input id="set-gamer-speed" type="range" min="1" max="60" step="1" value="16">
         <span id="set-gamer-speed-val">16s</span>
       </div>
       <label>Background</label>
@@ -485,8 +534,8 @@
       <label class="check-label"><input id="set-type-anywhere" type="checkbox"> start typing anywhere in the window (no need to click the box)</label>
       <label>Font</label>
       <div class="font-row">
-        <input id="set-font" list="font-list" placeholder="System (Segoe UI)" spellcheck="false" autocomplete="off">
-        <datalist id="font-list"></datalist>
+        <input id="set-font" placeholder="System (Segoe UI)" spellcheck="false" autocomplete="off" role="combobox" aria-haspopup="listbox" aria-controls="font-list">
+        <datalist id="font-list" hidden></datalist>
         <button id="btn-font-reset" class="btn small" title="Reset to system default">reset</button>
       </div>
       <label>Text size</label>
@@ -526,15 +575,8 @@
         <option value="youtube">YouTube Shorts</option>
         <option value="none">None (hide the button)</option>
       </select>
-      <label>Open with</label>
-      <select id="set-shorts-mode">
-        <option value="panel">In-app split panel (plays inside the website)</option>
-        <option value="window">Side window (full infinite feed)</option>
-        <option value="tab">New browser tab</option>
-      </select>
     </div>
-    <label class="check-label"><input id="set-shorts-auto" type="checkbox"> open it automatically while the agent runs (closes when the run finishes)</label>
-    <p class="hint">One tap opens your feed. The in-app panel plays single videos inside the website (paste a link). The infinite feed can't be embedded in a browser — the side window docks flush to the right edge, and the Pi mobile app (React Native) shows it as a true native panel.</p>
+    <label class="check-label" id="set-shorts-auto-label"><input id="set-shorts-auto" type="checkbox"> open it automatically while the agent runs (closes when the run finishes)</label>
   </div>
 
   <!-- Pi providers: write to ~/.pi/agent/models.json so pi picks them up -->
@@ -571,8 +613,7 @@
       <p class="hint" style="margin-top:2px">Log in to a provider — this writes to <code>~/.pi/agent/auth.json</code>, the same file pi's <code>/login</code> uses. The agent restarts to pick up the change.</p>
       <div class="settings-grid">
         <label>Provider</label>
-        <input id="auth-provider" type="text" list="auth-provider-ids" placeholder="search or type a provider id…" autocomplete="off">
-        <datalist id="auth-provider-ids"></datalist>
+        <input id="auth-provider" type="text" placeholder="search or type a provider id…" autocomplete="off">
         <label>API key</label>
         <input id="auth-key" type="password" placeholder="sk-…" autocomplete="off">
       </div>
@@ -619,6 +660,16 @@
     </div>
 
     <div class="prov-section" style="margin-top:12px">
+      <h4 class="ext-head">MCP servers <span class="ext-count" id="ext-mcp-count"></span></h4>
+      <p class="hint" style="margin:2px 0 6px">From <code id="ext-mcp-file">mcp.json</code> — pi connects every enabled server
+        when a session starts. Project servers come from <code>.pi/mcp.json</code> and are read-only here.</p>
+      <div id="ext-mcp" class="prov-list"></div>
+      <div class="rate-row prov-actions">
+        <button id="btn-ext-mcp-add" class="btn small">add server…</button>
+      </div>
+    </div>
+
+    <div class="prov-section" style="margin-top:12px">
       <h4 class="ext-head">AGENTS.md</h4>
       <p class="hint" style="margin:2px 0 6px">
         The global file is <code>&lt;agent dir&gt;/AGENTS.md</code> and is editable here. The per-project files
@@ -644,11 +695,81 @@
   </div>
 </dialog>
 
+  <!-- Issue #175: what an html/svg code block renders (the eye on the block) -->
+  <dialog id="code-preview">
+    <div class="code-preview-head">
+      <span id="code-preview-title">html page</span>
+      <span class="code-preview-spacer"></span>
+      <button id="code-preview-copy" class="btn small" type="button" title="Copy the code">copy</button>
+      <button id="code-preview-close" class="btn icon" type="button" title="Close (Esc)" aria-label="Close">✕</button>
+    </div>
+    <div id="code-preview-body"></div>
+  </dialog>
+
+<!-- Add / edit an MCP server (issue #92). The inline three-input row it
+     replaces was too cramped to be an affordance; this is the same shape as
+     pi's own mcp.json: a name, and either a command with args (stdio) or a URL
+     with headers (http). -->
+<dialog id="mcp-dialog">
+  <h3 id="mcp-dialog-title">Add MCP server</h3>
+  <div class="settings-grid">
+    <label for="mcp-name">Name</label>
+    <input id="mcp-name" type="text" placeholder="filesystem" autocomplete="off" spellcheck="false">
+    <label for="mcp-transport">Type</label>
+    <select id="mcp-transport">
+      <option value="stdio">stdio — a command</option>
+      <option value="http">http — a URL</option>
+    </select>
+    <label for="mcp-command" id="mcp-command-label">Command</label>
+    <input id="mcp-command" type="text" placeholder="npx" autocomplete="off" spellcheck="false">
+    <label for="mcp-args" id="mcp-args-label">Arguments</label>
+    <input id="mcp-args" type="text" placeholder="-y @modelcontextprotocol/server-filesystem ." autocomplete="off" spellcheck="false">
+    <label for="mcp-url" id="mcp-url-label">URL</label>
+    <input id="mcp-url" type="text" placeholder="https://host/mcp" autocomplete="off" spellcheck="false">
+    <label for="mcp-env" id="mcp-env-label">Environment</label>
+    <textarea id="mcp-env" rows="3" spellcheck="false" placeholder="KEY=value, one per line"></textarea>
+    <label></label>
+    <label class="check-label"><input id="mcp-enabled" type="checkbox"> enabled (pi connects it when a session starts)</label>
+  </div>
+  <div id="mcp-dialog-error" class="hint hidden"></div>
+  <div class="dialog-buttons">
+    <button id="mcp-cancel" class="btn">Cancel</button>
+    <button id="mcp-save" class="btn primary">Save</button>
+  </div>
+</dialog>
+
 <div id="toasts"></div>
 <div id="drop-overlay" class="drop-overlay hidden">Drop files to attach</div>
 
 
 
+    <script src="util.js"></script>
+<script src="markdown.js"></script>
+<script src="toasts.js"></script>
+<script src="voice.js"></script>
+<script src="attachments.js"></script>
+<script src="subagents.js"></script>
+<script src="goals.js"></script>
+<script src="settings.js"></script>
+<script src="instances.js"></script>
+<script src="composer.js"></script>
+<script src="slash.js"></script>
+<script src="keyboard.js"></script>
+<script src="sessions.js"></script>
+<script src="models.js"></script>
+<script src="extension-ui.js"></script>
+<script src="pi-panel.js"></script>
+<script src="shorts.js"></script>
+<script src="menus.js"></script>
+<script src="transcript.js"></script>
+<script src="stream.js"></script>
+<script src="settings-ui.js"></script>
+<script src="terminals.js"></script>
+<script src="model-menu.js"></script>
+<script src="context-menu.js"></script>
+<script src="appearance.js"></script>
+<script src="agent-source.js"></script>
+<script src="code-preview.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

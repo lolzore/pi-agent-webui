@@ -1,0 +1,89 @@
+{
+  "name": "pi-agent-desktop",
+  "productName": "Pi Agent",
+  "version": "0.1.3",
+  "description": "Pi Agent desktop: the WebUI in a native window, with the real shorts feeds (top-level webviews, so X-Frame-Options does not apply)",
+  "private": true,
+  "type": "module",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node test/smoke.cjs",
+    "dist:linux": "electron-builder --linux --publish never",
+    "dist:win": "electron-builder --win portable --publish never",
+    "dist": "electron-builder -lw --publish never",
+    "dist:win:nsis": "electron-builder --win nsis --publish never"
+  },
+  "devDependencies": {
+    "electron": "^44.9.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "org.piagent.desktop",
+    "productName": "Pi Agent",
+    "files": [
+      "main.js",
+      "preload.cjs",
+      "webui-preload.cjs",
+      "shorts-preload.cjs",
+      "toolbar.html",
+      "toolbar.css",
+      "toolbar.js",
+      "feeds.js",
+      "settings.js",
+      "bridge-manager.js",
+      "assets/**"
+    ],
+    "extraResources": [
+      {
+        "from": "../bridge",
+        "to": "app-bridge/bridge"
+      },
+      {
+        "from": "../web",
+        "to": "app-bridge/web"
+      }
+    ],
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "assets/icon-512.png",
+      "category": "Network",
+      "maintainer": "TheBlueChips <TheBlueChips@users.noreply.github.com>",
+      "syncDesktopName": true
+    },
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "asarUnpack": [
+      "node_modules/ws/**"
+    ],
+    "appImage": {
+      "artifactName": "pi-agent-${version}-linux-${arch}.AppImage"
+    },
+    "deb": {
+      "artifactName": "pi-agent-${version}-linux-${arch}.deb"
+    },
+    "portable": {
+      "artifactName": "pi-agent-${version}-win-${arch}-portable.${ext}"
+    },
+    "nsis": {
+      "artifactName": "pi-agent-${version}-win-${arch}-setup.${ext}"
+    },
+    "publish": null
+  },
+  "homepage": "https://github.com/TheBlueChips/pi-agent-webui",
+  "author": {
+    "name": "TheBlueChips",
+    "email": "TheBlueChips@users.noreply.github.com"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  },
+  "desktopName": "pi-agent.desktop"
+}

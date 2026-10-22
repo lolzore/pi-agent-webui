@@ -147,3 +147,30 @@ class WS {
 }
 
 module.exports = WS;
+
+/* Launch Chromium and wait for the DevTools port it chose.
+ *
+ * The tests used fixed ports with a pid modulo, and two of them could land on
+ * the same port while a previous browser was still shutting down - which showed
+ * up as a browser that never exposed a page, or a /json/list answered by the
+ * wrong process. Asking for port 0 and reading the real port from Chrome's own
+ * stderr removes the guess entirely.
+ *
+ * Returns { child, port (a promise), stderr() } - the caller still owns the
+ * child and the user-data-dir. */
+function launchBrowser(browser, args) {
+  const { spawn } = require('child_process');
+  const child = spawn(browser, [...(args || []), '--remote-debugging-port=0'], { stdio: ['ignore', 'ignore', 'pipe'] });
+  let err = '';
+  const port = new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('browser never reported a debug port\n' + err.slice(-400))), 30000);
+    child.stderr.on('data', (c) => {
+      err += c;
+      const m = /DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)\//.exec(err);
+      if (m) { clearTimeout(t); resolve(Number(m[1])); }
+    });
+    child.on('exit', (code) => { clearTimeout(t); reject(new Error('browser exited (' + code + ')\n' + err.slice(-400))); });
+  });
+  return { child, port, stderr: () => err };
+}
+module.exports.launchBrowser = launchBrowser;

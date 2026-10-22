@@ -1,0 +1,24 @@
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  display: flex; align-items: center; gap: 6px;
+  background: #0c0f14; border-bottom: 1px solid #232a36;
+  font: 12px/1 system-ui, -apple-system, "Segoe UI", sans-serif; color: #e6e9ef;
+  user-select: none; overflow: hidden;
+}
+#drag { width: 6px; align-self: stretch; cursor: col-resize; background: transparent; }
+#drag:hover { background: #5aa9ff; }
+#tabs { display: flex; gap: 4px; }
+#tabs button {
+  border: 1px solid #232a36; background: #151a22; color: #8b93a3;
+  padding: 4px 10px; border-radius: 999px; font: inherit; cursor: pointer;
+}
+#tabs button:hover { color: #e6e9ef; }
+#tabs button.on { color: #fff; background: #101823; }
+#btns { margin-left: auto; display: flex; gap: 2px; }
+#btns button {
+  border: 0; background: transparent; color: #8b93a3; font-size: 13px;
+  padding: 4px 7px; border-radius: 6px; cursor: pointer;
+}
+#btns button:hover { color: #e6e9ef; background: #151a22; }

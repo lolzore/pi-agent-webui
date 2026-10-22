@@ -34,6 +34,21 @@ function get(pathAndQuery) {
     if (r.body.length < 1000) fail(`GET ${asset} is suspiciously small (${r.body.length} bytes)`);
   }
 
+  // A malformed percent escape used to throw URIError out of serveStatic and
+  // kill the whole bridge. It must be a 400, and the bridge must still answer.
+  const malformed = await get('/%ZZ');
+  if (malformed.status !== 400) fail(`GET /%ZZ returned ${malformed.status}, expected 400`);
+  const afterMalformed = await get('/api/health');
+  if (afterMalformed.status !== 200) fail('the bridge died after a malformed URL');
+
+  // Static traversal: an encoded slash survives URL normalisation and used to
+  // let /..%2fwebui-settings.json read a sibling whose name starts with "web".
+  for (const path of ['/..%2fwebui-settings.json', '/%2e%2e%2fwebui-settings.json']) {
+    const r = await get(path);
+    if (r.status !== 403) fail(`GET ${path} returned ${r.status}, expected 403`);
+    if (r.body.includes('TRAVERSAL_MARKER')) fail(`GET ${path} served a sibling file`);
+  }
+
   // The list the sidebar renders. An empty array here is the "no chats" symptom.
   const list = await get('/api/sessions');
   if (list.status !== 200) fail(`GET /api/sessions returned ${list.status}`);

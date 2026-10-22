@@ -116,7 +116,7 @@ $env:PI_WEBUI_PORT=3090; docker compose up -d --build   # when 3080 is taken
 docker compose build --build-arg PI_PACKAGE=@mariozechner/pi-coding-agent
 ```
 
-The host port is `PI_WEBUI_PORT` (default 3080) so a container and a native bridge can share the machine. The image installs `@earendil-works/pi-coding-agent` by default — override with `--build-arg PI_PACKAGE=… --build-arg PI_VERSION=…` to pin another one. The container binds `0.0.0.0` *inside* its own network namespace, which is what makes the published port work at all; the port mapping is the boundary. **Your WebUI settings and the session to resume live in the pi volume** (`/root/.pi`), not in the image, so rebuilding or recreating the container no longer resets them, and `.dockerignore` keeps the host's `node_modules`, sessions and settings out of the image.
+The host port is `PI_WEBUI_PORT` (default 3080) so a container and a native bridge can share the machine. The image installs `@earendil-works/pi-coding-agent` **1.3.0** by default — override with `--build-arg PI_PACKAGE=… --build-arg PI_VERSION=…` to pin another one. The container binds `0.0.0.0` *inside* its own network namespace, which is what makes the published port work at all; the port mapping is the boundary. **Your WebUI settings and the session to resume live in the pi volume** (`/root/.pi`), not in the image, so rebuilding or recreating the container no longer resets them, and `.dockerignore` keeps the host's `node_modules`, sessions and settings out of the image.
 
 ### Linux / macOS
 
@@ -140,7 +140,7 @@ if 3080 is taken).
 
 ```powershell
 npm install -g @mariozechner/pi-coding-agent   # the pi CLI
-cd pi_agent_webui/bridge
+cd pi-agent-webui/bridge
 npm install
 npm start                # serves http://localhost:3080 by default (set PORT to change)
 ```
@@ -221,6 +221,7 @@ $env:PI_COMMAND="node mock_agent.js"; npm start
 - **Renamed or moved the project folder?** Each session records the working directory it was taken in, and pi refuses to open a session whose folder is gone. When you click such a session the WebUI says which folder is missing and offers to recreate it; saying yes puts the (empty) folder back and opens the session, so nothing is lost.
 - **Local only by default.** The bridge binds `127.0.0.1`, so nothing on your network can reach it. It can also drive a shell on this machine, so exposing it is a deliberate choice: **Settings → General → Network** switches it on and off live (the bridge writes `bridge/lan.json` and rebinds without a restart), or set `"lan": true` in that file by hand (`PI_WEBUI_HOST=0.0.0.0` wins over it; `"host": "192.168.x.y"` binds one specific interface). It prints a warning and the LAN address whenever it is listening on the network — only do this on a network you trust, there is no login.
 - **Reaching another machine's WebUI.** The switcher does not send your browser to the other machine: this bridge fetches for it (`/proxy/<origin>/...`, WebSocket included), so the page stays on this origin and a host that is switched off is a banner with a way back rather than a dead end. The other bridge therefore only has to be reachable **from this machine** - either enable LAN on it (`"lan": true` in its `bridge/lan.json`, or the switch in Settings > General, it warns), or keep it local and forward a port over SSH (`ssh -L 3081:localhost:3080 user@otherbox`, then add `http://localhost:3081`). The tunnel is the safer of the two: nothing is exposed to the network. Only addresses already in the instance list are proxied, never arbitrary ones.
+- **Several agents on one PC.** `INSTANCE=2 ./start-webui.sh` starts a second bridge on port 3082 with its own pi home (`~/.pi/webui-instances/2`): separate sessions, auth, skills, models and settings. Leave it running and the instance switcher in the first window finds it by itself — bridges on 3080-3095 are probed and offered as `found:` rows, one click to add and switch. Want something shared? Link it into the instance home (`ln -s ~/.pi/agent/auth.json ~/.pi/webui-instances/2/.pi/agent/auth.json`).
 - **Something stuck on screen?** `Esc` closes any open menu (model picker, thinking levels, instance switcher, branch list) before it means "stop the agent", and a click anywhere outside a menu closes it. In a window with no reload button that is the way out.
 - **A long unbroken line** (a URL, a hash, minified code) wraps instead of widening the transcript; only a code block scrolls sideways. The chat never scrolls horizontally. The conversation's scrollbar runs the full height of the window (it is the chat column that scrolls, not the message list inside it), so it does not stop at the top of the composer or shorten while you type.
 - **The same file uploaded twice** is kept once: the bridge remembers the hash of what it wrote and hands back the existing path (the UI says so), instead of filling the workspace with copies.

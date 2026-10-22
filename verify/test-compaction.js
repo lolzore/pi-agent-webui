@@ -58,13 +58,14 @@ let okMark = 0;
 if (!base) { console.error('usage: node test-compaction.js <baseUrl> <browserPath>'); process.exit(2); }
 if (!browser || !fs.existsSync(browser)) { console.error('no browser at ' + browser); process.exit(2); }
 
-const PORT = 9900 + (process.pid % 80);
+let PORT = 0;   // assigned from the browser's own DevTools line (see ws-min.js)
 const userDir = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-compact-'));
-const child = spawn(browser, [
+const launched = require('./ws-min.js').launchBrowser(browser, [
   '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
-  '--disable-extensions', '--remote-debugging-port=' + PORT, '--user-data-dir=' + userDir,
+  '--disable-extensions', '--user-data-dir=' + userDir,
   'about:blank',
-], { stdio: ['ignore', 'ignore', 'pipe'] });
+]);
+const child = launched.child;
 let stderr = '';
 child.stderr.on('data', (c) => { stderr += c; });
 const cleanup = () => {
@@ -81,6 +82,7 @@ const getJson = (p) => new Promise((res, rej) => {
 });
 
 (async () => {
+  try { PORT = await launched.port; } catch (e) { fail(e.message); }
   let ver = null;
   for (let i = 0; i < 100; i++) { try { ver = await getJson('/json/version'); break; } catch { await sleep(150); } }
   if (!ver) fail('browser never came up\n' + stderr.slice(-400));

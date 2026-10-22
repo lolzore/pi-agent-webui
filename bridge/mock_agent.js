@@ -4,20 +4,35 @@
  * part of the UI: streaming prompts, images, bash, commands, sessions,
  * fork/edit, and extension UI dialogs. Point the bridge at it with:
  *   PI_COMMAND="node mock_agent.js" node server.js
+ *
+ * Set PI_MOCK_SESSION_FILE to a real .jsonl to have the mock claim to be in that
+ * session. Without it the mock reports a path that does not exist, so the page
+ * shows an empty transcript - which is fine for testing the UI's own behaviour and
+ * useless for anything that depends on the transcript having height and scrolling,
+ * such as the sticky-to-bottom path.
  */
 'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const state = {
   model: { id: 'mock-large', name: 'Mock Large', provider: 'mock', reasoning: true, input: ['text', 'image'], contextWindow: 200000 },
   thinkingLevel: 'medium',
   isStreaming: false,
-  sessionFile: '/root/.pi/agent/sessions/mock-session.jsonl',
+  sessionFile: process.env.PI_MOCK_SESSION_FILE || '/root/.pi/agent/sessions/mock-session.jsonl',
   sessionId: 'mock-session',
   sessionName: 'Mock session',
   messageCount: 0,
   compacting: false,
 };
 const messages = [];
+/* pi keeps steering and follow-up messages in its own queues and abort() does not
+ * clear them - only clear_queue does, which pi 1.0.0 exposes over RPC. Mirrored here
+ * so the WebUI behaviour around abort can be tested (issue #53). */
+const queues = { steering: [], followUp: [] };
+function emitQueue() { send({ type: 'queue_update', steering: [...queues.steering], followUp: [...queues.followUp] }); }
 const commands = [
   { name: 'echo', description: 'Echo the rest of the message back', source: 'extension' },
   { name: 'dialog', description: 'Demo: exercise extension UI dialogs', source: 'extension' },
@@ -83,11 +98,29 @@ process.stdin.on('data', (d) => {
   }
 });
 
+/* Optional, for tests: what this mock was started with, and every RPC it is
+ * asked for - so a test can assert that the bridge resumes by *starting in* a
+ * session instead of switching to it after the fact. */
+function noteRpc(type) {
+  const f = process.env.PI_MOCK_RPC_LOG;
+  if (!f) return;
+  try { fs.appendFileSync(f, String(type) + '\n'); } catch { /* best effort */ }
+}
+if (process.env.PI_MOCK_ARGV_FILE) {
+  try { fs.writeFileSync(process.env.PI_MOCK_ARGV_FILE, process.argv.slice(2).join(' ') + '\n'); } catch { /* best effort */ }
+}
+
 function handle(msg) {
+  noteRpc(msg && msg.type);
   const id = msg.id;
   switch (msg.type) {
     case 'get_state':
-      respond(id, msg.type, true, { ...state, pendingMessageCount: 0 });
+      respond(id, msg.type, true, {
+        ...state,
+        pendingMessageCount: queues.steering.length + queues.followUp.length,
+        queuedSteering: [...queues.steering],
+        queuedFollowUp: [...queues.followUp],
+      });
       return;
     case 'get_messages':
       respond(id, msg.type, true, { messages: [...messages] });
@@ -129,6 +162,22 @@ function handle(msg) {
           .map((m, i) => ({ entryId: `u${i}`, text: userText(m) })),
       });
       return;
+    case 'get_tree': {
+      /* The shape the page walks: nodes of { entry, children }, with the leaf id
+       * it should walk back from. User entries carry the same ids
+       * get_fork_messages reports, so a fork lands on the message it names. */
+      let ui = 0;
+      const nodes = messages.map((m, i) => ({
+        entry: { id: m.role === 'user' ? `u${ui++}` : `a${i}`, message: m },
+        children: [],
+      }));
+      for (let i = 0; i < nodes.length - 1; i++) nodes[i].children.push(nodes[i + 1]);
+      respond(id, msg.type, true, {
+        tree: nodes.length ? [nodes[0]] : [],
+        leafId: nodes.length ? nodes[nodes.length - 1].entry.id : null,
+      });
+      return;
+    }
     case 'fork': {
       const idx = parseInt(String(msg.entryId).replace('u', ''), 10);
       const all = messages.filter((m) => m.role === 'user');
@@ -166,17 +215,30 @@ function handle(msg) {
       return;
     case 'set_steering_mode':
     case 'set_follow_up_mode':
-    case 'set_auto_compaction':
     case 'set_auto_retry':
-    case 'clear_queue':
-      respond(id, msg.type, true, msg.type === 'clear_queue' ? { steering: [], followUp: [] } : undefined);
-      return;
     case 'abort':
+    case 'abort_bash':
+    case 'abort_retry':
       state.isStreaming = false;
       respond(id, msg.type, true);
       send({ type: 'agent_end', messages: [] });
       send({ type: 'agent_settled' });
       return;
+    case 'set_auto_compaction': {
+      // pi persists this one; the mock does too, so the WebUI's read-back and
+      // the bridge's /api/pi-config reflect the change (issue #56).
+      try {
+        const dir = process.env.PI_CODING_AGENT_DIR || process.env.PI_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent');
+        const file = path.join(dir, 'settings.json');
+        fs.mkdirSync(dir, { recursive: true });
+        let s = {};
+        try { s = JSON.parse(fs.readFileSync(file, 'utf8')) || {}; } catch { s = {}; }
+        s.compaction = Object.assign({}, s.compaction, { enabled: !!msg.enabled });
+        fs.writeFileSync(file, JSON.stringify(s, null, 2));
+      } catch { /* best effort */ }
+      respond(id, msg.type, true);
+      return;
+    }
     case 'bash': {
       const out = `running: ${msg.command}\nmock output line 1\nmock output line 2`;
       messages.push({
@@ -206,12 +268,51 @@ function handle(msg) {
       }, 3000);
       return;
     }
+    case 'clear_queue': {
+      const out = { steering: [...queues.steering], followUp: [...queues.followUp] };
+      queues.steering = [];
+      queues.followUp = [];
+      emitQueue();
+      respond(id, msg.type, true, out);
+      return;
+    }
     case 'prompt': {
       if (state.compacting) {
         respond(id, msg.type, false, undefined, 'Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.');
         return;
       }
       const text = msg.message || '';
+      /* goal-x commands, emulated enough for the WebUI (issue #81): pause and
+       * resume change the focused goal's status in the workspace, which is what
+       * the extension would do; focus and refresh are acknowledged. The UI
+       * sends these as ordinary prompts. */
+      if (/^\/goal-(pause|resume|focus|refresh)\b/.test(text)) {
+        const cmd = text.split(/\s+/)[0];
+        if (cmd === '/goal-pause' || cmd === '/goal-resume') {
+          try {
+            const dir = path.join(process.env.WORKSPACE_DIR || process.cwd(), '.pi', 'goals');
+            const name = fs.readdirSync(dir).find((n) => /^active_goal_.*\.md$/.test(n));
+            if (name) {
+              const full = path.join(dir, name);
+              const body = fs.readFileSync(full, 'utf8');
+              const next = cmd === '/goal-pause' ? 'paused' : 'active';
+              // The record's own status is the first "status" in the file; task
+              // statuses live inside taskList, further down.
+              fs.writeFileSync(full, body.replace(/"status"\s*:\s*"[^"]*"/, `"status": "${next}"`));
+            }
+          } catch { /* no goal in this workspace */ }
+        }
+        respond(id, msg.type, true);
+        streamAssistant(`(${cmd} handled by the mock)`);
+        send({ type: 'agent_settled' });
+        return;
+      }
+      if (state.isStreaming && (msg.streamingBehavior === 'steer' || msg.streamingBehavior === 'followUp')) {
+        (msg.streamingBehavior === 'steer' ? queues.steering : queues.followUp).push(text);
+        emitQueue();
+        respond(id, msg.type, true);
+        return;
+      }
       const userMsg = { role: 'user', content: text, timestamp: Date.now(), attachments: [] };
       if (Array.isArray(msg.images) && msg.images.length) {
         userMsg.content = [
@@ -221,6 +322,20 @@ function handle(msg) {
         userMsg.attachments = msg.images.map((im, i) => ({
           id: `a${i}`, type: 'image', fileName: `image-${i + 1}`, mimeType: im.mimeType, size: (im.data || '').length,
         }));
+      }
+      /* Whatever is still queued is delivered by this turn - that is what makes the
+       * difference observable: a message left in the queue comes back later as a
+       * message nobody typed. */
+      for (const queued of [...queues.steering, ...queues.followUp]) {
+        const qm = { role: 'user', content: queued, timestamp: Date.now(), attachments: [] };
+        messages.push(qm);
+        send({ type: 'message_start', message: qm });
+        send({ type: 'message_end', message: qm });
+      }
+      if (queues.steering.length || queues.followUp.length) {
+        queues.steering = [];
+        queues.followUp = [];
+        emitQueue();
       }
       messages.push(userMsg);
       state.messageCount = messages.length;
