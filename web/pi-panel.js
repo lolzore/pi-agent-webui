@@ -65,7 +65,13 @@ function extRow(kind, r, reload) {
     const del = el('button', 'btn small', 'uninstall');
     del.title = `Delete ${r.name} from disk. Only loose files under the agent dir can be removed here.`;
     del.onclick = async () => {
-      if (!confirm(`Delete ${r.name} from disk?\n\nThis removes the file itself, not just the setting. It cannot be undone from here.`)) return;
+      const yes = await askDialog({
+        title: `Delete ${r.name} from disk?`,
+        body: 'This removes the file itself, not just the setting. It cannot be undone from here.',
+        okLabel: 'delete',
+        danger: true,
+      });
+      if (!yes) return;
       del.disabled = true;
       try {
         const d = await postExt('/api/pi-extensions/delete', { type: kind, name: r.name });
@@ -128,7 +134,12 @@ function mcpRow(r, reload) {
   const del = el('button', 'btn small', 'remove');
   del.title = 'Take this server out of mcp.json';
   del.onclick = async () => {
-    if (!confirm(`Remove ${r.name} from ${r.sourceLabel}?`)) return;
+    const yes = await askDialog({
+      title: `Remove ${r.name} from ${r.sourceLabel}?`,
+      okLabel: 'remove',
+      danger: true,
+    });
+    if (!yes) return;
     del.disabled = true;
     try {
       await postExt('/api/mcp/delete', { name: r.name });
@@ -306,7 +317,13 @@ async function loadExtensionsTab() {
       const del = el('button', 'btn small', 'remove');
       del.title = 'Take this entry out of settings.json. The files it installed under ~/.pi stay where they are.';
       del.onclick = async () => {
-        if (!confirm(`Remove ${p.source} from settings.json?\n\nThis only edits the list. Anything it installed under ~/.pi/agent stays on disk.`)) return;
+        const yes = await askDialog({
+          title: `Remove ${p.source} from settings.json?`,
+          body: 'This only edits the list. Anything it installed under ~/.pi/agent stays on disk.',
+          okLabel: 'remove',
+          danger: true,
+        });
+        if (!yes) return;
         del.disabled = true;
         try {
           await postExt('/api/pi-extensions/package', { action: 'remove', source: p.source });
@@ -371,7 +388,15 @@ if ($('btn-ext-pkg-add')) {
 if ($('btn-ext-agents-save')) {
   $('btn-ext-agents-save').onclick = async () => {
     const content = $('ext-agents-text').value;
-    if (content.trim() === '' && !confirm('Save an empty AGENTS.md?\n\nAn empty box deletes the global AGENTS.md.')) return;
+    if (content.trim() === '') {
+      const yes = await askDialog({
+        title: 'Save an empty AGENTS.md?',
+        body: 'An empty box deletes the global AGENTS.md.',
+        okLabel: 'delete it',
+        danger: true,
+      });
+      if (!yes) return;
+    }
     $('btn-ext-agents-save').disabled = true;
     try {
       const d = await postExt('/api/pi-agents', { content });
@@ -462,6 +487,25 @@ function piProviderLlamaRows(servers, scanning) {
   return out;
 }
 
+/* The provider currently loaded into the form by the row's edit button. Its
+ * full model objects are kept: the textarea only shows ids, and re-saving a
+ * provider must not throw away context windows, costs or other per-model
+ * settings. */
+let editingProvider = null;
+
+function fillProviderForm(id, p) {
+  const models = Array.isArray(p.models)
+    ? p.models.map((m) => (typeof m === 'string' ? { id: m } : { ...m })).filter((m) => m && m.id)
+    : [];
+  editingProvider = { id, models };
+  $('prov-id').value = id;
+  $('prov-base-url').value = p.baseUrl || '';
+  $('prov-api').value = p.api || 'openai-completions';
+  $('prov-api-key').value = '';
+  $('prov-models').value = models.map((m) => m.id).join('\n');
+  $('prov-id').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
 /* `custom` is the providers object (null/{} is a real answer), `llama` is
  * `{ pending }`, `{ servers, scanning }` or `{}` once the probe has answered,
  * and `customErr` says the providers fetch itself failed. */
@@ -491,15 +535,22 @@ function renderPiProviders(list, custom, llama, customErr) {
       list.appendChild(el('div', 'prov-empty', (servers.length || pending || scanning) ? 'no providers added by hand' : 'no custom providers yet'));
     } else {
       for (const [id, p] of provs) {
-        const row = el('div', 'prov-row');
+        const row = el('div', 'prov-row prov-row-custom');
         const info = el('div', 'prov-info');
         info.appendChild(el('div', 'prov-id', id));
+        const thinking = (p.models || []).filter((m) => m && m.reasoning).length;
         info.appendChild(el('div', 'prov-meta',
-          `${p.baseUrl || '—'} · ${p.models?.length || 0} models · key ${p.hasApiKey ? '✓' : '—'}`));
+          `${p.baseUrl || '—'} · ${p.models?.length || 0} models · key ${p.hasApiKey ? '✓' : '—'}`
+          + (thinking ? ` · thinking ${thinking}` : '')));
         const btn = el('button', 'btn small', 'remove');
         btn.title = `Remove provider "${id}" from pi's models.json`;
         btn.onclick = async () => {
-          if (!confirm(`Remove provider "${id}" from pi's models.json?`)) return;
+          const yes = await askDialog({
+            title: `Remove provider "${id}" from pi's models.json?`,
+            okLabel: 'remove',
+            danger: true,
+          });
+          if (!yes) return;
           try {
             const r = await fetch(api(`/api/pi-providers?id=${encodeURIComponent(id)}`), { method: 'DELETE' });
             const out = await r.json();
@@ -509,7 +560,10 @@ function renderPiProviders(list, custom, llama, customErr) {
             refreshModels();
           } catch (e) { toast(e.message, 'error'); }
         };
-        row.append(info, btn);
+        const edit = el('button', 'btn small', 'edit');
+        edit.title = `Edit "${id}" — change its endpoint, key, models or thinking support`;
+        edit.onclick = () => fillProviderForm(id, p);
+        row.append(info, edit, btn);
         list.appendChild(row);
       }
     }
@@ -564,16 +618,34 @@ async function loadPiProviders(resetRetry) {
   }
 }
 
+/* Provider docs usually show the full chat endpoint (.../v1/chat/completions),
+ * but pi takes the base URL and appends the endpoint itself. Strip the part
+ * people paste by mistake, and put the corrected value back in the field so it
+ * is obvious what will be saved. */
+function providerBaseUrl(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  const withProto = /^https?:\/\//i.test(text) ? text : `https://${text}`;
+  let u;
+  try { u = new URL(withProto); } catch { return text; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return text;
+  u.pathname = u.pathname.replace(/\/+$/, '').replace(/\/(?:chat\/completions|completions|models)$/i, '') || '/';
+  u.search = '';
+  u.hash = '';
+  return u.toString().replace(/\/$/, '');
+}
+
 $('btn-prov-discover').onclick = async () => {
-  const url = $('prov-base-url').value.trim().replace(/\/+$/, '');
+  const url = providerBaseUrl($('prov-base-url').value);
   if (!url) { toast('Enter the base URL first', 'warning'); return; }
+  $('prov-base-url').value = url;
   const btn = $('btn-prov-discover');
   btn.disabled = true;
   try {
     const r = await fetch(api('/api/probe-models'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, apiKey: $('prov-api-key').value.trim() }),
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || `probe failed (${r.status})`);
@@ -588,8 +660,9 @@ $('btn-prov-discover').onclick = async () => {
 };
 
 $('btn-prov-test').onclick = async () => {
-  const baseUrl = $('prov-base-url').value.trim().replace(/\/+$/, '');
+  const baseUrl = providerBaseUrl($('prov-base-url').value);
   if (!/^https?:\/\//i.test(baseUrl)) { toast('Enter a valid base URL first', 'warning'); return; }
+  $('prov-base-url').value = baseUrl;
   const btn = $('btn-prov-test');
   btn.disabled = true;
   btn.textContent = 'testing…';
@@ -605,6 +678,7 @@ $('btn-prov-test').onclick = async () => {
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || `probe failed (${r.status})`);
+    if (d.baseUrl) $('prov-base-url').value = d.baseUrl;
     if (d.ok) {
       toast(`✓ Connection works — model "${d.model}" replied: ${d.sample || '(empty)'}`);
       if (d.models.length && !$('prov-models').value.trim()) {
@@ -626,31 +700,73 @@ $('btn-prov-test').onclick = async () => {
 
 $('btn-prov-add').onclick = async () => {
   const id = $('prov-id').value.trim();
-  const baseUrl = $('prov-base-url').value.trim();
-  const api = $('prov-api').value;
+  const baseUrl = providerBaseUrl($('prov-base-url').value);
+  // Do not call this `api`: it shadows the api() URL helper below, and the add
+  // button then failed with "api is not a function" before it ever sent a save.
+  const providerApi = $('prov-api').value;
   const apiKey = $('prov-api-key').value.trim();
-  const models = $('prov-models').value.split('\n').map((s) => s.trim()).filter(Boolean);
+  let models = $('prov-models').value.split('\n').map((s) => s.trim()).filter(Boolean);
+  const prior = editingProvider && editingProvider.id === id ? editingProvider.models : [];
+  // Editing a provider without retyping its model list keeps the list. This is
+  // also how an existing provider gets thinking support: a blank Models box is
+  // "leave the models alone", not "delete every model".
+  if (!models.length && prior.length) models = prior.map((m) => m.id);
   if (!id) { toast('Provider id is required', 'warning'); return; }
   if (!/^https?:\/\//i.test(baseUrl)) { toast('Base URL must start with http:// or https://', 'warning'); return; }
+  $('prov-base-url').value = baseUrl;
   const btn = $('btn-prov-add');
   btn.disabled = true;
   try {
+    // A provider saved without models shows up in pi but offers nothing to
+    // pick. The endpoint can usually tell us its models, so ask before saving
+    // unless the user typed a list.
+    if (!models.length) {
+      btn.textContent = 'finding models…';
+      try {
+        const r = await fetch(api('/api/probe-models'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: baseUrl, apiKey }),
+        });
+        const d = await r.json();
+        if (r.ok && Array.isArray(d.models) && d.models.length) {
+          models = d.models.map((m) => m.id).filter(Boolean);
+          $('prov-models').value = models.join('\n');
+        }
+      } catch { /* still save it; the user can add model ids by hand */ }
+    }
+    const priorById = new Map(prior.map((m) => [m.id, m]));
+    const modelEntries = models.map((mid) => {
+      const base = priorById.get(mid) || { id: mid };
+      const entry = { ...base, id: mid };
+      // Custom providers no longer carry a "supports thinking" switch (issue
+      // #264). Keep the flag an existing model already had, and give a new
+      // model the old default (thinking on) so nothing silently loses its
+      // reasoning levels when the provider is edited.
+      if (entry.reasoning === undefined) entry.reasoning = true;
+      return entry;
+    });
     const r = await fetch(api('/api/pi-providers'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, baseUrl, api, apiKey: apiKey || undefined, models }),
+      body: JSON.stringify({ id, baseUrl, api: providerApi, apiKey: apiKey || undefined, models: modelEntries }),
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || `failed (${r.status})`);
-    toast(`Provider "${id}" saved to pi — new models appear in the model list`);
+    toast(`Provider "${id}" saved to pi — reloading so its models become available`);
+    editingProvider = null;
     $('prov-api-key').value = '';
     $('prov-models').value = '';
+    // The running pi process loaded models.json at startup. A bare
+    // get_available_models reads that old snapshot, so a newly saved provider
+    // (or a new reasoning flag) stayed invisible until the next manual reload.
+    await reloadPi('Provider saved — its models are ready');
     loadPiProviders();
-    refreshModels(); // pi re-reads models.json when the model list is opened
   } catch (e) {
     toast(`Save failed: ${e.message}`, 'error');
   } finally {
     btn.disabled = false;
+    btn.textContent = 'add / update in pi';
   }
 };
 
@@ -764,7 +880,13 @@ async function authRestartAgent() {
 }
 
 async function authLogout(id) {
-  if (!confirm(`Log out "${id}"?\nRemoves its credentials from auth.json (like /logout).`)) return;
+  const yes = await askDialog({
+    title: `Log out "${id}"?`,
+    body: 'Removes its credentials from auth.json (like /logout).',
+    okLabel: 'log out',
+    danger: true,
+  });
+  if (!yes) return;
   try {
     const r = await fetch(api(`/api/auth-login?provider=${encodeURIComponent(id)}`), { method: 'DELETE' });
     const out = await r.json();

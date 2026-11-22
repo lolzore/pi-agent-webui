@@ -4,6 +4,8 @@
 // Usage: node test-atomic-write.js <server.js>
 
 const fs = require('fs');
+const http = require('http');
+const { spawn } = require('child_process');
 const os = require('os');
 const path = require('path');
 const vm = require('vm');
@@ -50,3 +52,78 @@ try {
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });
 }
+
+
+/* ── the two endpoints that used to write in place (issue #236) ────────────
+ * A scratch bridge is started here so the checks cover the routes, not only the
+ * helper: /api/ui-settings and AGENTS.md must land complete and leave no
+ * staging file behind. */
+async function endpointChecks() {
+  const ROOT = path.join(__dirname, '..');
+  const T = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-ep-'));
+  const AGENT = path.join(T, 'agent');
+  fs.mkdirSync(AGENT, { recursive: true });
+  const PORT = 4500 + (process.pid % 200);
+  const child = spawn(process.execPath, ['bridge/server.js'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      PORT: String(PORT),
+      PI_COMMAND: `node ${path.join(ROOT, 'bridge', 'mock_agent.js')}`,
+      PI_SESSION_DIR: path.join(T, 'sessions'),
+      PI_CODING_AGENT_SESSION_DIR: path.join(T, 'sessions'),
+      PI_AGENT_DIR: AGENT,
+      PI_CODING_AGENT_DIR: AGENT,
+      WORKSPACE_DIR: path.join(T, 'workspace'),
+      PI_WEBUI_SETTINGS: path.join(T, 'settings.json'),
+      PI_WEBUI_LAST_SESSION: path.join(T, 'last.json'),
+    },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  const cleanup = () => {
+    try { child.kill(); } catch { /* gone */ }
+    try { fs.rmSync(T, { recursive: true, force: true }); } catch { /* gone */ }
+  };
+  const req = (method, p, body) => new Promise((resolve, reject) => {
+    const r = http.request({ host: '127.0.0.1', port: PORT, path: p, method, timeout: 6000,
+      headers: body ? { 'Content-Type': 'application/json' } : {} }, (res) => {
+      let b = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => { b += c; });
+      res.on('end', () => { let d = null; try { d = JSON.parse(b); } catch { /* text */ } resolve({ status: res.statusCode, body: b, d }); });
+    });
+    r.on('timeout', () => r.destroy(new Error('timeout')));
+    r.on('error', reject);
+    if (body) r.write(body);
+    r.end();
+  });
+  try {
+    let up = false;
+    for (let i = 0; i < 60; i++) {
+      try { if ((await req('GET', '/api/health')).status === 200) { up = true; break; } } catch { /* not yet */ }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    if (!up) throw new Error('the scratch bridge never came up');
+
+    const put = await req('POST', '/api/ui-settings', JSON.stringify({ agentName: 'atomic-probe', atomicProbe: 'yes' }));
+    if (put.status !== 200) throw new Error('POST /api/ui-settings returned ' + put.status);
+    const got = await req('GET', '/api/ui-settings');
+    if (!got.d || got.d.atomicProbe !== 'yes') throw new Error('the settings write did not persist');
+    const settingsTmp = fs.readdirSync(T).filter((f) => f.includes('.tmp'));
+    if (settingsTmp.length) throw new Error('settings staging files left behind: ' + settingsTmp.join(', '));
+
+    const agents = await req('POST', '/api/pi-agents', JSON.stringify({ content: '# atomic probe\n' }));
+    if (agents.status !== 200) throw new Error('POST /api/pi-agents returned ' + agents.status);
+    const readBack = await req('GET', '/api/pi-agents');
+    if (!readBack.d || !readBack.d.global || !/atomic probe/.test(readBack.d.global.content || '')) {
+      throw new Error('AGENTS.md did not land complete');
+    }
+    const agentTmp = fs.readdirSync(AGENT).filter((f) => /AGENTS\.md.*\.tmp/.test(f));
+    if (agentTmp.length) throw new Error('AGENTS.md staging files left behind: ' + agentTmp.join(', '));
+    console.log('2 endpoints');
+  } finally {
+    cleanup();
+  }
+}
+
+endpointChecks().then(() => process.exit(0)).catch((e) => { console.error('FAIL: ' + (e && e.stack || e)); process.exit(1); });

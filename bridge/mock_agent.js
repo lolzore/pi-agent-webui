@@ -21,7 +21,9 @@ const state = {
   model: { id: 'mock-large', name: 'Mock Large', provider: 'mock', reasoning: true, input: ['text', 'image'], contextWindow: 200000 },
   thinkingLevel: 'medium',
   isStreaming: false,
-  sessionFile: process.env.PI_MOCK_SESSION_FILE || '/root/.pi/agent/sessions/mock-session.jsonl',
+  sessionFile: process.argv.includes('--no-tools') && process.env.PI_MOCK_PLAIN_SESSION_FILE
+    ? process.env.PI_MOCK_PLAIN_SESSION_FILE
+    : (process.env.PI_MOCK_SESSION_FILE || '/root/.pi/agent/sessions/mock-session.jsonl'),
   sessionId: 'mock-session',
   sessionName: 'Mock session',
   messageCount: 0,
@@ -74,10 +76,39 @@ async function streamAssistant(text, usage) {
   };
   send({ type: 'message_end', message: msg });
   send({ type: 'turn_end' });
+  emitScriptedExtensionErrors();
   messages.push(msg);
   state.isStreaming = false;
   send({ type: 'agent_end', messages: [msg] });
   send({ type: 'agent_settled' });
+}
+
+/* Issue #215: a wedged extension runner reports the same context error once per
+ * handler, on every turn. PI_MOCK_EXT_ERRORS=stale makes the mock do exactly
+ * that - once per process, so a repaired agent is quiet afterwards - and =plain
+ * emits an ordinary repeated extension error, which must not restart anything. */
+let scriptedExtErrorsSent = false;
+/* Only a prompt that asks for it reports the scripted errors, so a repaired agent
+ * can be shown to answer the next turn without repeating them. */
+let scriptedExtErrorsArmed = false;
+function emitScriptedExtensionErrors() {
+  const mode = process.env.PI_MOCK_EXT_ERRORS;
+  if (!mode || !scriptedExtErrorsArmed || scriptedExtErrorsSent) return;
+  scriptedExtErrorsArmed = false;
+  scriptedExtErrorsSent = true;
+  if (mode === 'stale') {
+    const stale = 'This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().';
+    send({ type: 'extension_error', extensionPath: '<boundary>', event: 'turn_end', error: 'turn_end could not resolve the persisted assistant entry ID' });
+    for (const [ext, ev] of [
+      ['C:\\Users\\x\\.pi\\agent\\npm\\node_modules\\pi-goal-x\\extensions\\goal.ts', 'context'],
+      ['builtin:codemode', 'prepare_loadout'],
+      ['C:\\Users\\x\\.pi\\agent\\extensions\\schizodev-router.ts', 'before_provider_request'],
+    ]) send({ type: 'extension_error', extensionPath: ext, event: ev, error: stale });
+    return;
+  }
+  for (let i = 0; i < 2; i++) {
+    send({ type: 'extension_error', extensionPath: 'C:\\Users\\x\\.pi\\agent\\extensions\\other.ts', event: 'turn_end', error: 'other.ts could not read its config' });
+  }
 }
 
 let buffer = '';
@@ -108,6 +139,11 @@ function noteRpc(type) {
 }
 if (process.env.PI_MOCK_ARGV_FILE) {
   try { fs.writeFileSync(process.env.PI_MOCK_ARGV_FILE, process.argv.slice(2).join(' ') + '\n'); } catch { /* best effort */ }
+}
+/* One line per mock start, so a test can tell a repair restart from a page that
+ * simply stayed up (issue #215). */
+if (process.env.PI_MOCK_START_LOG) {
+  try { fs.appendFileSync(process.env.PI_MOCK_START_LOG, String(process.pid) + '\n'); } catch { /* best effort */ }
 }
 
 function handle(msg) {
@@ -282,6 +318,9 @@ function handle(msg) {
         return;
       }
       const text = msg.message || '';
+      // Issue #215 test hook: the scripted extension errors ride on the next
+      // answer only when the prompt asks for them.
+      scriptedExtErrorsArmed = /ext-error|ctx-error/i.test(text);
       /* goal-x commands, emulated enough for the WebUI (issue #81): pause and
        * resume change the focused goal's status in the workspace, which is what
        * the extension would do; focus and refresh are acknowledged. The UI

@@ -92,6 +92,17 @@ const head = (p) => new Promise((res, rej) => {
   if (bad.status !== 416) fail('an unsatisfiable range answered HTTP ' + bad.status + ' (expected 416)');
   console.log('  ranges work (206 with Content-Range, suffix ranges, 416 when unsatisfiable)');
 
+  /* /api/bg-file has its own Range parser (background media, issue #239). It
+   * must treat `bytes=-N` as the last N bytes, exactly like upload-file. */
+  const bgName = encodeURIComponent(path.basename(up.body.path));
+  const bgSuffix = await get(`/api/bg-file?name=${bgName}`, { Range: 'bytes=-16' });
+  if (bgSuffix.status !== 206 || !bgSuffix.body.equals(TINY_CLIP.subarray(TINY_CLIP.length - 16))) {
+    fail('bg-file suffix range is wrong (HTTP ' + bgSuffix.status + ')');
+  }
+  const bgOpen = await get(`/api/bg-file?name=${bgName}`, { Range: 'bytes=10-' });
+  if (bgOpen.status !== 206 || !bgOpen.body.equals(TINY_CLIP.subarray(10))) fail('bg-file open range is wrong');
+  console.log('  bg-file ranges handle suffix and open-ended forms');
+
   const h = await head(q(up.body.path));
   if (h.status !== 200 || Number(h.headers['content-length']) !== TINY_CLIP.length || h.body.length) {
     fail('HEAD is wrong: HTTP ' + h.status + ' length ' + h.headers['content-length'] + ' body ' + h.body.length);

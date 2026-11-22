@@ -13,6 +13,7 @@ const LOCAL_COMMANDS = [
   { name: 'tts', description: 'Toggle text-to-speech for agent replies', source: 'local' },
   { name: 'autosend', description: 'Toggle auto-send after voice input', source: 'local' },
   { name: 'thinking', description: 'Toggle showing thinking blocks', source: 'local' },
+  { name: 'statistics', description: 'Model and token usage across all sessions', source: 'local' },
 ];
 
 /* pi's built-in slash commands are implemented by its TUI, not by RPC mode:
@@ -99,17 +100,100 @@ function openSlashMenu(items) {
     menu.appendChild(row);
   });
   document.body.appendChild(menu);
-  // Span the composer: from the "+" button to "send".
+  slash.menu = menu;
+  // Span the composer: from the "+" button to "send", and sit just above it.
+  positionSlashMenu();
+  startSlashFollow();
+}
+
+/* Put the menu just above the composer row, inside the visible viewport.
+ *
+ * It used to be positioned once from `innerHeight - row.top + 8`. That is right
+ * for a desktop window with the composer pinned to the bottom, but it is wrong
+ * when the visual viewport is smaller or offset from the layout viewport (a
+ * phone keyboard, page zoom, a short window): the menu was then laid out at the
+ * bottom of the *chat window*, often below the visible area, until a reload
+ * happened to recompute it (issue #203). Keep the menu inside the visual
+ * viewport, and re-run this when the viewport or the transcript scroller moves
+ * while it is open. */
+function positionSlashMenu() {
+  if (!slash.open || !slash.menu) return;
   const row = document.querySelector('.composer-row') || input;
   const r = row.getBoundingClientRect();
-  menu.style.left = r.left + 'px';
-  menu.style.width = r.width + 'px';
-  menu.style.bottom = `${window.innerHeight - r.top + 8}px`;
-  slash.menu = menu;
+  const vv = window.visualViewport;
+  const vw = vv ? vv.width : window.innerWidth;
+  const vh = vv ? vv.height : window.innerHeight;
+  const ox = vv ? vv.offsetLeft : 0;
+  const oy = vv ? vv.offsetTop : 0;
+  const gap = 8;
+  const edge = 8;
+  const spaceAbove = r.top - gap - edge;
+  const spaceBelow = (oy + vh) - r.bottom - gap - edge;
+  // Prefer above the composer, but if the window is short, use whichever side
+  // has more room and cap the menu to it. The old clamp moved a too-tall menu
+  // to the top of the window, detached from the input (the screenshot in the
+  // follow-up); the menu must stay attached and scroll inside its own box.
+  const preferAbove = spaceAbove >= 120 || spaceAbove >= spaceBelow;
+  const room = Math.max(80, Math.min(260, preferAbove ? spaceAbove : spaceBelow));
+  slash.menu.style.maxHeight = room + 'px';
+  const left = Math.max(ox + edge, Math.min(r.left, ox + vw - Math.min(r.width, vw - 2 * edge) - edge));
+  slash.menu.style.left = left + 'px';
+  slash.menu.style.width = Math.min(r.width, vw - 2 * edge) + 'px';
+  if (preferAbove) {
+    const bottom = (oy + vh) - r.top + gap;
+    slash.menu.style.top = 'auto';
+    slash.menu.style.bottom = Math.max(edge, bottom) + 'px';
+  } else {
+    slash.menu.style.bottom = 'auto';
+    slash.menu.style.top = Math.max(edge, r.bottom + gap) + 'px';
+  }
 }
+
+/* The composer moves while the page settles: the transcript loads, a status
+ * bar or attachment strip appears, the input grows, the window resizes. The
+ * menu is re-positioned by the resize/scroll/visualViewport listeners below and
+ * by a slow follow timer while it is open. A rAF loop measured and restyled the
+ * menu every frame; removing the follow entirely (an earlier attempt) broke the
+ * menu after a layout shift that is neither a resize nor a scroll. */
+
+/* Follow the composer while the menu is open - ten checks a second, and only
+ * when its position actually changed. That is enough to catch the dock settling
+ * or a transform, without a layout read every frame. */
+let slashFollowTimer = null;
+let slashFollowTop = null;
+function startSlashFollow() {
+  if (slashFollowTimer) return;
+  slashFollowTop = null;
+  slashFollowTimer = setInterval(() => {
+    if (!slash.open || !slash.menu) { stopSlashFollow(); return; }
+    const row = document.querySelector('.composer-row') || input;
+    if (!row) return;
+    const top = row.getBoundingClientRect().top;
+    if (slashFollowTop != null && Math.abs(top - slashFollowTop) < 0.5) return;
+    slashFollowTop = top;
+    positionSlashMenu();
+  }, 100);
+}
+function stopSlashFollow() {
+  if (slashFollowTimer) { clearInterval(slashFollowTimer); slashFollowTimer = null; }
+  slashFollowTop = null;
+}
+
+/* The composer can move while the menu is open: the transcript scrolls under
+ * it, the window is resized, or a phone keyboard opens. Keep the menu attached
+ * instead of leaving it where it was first drawn. */
+const repositionSlashMenu = () => positionSlashMenu();
+window.addEventListener('resize', repositionSlashMenu);
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', repositionSlashMenu);
+  window.visualViewport.addEventListener('scroll', repositionSlashMenu);
+}
+const chatScrollerForSlash = document.getElementById('chat-scroll');
+if (chatScrollerForSlash) chatScrollerForSlash.addEventListener('scroll', repositionSlashMenu, { passive: true });
 
 function closeSlashMenu() {
   if (slash.menu) slash.menu.remove();
+  stopSlashFollow();
   slash = { open: false, items: [], sel: 0, menu: null };
 }
 

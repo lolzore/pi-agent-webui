@@ -34,7 +34,12 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-goalctl-'));
 const wsDir = path.join(scratch, 'ws');
 const goalsDir = path.join(wsDir, '.pi', 'goals');
 const activeFile = path.join(goalsDir, 'active_goal_20260101000000_goaltest1.md');
+const goalSessionId = '99999999-8888-7777-6666-555555555555';
+const sessionDir = path.join(scratch, 'sessions');
+const goalSessionFile = path.join(sessionDir, `2026-01-01T00-00-00-000Z_${goalSessionId}.jsonl`);
 fs.mkdirSync(goalsDir, { recursive: true });
+fs.mkdirSync(sessionDir, { recursive: true });
+fs.writeFileSync(goalSessionFile, JSON.stringify({ type: 'session', id: goalSessionId, cwd: wsDir }) + '\n');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const task = (id, title, status, extra) => Object.assign({ id, title, status }, extra || {});
@@ -50,6 +55,7 @@ writeGoal('active_goal_20260101000000_goaltest1.md', {
   objective: 'Ship the interactive goal controls',
   status: 'active',
   autoContinue: true,
+  scheduler: { owner: goalSessionId },
   createdAt: '2026-01-01T00:00:00.000Z',
   updatedAt: '2026-01-01T00:10:00.000Z',
   taskList: {
@@ -107,9 +113,10 @@ const taskOf = (rec, id) => rec.taskList.tasks.find((x) => x.id === id) || {};
     env: Object.assign({}, process.env, {
       PI_AGENT_DIR: path.join(scratch, 'agent'),
       PI_CODING_AGENT_DIR: path.join(scratch, 'agent'),
-      PI_CODING_AGENT_SESSION_DIR: path.join(scratch, 'sessions'),
+      PI_CODING_AGENT_SESSION_DIR: sessionDir,
       WORKSPACE_DIR: wsDir,
-      PI_SESSION_DIR: path.join(scratch, 'sessions'),
+      PI_SESSION_DIR: sessionDir,
+      PI_MOCK_SESSION_FILE: goalSessionFile,
       PI_WEBUI_SETTINGS: path.join(scratch, 'webui.json'),
       PI_WEBUI_LAST_SESSION: path.join(scratch, 'last.json'),
       PI_GOALS_DIR: goalsDir,
@@ -270,15 +277,32 @@ const taskOf = (rec, id) => rec.taskList.tasks.find((x) => x.id === id) || {};
   if (taskOf(record().rec, 't2').status !== 'complete') fail('complete from the bar did not change the file: ' + JSON.stringify(taskOf(record().rec, 't2')));
   const cmds3 = await evalJs("window.__cmds.slice()");
   if (!cmds3.includes('/goal-refresh')) fail('no /goal-refresh after the task change: ' + JSON.stringify(cmds3));
-  // A contracted task opens the native evidence dialog; the text lands in the file.
-  await evalJs("window.__prompts = []; window.prompt = (q) => { window.__prompts.push(q); return 'evidence from the native dialog'; }; true");
+  // A contracted task opens the in-app evidence dialog (issue #229 replaced
+  // window.prompt, which Electron does not implement); the text lands in the file.
   await evalJs("[...document.querySelectorAll('#goal-bar .goal-task')].map((r) => r.querySelector('[data-goal-task]')).find((b) => b && b.dataset.goalTask === 't5').click(); true");
-  await sleep(600);
+  await sleep(400);
+  const evidenceDialog = JSON.parse(await evalJs(`(() => {
+    const d = document.getElementById('ask-dialog');
+    return JSON.stringify({
+      open: !!(d && d.open),
+      title: (document.getElementById('ask-title') || {}).textContent || '',
+      body: (document.getElementById('ask-body') || {}).textContent || '',
+    });
+  })()`));
+  if (!evidenceDialog.open) fail('completing a contracted task did not open the evidence dialog');
+  if (!/evidence/i.test(evidenceDialog.title) || !/screenshot/.test(evidenceDialog.body)) {
+    fail('the evidence dialog did not name the contract: ' + JSON.stringify(evidenceDialog));
+  }
+  await evalJs(`(() => {
+    const i = document.getElementById('ask-body').querySelector('input');
+    i.value = 'evidence from the in-app dialog';
+    document.getElementById('ask-ok').click();
+    return true;
+  })()`);
+  await sleep(900);
   const t5 = taskOf(record().rec, 't5');
-  if (t5.status !== 'complete' || !/native dialog/.test(t5.evidence || '')) fail('the evidence dialog did not reach the file: ' + JSON.stringify(t5));
-  const asked = await evalJs("window.__prompts.slice()");
-  if (!asked.length || !/contract/i.test(asked[0])) fail('the dialog did not name the contract: ' + JSON.stringify(asked));
-  console.log('  task controls: reopen, complete, and the native evidence dialog all wrote the file; /goal-refresh sent');
+  if (t5.status !== 'complete' || !/in-app dialog/.test(t5.evidence || '')) fail('the evidence dialog did not reach the file: ' + JSON.stringify(t5));
+  console.log('  task controls: reopen, complete, and the in-app evidence dialog all wrote the file; /goal-refresh sent');
 
   // Focus: with no active_goal file the bar shows a pool goal and offers focus.
   fs.renameSync(activeFile, path.join(goalsDir, 'goal_goaltest1.md'));

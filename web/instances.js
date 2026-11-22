@@ -69,7 +69,13 @@ async function startInstance(instance) {
 
 async function stopInstance(rec) {
   if (!rec) return;
-  if (!confirm(`Stop the agent on port ${rec.port}?\n\nIt was started from this UI; whatever it is doing right now is lost.`)) return;
+  const yes = await askDialog({
+    title: `Stop the agent on port ${rec.port}?`,
+    body: 'It was started from this UI; whatever it is doing right now is lost.',
+    okLabel: 'stop',
+    danger: true,
+  });
+  if (!yes) return;
   try {
     const d = await fetch(api('/api/stop-instance'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port: rec.port }) }).then((r) => r.json());
     if (!d.ok) throw new Error(d.error || 'could not stop');
@@ -278,6 +284,7 @@ async function reloadForInstance() {
   S.compactionMarks = [];
   S.compactionLive = null;
   S.compacting = false;
+  S.compactionAway = false;
   S.ctxStats = null;
   S.ctxDisplayTokens = null;
   S.ctxBaseTokens = null;
@@ -305,7 +312,6 @@ async function reloadForInstance() {
   S.live = null;
   S.liveDetached = null;
   S.toolCards = new Map();
-  S.thinkingEl = null;
   try { $('chat').replaceChildren(); } catch { /* nothing rendered yet */ }
   try { renderQueue(); updateStreamUi(); updateViewBanner(); } catch { /* not wired yet */ }
   updateSubagentsBtn();
@@ -357,7 +363,13 @@ function forgetInstanceButton(rec) {
 
 async function forgetInstance(rec) {
   if (!rec) return;
-  if (!confirm(`Forget instance ${rec.instance}?\n\nThe record goes away. Its home (~/.pi/webui-instances/${rec.instance}) stays on disk.`)) return;
+  const yes = await askDialog({
+    title: `Forget instance ${rec.instance}?`,
+    body: `The record goes away. Its home (~/.pi/webui-instances/${rec.instance}) stays on disk.`,
+    okLabel: 'forget',
+    danger: true,
+  });
+  if (!yes) return;
   try {
     const d = await fetch(api('/api/forget-instance'), {
       method: 'POST',
@@ -554,11 +566,6 @@ function openInstancePage(inst) {
   const me = (SET.agentName || '').trim() || 'this machine';
   const sep = inst.url.includes('?') ? '&' : '?';
   location.href = `${inst.url}${sep}from=${encodeURIComponent(location.origin)}&fromName=${encodeURIComponent(me)}`;
-}
-
-function switchInstance(inst) {
-  if (!inst || inst.url === location.origin) return exitRemoteMode();
-  return enterRemoteMode(inst);
 }
 
 /* An instance opened through the switcher arrives with ?from=… - add it to the

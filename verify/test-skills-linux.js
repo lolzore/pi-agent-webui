@@ -72,6 +72,7 @@ const postJson = (p, body) => new Promise((res, rej) => {
   bridge = spawn(process.execPath, [path.join(ROOT, 'bridge', 'server.js')], {
     env: Object.assign({}, process.env, {
       HOME: homeDir,
+      USERPROFILE: homeDir,
       PI_AGENT_DIR: agentDir,
       PI_CODING_AGENT_DIR: agentDir,
       PI_CODING_AGENT_SESSION_DIR: path.join(scratch, 'sessions'),

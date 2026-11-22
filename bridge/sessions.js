@@ -377,7 +377,7 @@ const breathe = () => new Promise((r) => setImmediate(r));
  * does not report "full" after 16 KB. */
 const WRITE_CHUNK = 256 * 1024;
 function writeStream(res) {
-  const w = { res, buf: [], size: 0, wait: null };
+  const w = { res, buf: [], size: 0 };
   w.add = (s) => { w.buf.push(s); w.size += s.length; };
   w.flush = async () => {
     if (!w.size) return;
@@ -430,16 +430,49 @@ async function mapLimit(items, limit, fn) {
 
 const SCAN_CONCURRENCY = 24;
 
+/* Unchanged session files are not re-read.
+ *
+ * Every scan used to open each of the (up to 200) session files and read a
+ * 64 KB head and a 64 KB tail - up to ~25 MB of I/O per /api/sessions call,
+ * which the sidebar polls every 20 s. A stat is enough to know that the head
+ * and tail of an unchanged file are still what they were. Keyed by path; the
+ * entry is replaced whenever mtime or size moves, so names, parents and sizes
+ * are identical to the uncached scan. */
+const EDGE_CACHE = new Map();
+async function cachedEdges(file, readEdges) {
+  let st;
+  try { st = await fs.promises.stat(file); } catch { return null; }
+  const hit = EDGE_CACHE.get(file);
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.edges;
+  const e = await readEdges(file);
+  if (!e) return null;
+  // What the scan actually had to read; a cache hit adds nothing (issue #251).
+  scanState.lastScanBytes = (scanState.lastScanBytes || 0) + (e.bytesRead || 0);
+  EDGE_CACHE.set(file, { mtimeMs: e.mtimeMs, size: e.size, edges: e });
+  if (EDGE_CACHE.size > 600) EDGE_CACHE.delete(EDGE_CACHE.keys().next().value);
+  return e;
+}
+
 async function scanLocalSessions() {
+  /* A directory that cannot be read must reach scanSessions(), which records
+   * why and returns it as scanError. Swallowing it here made an unreadable
+   * directory look exactly like an account with no sessions (issue #30); the
+   * local catch then also had the lastScanError typo (issue #230).
+   *
+   * A directory that does not exist yet is different: pi creates sessions/ on
+   * its first start, and a bridge can be asked for the list before that has
+   * happened. That is an empty session list, not an error to put in front of
+   * the user. */
   let files;
   try {
     files = await fs.promises.readdir(SESSION_DIR, { recursive: true })
       .then((f) => f.filter((f) => f.endsWith('.jsonl') && !isSubagentTranscript(f)))
       .then((f) => f.map((f) => path.join(SESSION_DIR, f)));
-  } catch {
-    return [];
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return [];
+    throw e;
   }
-  const edges = await mapLimit(files, SCAN_CONCURRENCY, (f) => readSessionEdges(f));
+  const edges = await mapLimit(files, SCAN_CONCURRENCY, (f) => cachedEdges(f, readSessionEdges));
   const sessions = [];
   for (let i = 0; i < files.length; i++) {
     const e = edges[i];
@@ -648,12 +681,13 @@ async function scanSessions() {
     }
   }
   try {
+    scanState.lastScanBytes = 0;
     const found = await scanLocalSessions();
     scanState.lastScanError = null;
     return found;
   } catch (e) {
     scanState.lastScanError = `could not read ${SESSION_DIR}: ${e.message}`;
-    warnScanOnce('local-scan', lastScanError);
+    warnScanOnce('local-scan', scanState.lastScanError);
     return [];
   }
 }

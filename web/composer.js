@@ -126,6 +126,11 @@ async function sendCurrent() {
       resetComposer();
       return;
     }
+    if (name === 'statistics') {
+      openStatistics();
+      resetComposer();
+      return;
+    }
 
     // Built-in pi commands that map to a direct RPC call (e.g. /compact, /new).
     let handled = false;
@@ -173,9 +178,11 @@ async function handleBuiltinCommand(name, arg) {
       if (S.compacting) { toast('Compaction already in progress…', 'warning'); return true; }
       S.compacting = true;
       toast('Compacting session…');
-      setCtxRing(null);
-      resetCtxHighWater();
-      if ($('ctx-label')) $('ctx-label').textContent = ctxLabel('compacting…', '–');
+      if (!S.viewSession) {
+        setCtxRing(null);
+        resetCtxHighWater();
+        if ($('ctx-label')) $('ctx-label').textContent = ctxLabel('compacting…', '–');
+      }
       // Compaction makes an LLM call and can take minutes — the old 120s RPC
       // timeout fired first and reported a false failure while the agent kept
       // compacting. Don't block on the response; track progress via the
@@ -191,6 +198,7 @@ async function handleBuiltinCommand(name, arg) {
       return true;
     }
     case 'new': {
+      if (S.compacting) { toast('Compaction in progress — wait for it to finish before starting a new session', 'warning'); return true; }
       try { await rpc({ type: 'new_session' }); await applyDefaultModel(); await initSession(false); }
       catch (e) { toast(`New session failed: ${e.message}`, 'error'); }
       return true;
@@ -219,6 +227,7 @@ async function handleBuiltinCommand(name, arg) {
       return true;
     }
     case 'clone': {
+      if (S.compacting) { toast('Compaction in progress — wait for it to finish before cloning', 'warning'); return true; }
       try { await rpc({ type: 'clone' }); await refreshSessions(true); }
       catch (e) { toast(`Clone failed: ${e.message}`, 'error'); }
       return true;
@@ -245,7 +254,7 @@ async function handleBuiltinCommand(name, arg) {
         const cu = d && d.contextUsage;
         const toks = cu && cu.tokens != null ? `${Math.round(cu.tokens)}/${Math.round(cu.contextWindow)}` : '–';
         const cost = d && d.cost && d.cost.total != null ? `$${Number(d.cost.total).toFixed(3)}` : '–';
-        toast(`Session: ${S.sessionName || '(unnamed)'} · context ${toks} · cost ${cost}`);
+        toast(`Session: ${(S.state && S.state.sessionName) || '(unnamed)'} · context ${toks} · cost ${cost}`);
       } catch { /* ignore */ }
       return true;
     }
@@ -351,7 +360,7 @@ async function sendBash(command) {
   try {
     S.bashCards.set(id, { body: out });
     noteTerminalStart({ id, command, session: S.state && S.state.sessionName });
-    const d = await rpc({ type: 'bash', command, id });
+    const d = await rpc({ type: 'bash', command }, 120000, id);
     out.textContent = `$ ${command}\n${(d && d.output) || '(no output)'}`;
     if (d && d.exitCode) toast(`Command exited with code ${d.exitCode}`, 'warning');
   } catch (e) {

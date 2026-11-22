@@ -171,6 +171,33 @@ const getJson = (p) => new Promise((res, rej) => {
   if (!(leak.mine >= 1)) fail('a compaction belonging to this session was not drawn at all');
   ok('#40 a foreign marker is not drawn, and this session\'s own still is');
 
+  // ── a late compaction_end from another session is not drawn here ───────────
+  /* #40 covered a mark already in the page's list. The other way in is a live
+   * event: the agent compacts A, the reader moves to B, and A's compaction_end
+   * arrives afterwards. It used to append its marker to whatever was on screen,
+   * which then vanished on reload because only the page's memory had it. */
+  const late = await json(`(() => {
+    S.viewSession = null;
+    S.state.sessionFile = 'C:/sessions/B.jsonl';
+    S.compactionSession = 'C:/sessions/A.jsonl';
+    S.compacting = true;
+    S.compactionMarks.length = 0;
+    for (const n of [...document.querySelectorAll('.msg.compaction')]) n.remove();
+    handleRpcMessage({ type: 'compaction_end', reason: 'manual', aborted: false, willRetry: false,
+      result: { summary: 'LATE-FROM-A', tokensBefore: 7000, estimatedTokensAfter: 1200 } });
+    const drawn = [...document.querySelectorAll('.msg.compaction')]
+      .some((n) => /LATE-FROM-A/.test(n.textContent || ''));
+    const mark = S.compactionMarks[S.compactionMarks.length - 1] || {};
+    S.compactionSession = null;
+    S.compacting = false;
+    S.compactionMarks.length = 0;
+    return { drawn, session: mark.session || '' };
+  })()`);
+  console.log('  late compaction from A while B is shown: drawn=' + late.drawn + ', tagged ' + JSON.stringify(late.session));
+  if (late.drawn) fail('a late compaction from another session was drawn into the current transcript');
+  if (!/A\.jsonl$/.test(late.session)) fail('the late compaction was not tagged with the session it happened in: ' + JSON.stringify(late.session));
+  ok('a late compaction from another session is recorded, not drawn');
+
   // ── #47 the two facts pi never writes down survive a reload ────────────────
   const facts = await json(`(() => {
     const bigSummary = 'S'.repeat(30000);

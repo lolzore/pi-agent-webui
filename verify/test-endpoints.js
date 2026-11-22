@@ -4,6 +4,7 @@
 // Usage: node test-endpoints.js <baseUrl> <sessionPath>
 
 const http = require('http');
+const fs = require('fs');
 const { URL } = require('url');
 
 const base = process.argv[2];
@@ -19,6 +20,24 @@ function get(pathAndQuery) {
       res.on('data', (c) => { body += c; });
       res.on('end', () => resolve({ status: res.statusCode, body, type: res.headers['content-type'] || '' }));
     }).on('error', reject);
+  });
+}
+
+function post(pathAndQuery, body) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(pathAndQuery, base);
+    const req = http.request({
+      hostname: u.hostname, port: u.port, path: u.pathname + u.search, method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    }, (res) => {
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => { text += c; });
+      res.on('end', () => resolve({ status: res.statusCode, body: text }));
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
   });
 }
 
@@ -82,6 +101,20 @@ function get(pathAndQuery) {
   if (JSON.parse(lines[0]).type !== 'session') {
     fail(`/api/session-file starts with "${JSON.parse(lines[0]).type}", not the session header`);
   }
+
+  /* /api/ensure-dir may only recreate the working directory recorded in the
+   * session that is being opened. Anything else is refused and not created.
+   * (The generated fixture has no cwd; the refusal is the security half and is
+   * checked either way.) */
+  const header = JSON.parse(lines[0]);
+  if (header.cwd) {
+    const allowed = await post('/api/ensure-dir', JSON.stringify({ path: header.cwd, session: sessionPath }));
+    if (allowed.status !== 200) fail(`ensure-dir for the recorded cwd returned ${allowed.status}`);
+  }
+  const evil = `/tmp/pi-verify-not-a-session-dir-${process.pid}`;
+  const refused = await post('/api/ensure-dir', JSON.stringify({ path: evil, session: sessionPath }));
+  if (refused.status !== 400) fail(`ensure-dir for an unrelated path returned ${refused.status}, expected 400`);
+  if (fs.existsSync(evil)) fail('ensure-dir created a directory that no session records');
 
   // Traversal must stay refused.
   const trav = await get(`/api/session-file?path=${encodeURIComponent('../../../../etc/passwd')}`);

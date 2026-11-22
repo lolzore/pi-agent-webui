@@ -18,6 +18,7 @@ module.exports = function llamaRoutes(deps) {
     llamaServerIdentity,
     path,
     readLlamaServerUrl,
+    writeJsonAtomic,
   } = deps;
 
   function match(req) {
@@ -133,7 +134,7 @@ module.exports = function llamaRoutes(deps) {
             servers: clean.map((url) => ({ url })),
           });
           fs.mkdirSync(path.dirname(PI_SETTINGS_FILE), { recursive: true });
-          fs.writeFileSync(PI_SETTINGS_FILE, JSON.stringify(settings, null, 2));
+          writeJsonAtomic(PI_SETTINGS_FILE, settings);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, previous, urls: clean, format: 'semicolon-separated llamaServerUrl' }));
         } catch (e) {

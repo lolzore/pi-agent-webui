@@ -8,6 +8,21 @@
  */
 'use strict';
 
+/* The short name of the extension a pi event came from. pi reports a path for
+ * an installed extension, "builtin:name" for its own, and "<boundary>" for the
+ * turn/compaction boundary itself; the page used to drop all of it (issue #215). */
+function extensionName(p) {
+  const raw = String(p || '');
+  if (!raw) return '';
+  if (raw === '<boundary>') return 'pi';
+  if (raw.startsWith('builtin:')) return raw.slice('builtin:'.length);
+  const parts = raw.split(/[\\/]/);
+  return parts[parts.length - 1] || raw;
+}
+
+/* Last time each extension error text was shown (issue #215). */
+const EXT_ERROR_SEEN = new Map();
+
 function handleRpcMessage(msg) {
   if (msg.type === 'response') {
     const p = S.pending.get(msg.id);
@@ -44,11 +59,13 @@ function handleEvent(msg) {
         const input = $('session-name');
         input.value = name;
         input.title = `${name} — click to rename`;
+        updateDocumentTitle();
       }
       refreshSessions(true).catch(() => {});
       break;
     }
     case 'agent_start':
+      if (typeof petSetState === 'function') petSetState('loading');
       S.ctxTurnPeak = 0;
       S.isStreaming = true;
       S.turnEnded = false;
@@ -82,12 +99,12 @@ function handleEvent(msg) {
       refreshSessions().catch(() => {});
       break;
     case 'agent_settled':
-      if (msg.type === 'agent_settled') {
         clearRetryBar();   // a retry that ended in a settle leaves no bar behind
         // Only a turn that was actually running gets the chime - agent_settled
         // also arrives for bookkeeping with nothing to report.
         if (S.isStreaming) notifyTurnDone();
         S.isStreaming = false;
+        if (typeof petSetState === 'function') petSetState('done');
         autoCloseShortsIfOurs();
         // The turn total is stamped after the transcript has been finalised
         // below: stamping it here put the number into a bubble that finalizeLive()
@@ -121,7 +138,6 @@ function handleEvent(msg) {
         S.compactionNeedsContinue = false;
         if (autoContinues) maybeAutoContinue();
         if (!autoContinues) finishRunClock(lastAssistantTs());
-      }
       updateStreamUi();
       // "Now that the transcript is settled…" used to follow here, wrapped in
       // `if (msg.type === 'agent_end')` - dead, because this arm only ever sees
@@ -153,7 +169,11 @@ function handleEvent(msg) {
        * shell for it drew an empty assistant message that the matching
        * message_end then had to tear down - and that teardown was the rebuild
        * that lost the message you had just sent (issue #1). */
-      if (!msg.message || msg.message.role === 'assistant') { startLive(); S.turnEnded = false; }
+      if (!msg.message || msg.message.role === 'assistant') {
+        startLive();
+        if (typeof petSetState === 'function') petSetState('inferring');
+        S.turnEnded = false;
+      }
       break;
     case 'message_update':
       if (msg.usage && S.live) S.live.lastUsage = msg.usage;
@@ -177,6 +197,7 @@ function handleEvent(msg) {
       finalizeLive();
       break;
     case 'tool_execution_start':
+      if (typeof petNoteTool === 'function') petNoteTool(msg.toolName);
       startToolCard(msg);
       if (String(msg.toolName || '') === 'bash') {
         noteTerminalStart({
@@ -238,6 +259,7 @@ function handleEvent(msg) {
       break;
     }
     case 'tool_execution_end': {
+      if (typeof petSetState === 'function') petSetState('inferring');
       if (String(msg.toolName || '') === 'bash') noteTerminalEnd(msg.toolCallId);
       if (SUBAGENT_TOOLS.has(String(msg.toolName || ''))) {
         const det = (msg.result && msg.result.details) || msg.details || {};
@@ -270,9 +292,24 @@ function handleEvent(msg) {
       S.queue = { steering: msg.steering || [], followUp: msg.followUp || [] };
       renderQueue();
       break;
-    case 'extension_error':
-      toast(`Extension error: ${msg.error}`, 'error');
+    case 'extension_error': {
+      /* pi reports one error per extension handler, so a single wedged turn
+       * produced five toasts saying the same thing - and it does it again on the
+       * next turn (issue #215). Show the error and who raised it once; a repeat
+       * of the same text inside the window is the same problem, not new news. */
+      const sig = String(msg.error || '');
+      const now = Date.now();
+      const last = EXT_ERROR_SEEN.get(sig);
+      if (last !== undefined && now - last < 20000) break;
+      EXT_ERROR_SEEN.set(sig, now);
+      if (EXT_ERROR_SEEN.size > 30) {
+        for (const [k, t] of EXT_ERROR_SEEN) if (now - t > 20000) EXT_ERROR_SEEN.delete(k);
+        if (EXT_ERROR_SEEN.size > 30) EXT_ERROR_SEEN.clear();
+      }
+      const who = extensionName(msg.extensionPath);
+      toast(`Extension error${who ? ` (${who})` : ''}: ${sig}`, 'error');
       break;
+    }
     case 'auto_retry_start':
       /* A retry is a state, not a notice: the toast it used to be was gone in
        * seconds while pi kept retrying (issue #83). The bar stays until the
@@ -285,15 +322,24 @@ function handleEvent(msg) {
       break;
     case 'compaction_start':
       S.compacting = true;
+      // Pin the marker to the session the compaction started in. If the user
+      // browses another session while it runs, S.state.sessionFile can move on
+      // before compaction_end arrives; using the current path then tagged the
+      // result to the wrong session and it vanished on the way back.
+      S.compactionSession = (S.state && S.state.sessionFile) || null;
       toast('Compacting session…');
-      // The pre-compaction token count is now stale; show a dash until the
-      // next LLM response reports a real post-compaction context size.
-      setCtxRing(null);
-      // ...and drop the high-water marks with it, or the peak from before the
-      // compaction outlives the context it measured and clamps the next number
-      // back up to itself (issue #48).
-      resetCtxHighWater();
-      if ($('ctx-label')) $('ctx-label').textContent = ctxLabel('compacting…', '–');
+      /* A compaction in the agent's session says nothing about the read-only
+       * session on screen, so it must not blank that session's counter. */
+      if (!S.viewSession) {
+        // The pre-compaction token count is now stale; show a dash until the
+        // next LLM response reports a real post-compaction context size.
+        setCtxRing(null);
+        // ...and drop the high-water marks with it, or the peak from before the
+        // compaction outlives the context it measured and clamps the next number
+        // back up to itself (issue #48).
+        resetCtxHighWater();
+        if ($('ctx-label')) $('ctx-label').textContent = ctxLabel('compacting…', '–');
+      }
       // Live "compacting…" block with an elapsed timer, removed on compaction_end.
       if (!S.compactionLive) S.compactionLive = renderCompactionLive();
       break;
@@ -305,6 +351,19 @@ function handleEvent(msg) {
       let before = null;
       let after = null;
       S.compacting = false;
+      const compactSession = S.compactionSession || markSessionPath();
+      /* A late compaction_end may belong to the session the reader has just
+       * left. Its mark is still recorded against compactSession (so it is
+       * there when that session is opened again), but it must not be drawn into
+       * the transcript that is on screen now - that is how a compaction from a
+       * previous chat appeared in the current one until a reload cleared the
+       * page's memory. */
+      const shownSession = S.viewSession || markSessionPath();
+      const forShown = !compactSession || !shownSession
+        || sameSessionPath(compactSession, shownSession, S.sessionsList || []);
+      // Its result is due when the reader goes back to that session; remember
+      // that it happened out of sight rather than pinning any old mark later.
+      if (!forShown) S.compactionAway = true;
       if (msg.aborted) {
         removeCompactionLive();
         clearCompactLabelSoon();
@@ -321,15 +380,15 @@ function handleEvent(msg) {
         // Remember it so refreshMessages() can put the marker back where it
         // happened instead of re-appending it to the bottom every turn.
         if (!S.compactionMarks.some((k) => k.summary === msg.result.summary)) {
-          const mark = { ...msg.result, reason: msg.reason || null, at: Date.now(), session: markSessionPath() };
+          const mark = { ...msg.result, reason: msg.reason || null, at: Date.now(), session: compactSession };
           S.compactionMarks.push(mark);
           // estimatedTokensAfter and reason exist only on this event. pi computes
           // them at the moment it compacts and writes neither to the session file,
           // so they are kept aside for the reload (issue #47).
           saveCompactionFact(mark.session, mark);
         }
-        renderCompactionBlock(msg.result, msg.reason);
-        S.compactionHappened = true;
+        if (forShown) renderCompactionBlock(msg.result, msg.reason);
+        if (forShown) S.compactionHappened = true;
         // willRetry=true (overflow) → pi retries the prompt itself. A manual
         // /compact never auto-continues (the user asked for it, task was done).
         // Only auto-compactions (threshold/overflow without retry) need a nudge.
@@ -361,17 +420,18 @@ function handleEvent(msg) {
          * never happened, while the context (correctly) stayed the same
          * (issue #137). The mark lets a rebuild put it back. */
         const why = msg.reason || 'manual';
-        if (!S.compactionMarks.some((k) => k.noop && k.reason === why && k.session === markSessionPath())) {
-          S.compactionMarks.push({ noop: true, reason: why, at: Date.now(), session: markSessionPath() });
+        if (!S.compactionMarks.some((k) => k.noop && k.reason === why && k.session === compactSession)) {
+          S.compactionMarks.push({ noop: true, reason: why, at: Date.now(), session: compactSession });
         }
-        renderCompactionNoop(why);
+        if (forShown) renderCompactionNoop(why);
         toast('Compaction finished - pi reported no summary; the context was left as it was');
       }
       // Context is unknown to pi right after compaction (it reports tokens:null
       // until the next response), which left the ring showing a dash until the
       // session was switched. Show the estimated size the compaction itself
       // reported, then keep asking until pi has a real number.
-      if (after != null) showCompactionEstimate(after);
+      if (after != null && forShown && !S.viewSession) showCompactionEstimate(after);
+      S.compactionSession = null;
       clearCompactLabelSoon();
       refreshStats().catch(() => {});
       scheduleStatsRetry();
@@ -385,11 +445,13 @@ function handleEvent(msg) {
 
 function startLive() {
   const { root, tools, bubble } = makeMsgShell('assistant streaming', '…');
-  addCopyButton(tools, () => S.live ? S.live.text : '');
-  addSpeakButton(tools, () => stripMarkdown(S.live ? S.live.text : ''));
+  // The final shell keeps the live text in place, so the copy/speak callbacks
+  // must outlive S.live (see finalizeLiveInPlace).
+  addCopyButton(tools, () => (S.live ? S.live.text : (root._finalText || '')));
+  addSpeakButton(tools, () => stripMarkdown(S.live ? S.live.text : (root._finalText || '')));
   // Copy/speak only make sense once the message is final — keep the buttons
-  // hidden while streaming. finalizeLive() replaces this shell with the
-  // rendered message, where they are visible again.
+  // hidden while streaming. finalizeLive() reveals them in place, or replaces
+  // this shell with the rendered message when that is safer.
   tools.classList.add('pending');
   const md = el('div', 'md');
   bubble.appendChild(md);
@@ -450,7 +512,7 @@ function applyDelta(ev) {
     if (c) {
       S.outputSeq++;
       c._rawArgs = (c._rawArgs || '') + (ev.delta || ev.argumentsDelta || ev.partial || ev.partialArgs || '');
-      const named = toolNameFromJson(c._rawArgs);
+      const named = toolNameFromJson(c._rawArgs) || inferToolName(c._rawArgs);
       if (named && named !== c.toolName) {
         c.toolName = named;
         c.card.querySelector('.tool-name').textContent = named;
@@ -476,7 +538,7 @@ function applyDelta(ev) {
       existing.card.querySelector('.tool-name').textContent = ev.toolCall.name;
       noteToolTimeout(existing, ev.toolCall.arguments);
       if (existing._running && existing._timeoutMs) restartCardTimer(existing);
-      fillToolBody(existing, ev.toolCall.name, ev.toolCall.arguments);
+      fillToolBody(existing, ev.toolCall.arguments);
       // Re-key to the real tool-call id so the tool_execution_* events (which
       // are keyed by it) find this card.
       if (existing._contentIndex != null) L.toolByIndex.delete(existing._contentIndex);
@@ -484,7 +546,7 @@ function applyDelta(ev) {
       S.toolCards.set(ev.toolCall.id, existing);
     } else {
       const card = makeToolCard(ev.toolCall.name, { toolCallId: ev.toolCall.id });
-      fillToolBody(card, ev.toolCall.name, ev.toolCall.arguments);
+      fillToolBody(card, ev.toolCall.arguments);
       L.root.querySelector('.bubble').appendChild(card.card);
       S.toolCards.set(ev.toolCall.id, card);
     }
@@ -497,6 +559,20 @@ function applyDelta(ev) {
 function toolNameFromJson(raw) {
   const m = /"(?:name|tool|toolName|tool_name)"\s*:\s*"([A-Za-z0-9_.-]{1,40})"/.exec(raw || '');
   return m ? m[1] : null;
+}
+
+/* Some providers stream only the arguments, not the tool name. The shape of the
+ * first keys is enough to label the card correctly while it is still being
+ * written - edit arguments start with `edits`, a write with `content`, a bash
+ * call with `command`. Without this an edit card was labelled `tool` and its
+ * edit preview branch never ran, so it showed the raw `{"edits":` prefix for
+ * the whole call (issue #223). */
+function inferToolName(raw) {
+  const text = String(raw || '');
+  if (/"(?:edits|oldText|old_string)"\s*:/.test(text)) return 'edit';
+  if (/"(?:content)"\s*:/.test(text)) return 'write';
+  if (/"(?:command|cmd)"\s*:/.test(text)) return 'bash';
+  return null;
 }
 
 /* Live preview while a tool call's arguments stream in: for write-like tools
@@ -536,11 +612,40 @@ function unescapeJsonText(s) {
   });
 }
 
+/* Pull one string field out of a JSON document that is still being written.
+ * Regex rather than JSON.parse: a streamed argument is incomplete on almost
+ * every delta, so parsing would fail exactly when the preview matters. */
+function partialJsonString(raw, key) {
+  const re = new RegExp(`"${key}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)`);
+  const m = re.exec(String(raw || ''));
+  return m ? unescapeJsonText(m[1]) : '';
+}
+
 function liveToolPreview(name, raw) {
   const text = String(raw || '');
+  if (/edit/i.test(name || '')) {
+    // The old preview looked for a `content` field, which an edit call does not
+    // have. It therefore showed the raw `{"edits": …` prefix for the whole
+    // call (issue #223). Name the file and show the change being written.
+    const file = partialJsonString(text, 'path') || partialJsonString(text, 'filePath') || partialJsonString(text, 'file_path');
+    const oldText = partialJsonString(text, 'oldText') || partialJsonString(text, 'old_string') || partialJsonString(text, 'old');
+    const newText = partialJsonString(text, 'newText') || partialJsonString(text, 'new_string') || partialJsonString(text, 'new');
+    const count = (text.match(/"(?:oldText|old_string)"\s*:/g) || []).length;
+    let out = file ? `editing ${file}` : 'preparing edit…';
+    if (count) out += ` · ${count} edit${count === 1 ? '' : 's'}`;
+    if (oldText || newText) {
+      const clip = (v) => {
+        const line = String(v).split('\n')[0];
+        return line.length > 100 ? line.slice(0, 100) + '…' : line;
+      };
+      if (oldText) out += `\n− ${clip(oldText)}`;
+      if (newText) out += `\n+ ${clip(newText)}`;
+    }
+    return out;
+  }
   // Prefer the field a person is watching for this tool over the JSON around
   // it: the file being written, or the command being run.
-  const field = /write|edit/i.test(name || '') ? 'content'
+  const field = /write/i.test(name || '') ? 'content'
     : /bash/i.test(name || '') ? 'command'
       : null;
   let body = text;
@@ -707,6 +812,67 @@ function liveExtraTokens() {
   return Math.round(chars * ratio);
 }
 
+function liveFinalText(msg) {
+  return (msg.content || []).filter((b) => b && b.type === 'text').map((b) => b.text || '').join('');
+}
+
+function canFinalizeLiveInPlace(L, finalMsg) {
+  if (!finalMsg || finalMsg.role !== 'assistant') return false;
+  if (finalMsg.errorMessage || finalMsg.stopReason === 'error') return false;
+  if ((finalMsg.content || []).some((b) => b && b.type === 'toolCall')) return false;
+  const text = liveFinalText(finalMsg);
+  // The live text is the concatenation of the streamed deltas. A provider that
+  // sends a different final copy needs the normal renderer, not a guess.
+  return text.length > 0 && text === L.text;
+}
+
+/* Finish the live shell without moving or replacing it.
+ *
+ * The streaming view is already showing the complete text (paintLive just ran).
+ * Only the chrome changes: the timestamp replaces the bobbing dots, the usage
+ * figures settle, and the copy/speak buttons become visible. The message keeps
+ * its identity and vertical position, so the final frame does not reflow the
+ * conversation (issue #199). */
+function finalizeLiveInPlace(finalMsg, elapsedSec, prefillSec) {
+  const L = S.live;
+  const root = L.root;
+  const usage = finalMsg.usage || L.lastUsage;
+  const timed = usage && !finalMsg.usage ? { ...finalMsg, usage } : finalMsg;
+  const timing = { elapsedSec, prefillSec };
+  if (!usage) timing.est = estWriteTokens(L);
+  rememberTiming(timed, timing);
+  if (usage) {
+    S.totals.read += (usage.input || 0) + (usage.cacheRead || 0) + (usage.cacheWrite || 0);
+    S.totals.write += usage.output || 0;
+    noteTokenRatio(usage, messageChars(finalMsg));
+  }
+  const text = liveFinalText(finalMsg);
+  root._finalText = text;
+  root._msg = finalMsg;
+  root.classList.remove('streaming');
+  const who = root.querySelector('.who-text');
+  if (who) who.textContent = ` · ${timeStr(finalMsg.timestamp)}`;
+  const dots = root.querySelector('.streaming-dots');
+  if (dots) dots.remove();
+  const caret = root.querySelector('.streaming-caret');
+  if (caret) caret.remove();
+  const tools = root.querySelector('.msg-tools');
+  if (tools) tools.classList.remove('pending');
+  const stats = usageStats(usage, elapsedSec, prefillSec) || (usage ? null : estStatsText(estWriteTokens(L), elapsedSec));
+  L.statsEl.textContent = stats ? ` (${stats})` : '';
+  L.statsEl.title = (usage
+    ? 'token usage: input+cache read / output written'
+    : 'estimated token usage - this provider did not report any') +
+    (elapsedSec ? ` over ${Math.round(elapsedSec)}s of streaming` : '');
+  S.live = null;
+  // This turn is now in the DOM and correct; turn_end must not re-read the file.
+  S.turnFinalised = true;
+  maybeCelebrate(finalMsg);
+  updateTotals();
+  if (S.autoTts && text.trim()) speak(stripMarkdown(text));
+  scrollBottom();
+}
+
 function finalizeLive(finalMsg) {
   if (S.live) {
     S.outputSeq++;   // one assistant message finished producing something
@@ -719,6 +885,22 @@ function finalizeLive(finalMsg) {
     if (L.stopTurnTimer) L.stopTurnTimer();
     const elapsedSec = (Date.now() - L.startTs) / 1000;
     const prefillSec = L.firstDeltaTs ? (L.firstDeltaTs - L.startTs) / 1000 : null;
+    /* Keep the streaming row where it is when the final message is the same
+     * simple text that was just painted.
+     *
+     * The old path removed the live shell and rendered a new one at the end of
+     * the transcript. The text was identical, but the replacement was a full
+     * markdown render: the live view is split into stable/tail pieces and the
+     * final one is not, so lists and other blocks could change height, and the
+     * row was detached and re-attached in between. That is the "final output
+     * formats itself from up to down" flash (issue #199). Messages with tool
+     * calls or a provider error still take the full render because their block
+     * order and error chrome are not in the live shell. */
+    if (!S.liveDetached && canFinalizeLiveInPlace(L, finalMsg)) {
+      finalizeLiveInPlace(finalMsg, elapsedSec, prefillSec);
+      updateStreamUi();
+      return;
+    }
     /* What sits after the live row. A message the user sent while this one was
      * streaming (a steer) is drawn below it, and the session file keeps that
      * order: the assistant message, then the steer, then whatever the assistant
@@ -798,9 +980,9 @@ function startToolCard(msg) {
   card.toolName = msg.toolName || msg.name || '';
   card._rawArgs = '';
   noteToolTimeout(card, msg.args);
-  fillToolBody(card, card.toolName, msg.args);
+  fillToolBody(card, msg.args);
   startCardTimer(card);
-  const parent = S.live ? S.live.root.querySelector('.bubble') : chat;
+  const parent = S.live ? S.live.root.querySelector('.bubble') : transcriptHost();
   parent.appendChild(card.card);
   S.toolCards.set(msg.toolCallId, card);
   scrollBottom();
@@ -811,6 +993,7 @@ function startToolCard(msg) {
 /* The ring right after a compaction: pi has no number yet, so show the estimate
  * the compaction reported instead of a dash. */
 function showCompactionEstimate(tokens) {
+  if (S.viewSession) return;
   /* The window has to come from S.ctxWindow, and that is half of this fix.
    *
    * Every way into a compaction calls setCtxRing(null) first - compaction_start,
@@ -1020,6 +1203,12 @@ const barHideTimers = new Map();
 
 function setBarContent(bar, text) {
   if (!bar) return;
+  /* Issue #205: a bar whose entire content is a single digit (or a bare `|`)
+   * is not a status - it is a fragment of a count whose label did not arrive,
+   * and on screen it reads as a stray "1" floating above the composer. Drop
+   * that content; a real status ("1 running", "ready") is untouched. */
+  const whole = String(text == null ? '' : text).trim();
+  if (/^[0-9|]$/.test(whole)) text = '';
   const key = bar.id || 'bar';
   const pending = barHideTimers.get(key);
   if (pending) { clearTimeout(pending); barHideTimers.delete(key); }
@@ -1036,10 +1225,15 @@ function setBarContent(bar, text) {
   }
   barHideTimers.set(key, setTimeout(() => {
     barHideTimers.delete(key);
-    // Only if nothing arrived in the meantime (an extension can re-set it).
-    if (!String(bar.textContent || '').trim()) {
-      bar.textContent = '';
-      bar.classList.add('hidden');
-    }
+    // Any content that arrives clears this timer, so reaching here means the
+    // bar really stayed empty. Do not re-test bar.textContent: the old text is
+    // still in the element (we keep it during the grace period), and that made
+    // an emptied widget/status bar stay visible for ever with a stale line.
+    bar.textContent = '';
+    bar.classList.add('hidden');
+    // Release the space once the bar has really stayed empty. Keeping it for
+    // the whole run was what left the MCP status row floating under a blank
+    // widget box after a steering message or an image send.
+    delete bar.dataset.hadContent;
   }, BAR_HIDE_MS));
 }

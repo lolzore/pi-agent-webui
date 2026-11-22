@@ -17,6 +17,7 @@ A single `pi --mode rpc` subprocess is shared by every connected client; every p
 |---|---|
 | **Command use** | `/` opens a slash-command menu built from pi's `get_commands` (extension commands, prompt templates, `skill:` commands) **plus every pi built-in command** (`/compact`, `/new`, `/model`, `/thinking`, `/copy`, …) auto-loaded from the installed pi package — so new commands pi adds in future releases appear automatically. Built-ins with a direct RPC (`/compact`, `/new`, `/name`, `/model`, `/thinking`, `/clone`, `/copy`, `/session`) run natively in the WebUI; the rest are sent to the agent. Skills are listed under their plain name (`/pdf-tools`, not `/skill:pdf-tools`) and tab-completion inserts that — the `skill:` prefix pi registers is put back only on the way out, so what you send still reaches the right command. Shell access: type `!ls -la` to run a bash command in the container via pi's `bash` RPC (output streams live). |
 | **Stop generation** | A **Stop** button appears next to the (always visible) Send button while the agent is generating — click it to abort the current turn. Esc also clears the queue and aborts. |
+| **A running command stays running across a reload** | pi writes the assistant message with its tool calls *before* the tool runs, and the tool result only when it ends. A page reloaded during a long bash command therefore rebuilt its card from the session file with no result to match it, and drew it as **done**, with no timer — a command that takes minutes looked finished for the whole time it kept running (issue #279). A tool call in the newest assistant message that has no result is now drawn as **running** while the agent streams, with the timer continuing from the message's timestamp rather than restarting at 0, and as **interrupted** (red) once the run is over instead of claiming it finished. When the result arrives the card turns green and carries the real duration. |
 | **Live context ring** | The context ring in the top bar shows the % used and a `[used/max]ctx` label (e.g. `[54000/131072ctx]`). It updates **live while the agent is streaming** (polled every second) and on session switch — not just when you switch sessions and back. |
 | **How long did that take** | The indicator at the bottom counts the **whole task**: it starts when you send a message and stops at the agent's last word, with thinking, tool calls, every turn and any compaction in between included — not a per-turn stopwatch that resets to zero while you watch. It is kept per session in the browser, so a reload keeps counting if the agent is still working, comes back as the frozen number if it finished, and is dropped if there is no honest boundary to measure from. Only sending a message starts a new one; the automatic continue after a compaction is the same task. Each assistant message still carries its own *turn took …* line. |
 | **A steady picture** | The bottom strip and the message headers are laid out so that nothing moves except the text you are waiting for. An extension's widget or status appearing, changing line count or being cleared for a frame no longer resizes the composer area (a bar that goes empty keeps its place for a moment, and it has a fixed height while it is up), the scrollbar never changes the text width (`scrollbar-gutter`), and the numbers that grow as you watch — tokens, t/s, the task total — use fixed-width digits and enough reserved room that the row cannot rewrap. The **context readout** gets the same treatment: the stats row has one fixed height, the ring is a fixed-size block rather than a baseline-aligned inline `<svg>`, and `[573.9K/1.0Mctx]` has a reserved width, so the digits ticking over while the agent works no longer nudges the ring, the label or the model and thinking pills. The **edit strip and the attachment thumbnails are deliberately *not* reserved** — they only appear because you just did something, and reserving them left a permanent invisible gap of ~100px between the status bar and the composer, with the MCP status line floating at the top of it.  The **composer has one border and no slab behind it**: the strip itself has no border and no background, so the `+`, the message box and the send button are three separate outlined boxes — the only thing that grows upward as the draft gets longer is the message box. (It had a border *and* a 2 px focus ring *around the input inside it* — two or three concentric outlines, with the `+` in a box inside a box.)|
@@ -49,6 +50,7 @@ A single `pi --mode rpc` subprocess is shared by every connected client; every p
 | **Switching sessions** | Sidebar lists all sessions found in the pi session dir (from `/api/sessions`); click to `switch_session`, filter box, ⟳ refresh, `+ New` starts a new session, click the title bar name to rename (`set_session_name`). |
 | **Voice to text** | 🎙 button uses the browser's own speech recognition by default (Chrome/Edge; `localhost` is a secure context, so no HTTPS needed) — nothing to download. A local whisper.cpp server is the opt-in alternative: pick a model (Tiny 75 MB / Base 142 MB / Small 466 MB / Large v3 multilingual 3.1 GB, each with a note on speed vs accuracy; the list is fetched even while browser voice is selected, so the choice is there when you switch) and clicking the mic starts it automatically with the selected model — first use downloads it, *download & start* in settings does it up front. The download is verified: the binary zip and every model are checked against their published SHA-256 for a pinned revision, and a file that does not match is deleted rather than run. If it cannot start, browser voice takes over. Speech fills the composer — review, then send manually, or enable **auto-send** (settings ⚙ or `/autosend`) for hands-free sending. |
 | **TTS for agent output** | `TTS` toggle in the header (or `/tts`) auto-speaks every assistant reply; every assistant message also has a 🔊 button. Voices can be the browser's own (`speechSynthesis`, pick the Windows voice and rate in settings ⚙ with a test button), a local endpoint, or a **cloud voice** — fish-audio or any OpenAI-compatible `/v1/audio/speech` server. Cloud speech goes through the bridge (`POST /api/tts`), so there is no CORS to fight and the API key stays in the bridge's settings instead of the page. Esc stops playback. |
+| **Fun: desk pet** | Settings → **Fun** holds the gamer theme and party confetti, plus an opt-in **DeepSeek desk pet** inspired by [deepseek-harness-pets](https://github.com/orxz/deepseek-harness-pets). Search the [Petdex](https://petdex.dev) gallery, download a sprite, then pick it under **Pet skin**; the library is stored beside the agent so it survives reloads and is shared by instances. The pet floats outside the transcript, follows loading/inferring/scoring/done/error states, reacts when clicked, can be dragged anywhere, and remembers its corner per browser. Frames are drawn as whole 192×208 cells at their native size and the layer is zoomed to the chosen pet size, instead of scaling the whole sheet: scaling resampled the atlas, and at a fractional size the sampler could reach across a cell boundary and show a sliver of the next sprite for some frames (issue #278 — a hat tip or a braid beside the pet). Width-only sizing also keeps the 9-row classic and 11-row v2 sheets on their true rows rather than squashing them. |
 | **Agent identity** | Rename the agent and give it a profile image in settings ⚙ — both show next to its messages, and the image also sits top-left in the sidebar. There is no built-in placeholder: with no image set, only the name shows, and **clear** removes it everywhere. The image can be a still, a GIF or a video, and either can be **cropped by hand** (settings → crop…: the whole picture is shown with the crop frame over it, so you can see what you are cutting off — drag to move, scroll or the slider to zoom, and the dimmed area is what goes away). Its size is adjustable too. A **video** picture animates in the sidebar and in the transcript, kept on one shared frame so a group of them does not drift apart. **Animated avatars** (Settings → General) says how far back, and the slider runs **none of them** → 1 … 8 → **all of them** — the last with no hidden ceiling behind it, the numbers a limit for a transcript with more messages than the machine wants decoders for. Either way the whole group pauses while the tab is in the background, and older messages fall back to a still frame captured from the clip once. |
 | **The running-session dot** | The green pulsing dot next to a session in the sidebar is a fixed-size flex item with room for its halo, so a long session name cannot squeeze it into a sliver — which is what made the dot and the fold arrow look squished together. |
 | **Readable over anything** | Chat text is outlined (a 1px shadow around every glyph) so it stays legible when the panels are translucent and a background image or video shows through — the outline colour comes from settings, and it can be switched off. **Chatbox transparency** fades the composer, sidebar, message bubbles, tool cards, bash/system output, code blocks and the model/thinking controls together, with a real backdrop blur behind them, and **background transparency** fades the image/GIF/video on its own (a bright photo is often too much at full strength even with the panels clear). Backgrounds get the same manual crop as the profile image and are exempt from the attachment size limit (a background is only ever shown, never sent to the model), and a background **video's audio** can be played with its own volume — the browser only allows sound after you have clicked the page once, so it starts on the first click. |
@@ -69,7 +71,7 @@ A single `pi --mode rpc` subprocess is shared by every connected client; every p
 | **Mobile and narrow windows** | Under 760px the sidebar becomes a drawer over the chat (☰ opens it, tapping the conversation closes it), the topbar wraps instead of squeezing the session name between buttons, the stats row wraps instead of overlapping, and dialogs go edge to edge. Anything tappable gets a real touch target. |
 | **Local models on the network** | If you run llama.cpp servers, the WebUI finds them: settings → Pi providers lists the ones it knows about, and the bridge scans for more — the configured URL, `localhost`, this machine's own LAN addresses, then a background sweep of the local /24 on the usual ports (8080/8081), skipping virtual adapters. A banner offers a server it found; dismissing it is remembered, and the sweep can be switched off with `PI_LLAMA_SCAN=off`. |
 | **Settings that cannot be lost** | The bridge keeps the settings in one JSON file and **replaces** it with what a page posts, so the page now refuses to save before it has read the server's copy — a slow or failed first load used to leave a browser on its defaults and then write those over everything (avatar, background, folders). For the same reason the first-run dialog only appears once the settings really loaded, retrying once. |
-| **Coming back after a restart** | The bridge remembers the session *this WebUI* was in and resumes it when it starts the agent, so restarting the bridge and reloading puts you back where you were. That record is its own file (`webui-last-session-<source>.json` in the agent dir) — the WebUI no longer reads `last-session-native.json`, which belongs to pi's own CLI, because sharing it meant restarting the bridge resumed whatever session the terminal had used last. A record whose session is gone is dropped before the agent is asked about it — that used to be a failed switch and, with a pi that does not answer, a wedged agent that had to be restarted. A browser that has been here before also keeps its own copy and switches back by itself. |
+| **Coming back after a restart** | The bridge remembers the session *this WebUI* was in and resumes it when it starts the agent, so restarting the bridge and reloading puts you back where you were. That record is its own file (`webui-last-session-<source>.json` in the agent dir) — the WebUI no longer reads `last-session-native.json`, which belongs to pi's own CLI, because sharing it meant restarting the bridge resumed whatever session the terminal had used last. A record whose session is gone is dropped before the agent is asked about it — that used to be a failed switch and, with a pi that does not answer, a wedged agent that had to be restarted. The same check covers the folder the session was recorded in: pi exits code 1 for a session whose working directory is gone, and since the bridge resumes by *starting in* the session, one stale record (the project folder was renamed, or the app itself was moved) used to restart the agent forever and answer every command with "the agent is not running". That record is now dropped too, the agent starts in a fresh session, and the page is told why the last conversation was not reopened. A browser that has been here before also keeps its own copy and switches back by itself. |
 | **Right-click menus** | On a session: open, **export…** (a real "save where you want" dialog), **branches…** (jump to a fork point) and **delete…** (asks first). On a message: **fork from here** — starts a new branch at that turn — plus copy and speak. Same look as the model picker. |
 | **Model & thinking pickers** | The model list is searchable and scrolls, however many you have. The list of **thinking levels belongs to the model**, and it is re-read the moment the model actually changes — from the picker, from `/model`, from the llama.cpp fix, or by the agent switching by itself. Before, a switch left the previous model's levels in the menu: a model with no reasoning kept a full ladder of levels that all failed, and a model with the ladder offered only `off`. pi can still be applying a `set_model` when that call returns, so the list is read again a moment later, and dropped if the model changed again in between. |
 
@@ -79,7 +81,7 @@ Extras: streaming markdown rendering (code blocks, thinking collapse, live tool-
 
 > The WebUI uses **http://localhost:3080**.
 
-There are three ways in: the **browser UI** (`start-webui.bat`), the same UI in **its own window** with no build step (`start-app-window.bat`, Edge/Chrome app mode), or the **native Windows app** (`start-app.bat`, source in `pi-desktop/`).
+There are three ways in: the **browser UI** (`start-webui.bat`), the same UI in **its own window** with no build step (`start-app-window.bat`, Edge/Chrome app mode), or the **Electron desktop app** (`pi-electron/`).
 
 The first time you open the UI it asks a handful of things worth deciding up front — the agent's name and picture, theme colour (and gamer mode), chat text size, background, whether to play a sound or show a desktop notification when the agent finishes, voice auto-send, the Shorts feed and whether other devices on your network may open it. Everything there is also in ⚙ Settings, and the dialog never comes back once you press *Let's go* (or *skip*).
 
@@ -160,46 +162,22 @@ Edge/Chrome app mode (no tabs, no address bar), and starts the bridge first if
 nothing is listening on port 3080. Nothing to install and nothing to compile;
 the default browser is used when no Chromium browser is found.
 
-This is the recommended way to run it as an app. The native shell below looks
-slightly more native but needs the C++ toolchain described there.
+### Electron desktop app (pi-electron/)
 
-### Native desktop app (pi-desktop/)
-
-The `pi-desktop/` folder is a **React Native for Windows** app: a WebView2 host
-around the same `web/` UI, plus native extras the browser cannot do — the
-Instagram / TikTok / YouTube Shorts feed renders in a real WebView2 surface, so
-`X-Frame-Options: DENY` does not apply, and the feed can auto-open while the
-agent runs.
+`pi-electron/` is the desktop build: the same `web/` UI in an Electron window,
+with the real Instagram / TikTok / YouTube Shorts feeds beside the chat. A
+`WebContentsView` is a top-level browsing context, so `X-Frame-Options: DENY`
+does not apply and the actual feeds play while the agent runs.
 
 ```
-start-app.bat
+cd pi-electron
+npm ci
+npm start
 ```
 
-That starts the bridge for you (quietly, in the background, no question asked),
-installs the app's npm dependencies, builds it when there is no build yet, and
-launches it. When you close the app window the bridge it started is stopped
-too, so opening and closing the app is all there is to it - a bridge that was
-already running is left alone, since a browser tab may be using it. The first
-build compiles the C++ React Native Windows runtime and takes 5-20 minutes;
-afterwards `pi-desktop\windows\x64\Release\PiAgent.exe` starts directly.
-
-The WebUI lives in one native WebView2 surface that is **kept across layout
-changes**: the host component is remounted whenever the window is resized (or
-rotated, or the Shorts panel opens), and it used to close the surface on unmount
-and then navigate it to the same URL on the next mount - which is a full page
-load in WebView2, so a one-pixel resize reloaded the whole UI and restarted every
-video. It now only re-bounds the surface, and only navigates when the bridge URL
-really changes.
-
-> Note: an app JS-only fix cannot be shipped by hand-building the bundle. Metro
-> plus the matching Hermes compiler produces bytecode with an identical header
-> that the runtime still refuses (white window). Use the real build targets.
-
-Building needs **Visual Studio 2022 with the "Desktop development with C++"
-workload and the Windows 11 SDK (10.0.26100)**, which is a few gigabytes of
-download — that is the reason `start-app-window.bat` exists. The project files
-are committed (only build output is ignored), so a clone builds as-is once the
-toolchain is present; see `pi-desktop/README.md` for the details.
+`npm run dist` produces the Linux AppImage/deb and the Windows portable
+executable in `pi-electron/dist/`. A packaged build starts its own bridge using
+Electron's bundled Node, so the machine needs no separate Node install.
 
 ### Try it without any agent (UI smoke test)
 
@@ -235,16 +213,18 @@ $env:PI_COMMAND="node mock_agent.js"; npm start
 start-webui.bat         launcher (Windows): pick native pi or a Docker container, then serve :3080
 start-webui.sh          the same launcher for Linux and macOS
 start-app-window.bat    same UI in its own app window (Edge/Chrome app mode), no toolchain needed
-start-app.bat           native React Native for Windows app (builds pi-desktop/, needs Visual Studio)
+pi-electron/            Electron desktop app (Windows/Linux), with the real shorts feeds beside the chat
 switch_pi_agent_source.bat  re-run the source picker, then launch
 Dockerfile              container image (node + pi CLI + bridge + web)
 docker-compose.yml      alternative: dedicated container with bundled pi, port 3080 (PI_WEBUI_PORT)
 .dockerignore           keeps node_modules, sessions and settings out of the image
 bridge/server.js        HTTP + WebSocket bridge, spawns one pi RPC process per tab
 bridge/lan.json         LAN access: {"lan": true} exposes the bridge to the network (ships as false: local only)
+bridge/routes/pets.js   Petdex search proxy and downloaded pet library
 bridge/whisper_boot.js  downloads and runs the local whisper.cpp server on demand
 bridge/mock_agent.js    fake pi agent for UI testing
 web/index.html|app.js|style.css   the UI (no build step, no framework)
+web/pet.js             opt-in DeepSeek desk pet and Petdex search/download
 ```
 
 Protocol reference: [pi RPC docs](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/rpc.md).
@@ -254,15 +234,20 @@ Protocol reference: [pi RPC docs](https://github.com/badlogic/pi-mono/blob/main/
 ```bash
 ./verify-matrix.sh              # host: syntax, unit, integration, real browser
 ./verify-matrix.sh --docker     # the above, then the image from docker-compose.yml
+./verify-matrix.sh --changed    # only tests affected by files changed since origin/main
+./verify-matrix.sh --changed --docker
 ```
 
-Five layers, each able to fail on its own:
+`--changed` uses the mapping in `verify-matrix.sh` (source path → covering tests),
+includes uncommitted and untracked files, and reports unaffected tests separately
+instead of rerunning them. Set `PI_TEST_BASE=HEAD` to compare only the working
+tree, or another ref to compare against a different base.
+
+Four layers, each able to fail on its own:
 
 | Layer | What it checks | Tool |
 |---|---|---|
 | 1. syntax | plain JS parses | `node --check` |
-| 1. syntax | the React Native sources parse (they contain JSX) | `@babel/parser` |
-| 1. lint | undefined identifiers, hooks called conditionally or in a loop | `eslint` |
 | 2. unit | `sessionLines` returns a real JSONL file unchanged and in order, and stays lazy | `verify/test-session-lines.js` |
 | 2. unit | the atomic JSON write is whole, leaves no temp file, and cannot destroy the previous file | `verify/test-atomic-write.js` |
 | 3. integration | a live bridge: the session list, the messages, the raw JSONL, path traversal | `verify/test-endpoints.js` |
@@ -272,14 +257,9 @@ Five layers, each able to fail on its own:
 The unit checks extract the real function out of `bridge/server.js` rather than
 testing a copy, so they cannot pass while the shipped code is broken.
 
-Two notes on why some checks are not `node --check`:
-
-- `node --check` reports **exit 0** for a `.js` file containing JSX *and* an
-  unclosed `memo(` wrapper. A file that fails to parse as CommonJS gets retried
-  as an ES module and the error is swallowed. That is why the React Native files
-  go through `@babel/parser`.
-- A parser cannot see an identifier that is used but never defined, which is what
-  a half-finished edit leaves behind. That is what the ESLint pass is for.
+The Electron smoke test (`pi-electron/test/smoke.cjs`) is part of the syntax
+layer: it launches the packaged shell and checks the WebUI plus the separate
+shorts surface.
 
 If Docker cannot reach the registry, the image build is reported as skipped
 rather than failed — the other layers still run, and the container checks use

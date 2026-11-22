@@ -160,7 +160,18 @@ module.exports = WS;
  * child and the user-data-dir. */
 function launchBrowser(browser, args) {
   const { spawn } = require('child_process');
-  const child = spawn(browser, [...(args || []), '--remote-debugging-port=0'], { stdio: ['ignore', 'ignore', 'pipe'] });
+  const given = args || [];
+  /* These flags are test hygiene, not part of what any check measures: no
+   * window on the user's desktop, no audio, no out-of-band network. A caller
+   * that already chose a viewport keeps it; a browser that ignores headless
+   * mode still lands off screen. */
+  const defaults = ['--headless=new', '--window-position=-32000,-32000', '--mute-audio', '--disable-background-networking'];
+  const chosen = (flag) => given.some((a) => a === flag || a.startsWith(flag + '='));
+  const extra = defaults.filter((f) => !chosen(f));
+  const child = spawn(browser, [...given, ...extra, '--remote-debugging-port=0'], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    windowsHide: true,
+  });
   let err = '';
   const port = new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('browser never reported a debug port\n' + err.slice(-400))), 30000);

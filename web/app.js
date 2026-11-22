@@ -6,8 +6,6 @@
 /* $, el, escapeHtml, fmtSize, timeStr and cssEscape live in util.js, loaded
  * before this file - the first phase of the #54 split. */
 
-/* Compact markdown renderer: fenced code, headings, lists, quotes,
- * bold/italic/inline-code/links. Everything is HTML-escaped first. */
 /* ── speech to text ───────────────────────────────────────────────────────
  * The browser's own recognition is the default: nothing to download and it is
  * good enough for dictating a prompt. The local whisper.cpp server is opt-in -
@@ -41,7 +39,8 @@ function renderSttModelNote() {
   const note = $('stt-model-note');
   if (!sel || !note) return;
   const opt = sel.selectedOptions && sel.selectedOptions[0];
-  note.textContent = opt ? (opt.dataset.note || '') : '';
+  note.textContent = (opt && opt.dataset.note)
+    || 'The local whisper.cpp model. Larger models are slower and more accurate; the first use downloads it.';
 }
 
 function renderSttStatus(st) {
@@ -132,6 +131,7 @@ function syncTtsSettingsUi() {
   if (!backend) return;
   const mode = backend.value;
   const cloud = mode === 'fish' || mode === 'openai';
+  const fish = mode === 'fish';
   const show = (id, on) => {
     const el = $(id);
     if (!el) return;
@@ -149,8 +149,12 @@ function syncTtsSettingsUi() {
   show('set-tts-voice-name', mode === 'endpoint');
   show('tts-cloud-key-label', cloud);
   show('set-tts-apikey', cloud);
-  show('tts-cloud-model-label', cloud);
-  show('set-tts-cloud-model', cloud);
+  /* Issue #211: Fish Audio has a model list of its own, so it gets a picker
+   * instead of the free-text field the OpenAI-compatible services need. */
+  show('tts-fish-model-label', fish);
+  show('set-tts-fish-model', fish);
+  show('tts-cloud-model-label', mode === 'openai');
+  show('set-tts-cloud-model', mode === 'openai');
   show('tts-cloud-voice-label', cloud);
   show('set-tts-cloud-voice', cloud);
   show('tts-cloud-url-label', cloud);
@@ -159,11 +163,32 @@ function syncTtsSettingsUi() {
   if (note) {
     note.classList.toggle('hidden', !cloud);
     note.textContent = mode === 'fish'
-      ? 'Fish Audio: paste your API key and the reference id of the voice to use (or leave it blank for the default). The bridge makes the call, so the key never travels through the page.'
+      ? 'Fish Audio: paste your API key; the key is stored by the bridge, never kept in this page. Pick a model above and a voice below.'
       : mode === 'openai'
         ? 'Any OpenAI-compatible service: /v1/audio/speech with a model and a voice. Set the URL for anything other than OpenAI itself (Groq, DeepInfra, a self-hosted proxy).'
         : '';
   }
+  // The field labels say which service they belong to. Same inputs, different
+  // names and placeholders, so a Fish user is not guessing what "Cloud model"
+  // means or pasting a reference id into an "alloy / nova" field.
+  const keyLabel = $('tts-cloud-key-label');
+  if (keyLabel) {
+    // Do not replace the label wholesale: the ? for tts-cloud-note is a child
+    // of it (issue #219), and textContent = ... would delete it.
+    const tip = keyLabel.querySelector('.help-tip');
+    keyLabel.textContent = fish ? 'Fish Audio API key' : 'Cloud API key';
+    if (tip) keyLabel.appendChild(tip);
+  }
+  const voiceLabel = $('tts-cloud-voice-label');
+  if (voiceLabel) voiceLabel.textContent = fish ? 'Fish Audio voice (reference id)' : 'Cloud voice';
+  const urlLabel = $('tts-cloud-url-label');
+  if (urlLabel) urlLabel.textContent = fish ? 'Fish Audio service URL' : 'Service URL';
+  const voiceIn = $('set-tts-cloud-voice');
+  if (voiceIn) voiceIn.placeholder = fish ? 'a reference id from fish.audio (blank for the default)' : 'alloy / nova / …';
+  const urlIn = $('set-tts-cloud-url');
+  if (urlIn) urlIn.placeholder = fish ? 'https://api.fish.audio' : 'https://api.openai.com';
+  const fishNote = $('tts-fish-note');
+  if (fishNote) fishNote.classList.toggle('hidden', !fish);
 }
 
 function syncVoiceSettingsUi() {
@@ -189,10 +214,10 @@ function syncVoiceSettingsUi() {
   }
   if (note) note.classList.toggle('hidden', !whisper);
   if (status) status.classList.toggle('hidden', !whisper);
-  document.querySelectorAll('#tab-voice .settings-grid > label').forEach((l) => {
-    const t = (l.textContent || '').trim();
-    if (t === 'Whisper model' || t === 'Whisper endpoint') l.classList.toggle('hidden', !whisper);
-  });
+  for (const id of ['label-whisper-model', 'label-whisper-endpoint']) {
+    const l = $(id);
+    if (l) l.classList.toggle('hidden', !whisper);
+  }
   // Fetch the list even when browser STT is selected: it is one request, and
   // otherwise the whisper choices (including the multilingual model) only
   // existed after you had already switched to whisper and back.
@@ -218,10 +243,13 @@ function restartCardTimer(card) {
   startCardTimer(card);
 }
 
-function startCardTimer(card) {
+function startCardTimer(card, since) {
   if (card._timer) return;
   card._running = true;
-  card._start = Date.now();
+  // `since` is the assistant message's timestamp when the card is rebuilt from
+  // history while its tool is still running, so the elapsed time it shows is the
+  // time the command has been running - not the time since the page opened.
+  card._start = Number(since) > 0 ? Number(since) : Date.now();
   const tick = () => {
     card.timerEl.classList.remove('hidden');
     // Always counts up: the countdown a bash timeout used to produce looked
@@ -308,110 +336,6 @@ const asArray = (data, key) =>
 
 /* ───────────────────────── local settings ───────────────────────── */
 
-const DEFAULT_SETTINGS = {
-  agentName: 'pi',        // display name next to the agent's messages
-  avatar: null,           // dataURL shown next to the agent's name
-  ttsVoiceURI: null,      // preferred browser speechSynthesis voice
-  ttsRate: 1.05,
-  voiceAutoSend: false,   // send the composer automatically after voice input
-  showThinking: true,     // show/hide thinking blocks
-  showToolCalls: true,    // show/hide tool call cards entirely
-  autoExpandThinking: false, // render thinking blocks open by default
-  autoExpandTools: false, // render tool call output open by default
-  sttEndpoint: '',        // whisper-compatible transcription endpoint
-  sttBackend: 'browser',  // 'browser' (built in, default) | 'whisper' (local server, downloaded on demand)
-  sttModel: 'ggml-base.en.bin', // whisper.cpp model id
-  instances: [],          // other pi agents to switch between: [{id, name, url}]
-  favouriteModels: [],    // "provider||id" keys pinned to the top of the model picker
-  defaultModel: '',       // "provider||id" a new chat starts on ('' = keep the last used) - issue #176
-  ttsBackend: 'browser',  // 'browser' | 'endpoint' (local server) | 'fish' | 'openai' (cloud, via the bridge)
-  ttsApiKey: '',          // cloud voices: kept in the bridge's settings and sent by the bridge
-  ttsCloudModel: '',      // fish: s1 ; openai-compatible: tts-1, gpt-4o-mini-tts, …
-  ttsCloudVoice: '',      // fish: reference id ; openai-compatible: alloy, nova, …
-  ttsCloudUrl: '',        // blank = the service's own endpoint
-  ttsEndpoint: '',        // OpenAI-compatible /v1/audio/speech server (Piper etc.)
-  ttsModel: 'piper',
-  ttsVoiceName: '',
-  themeAccent: null,      // custom accent color
-  themeBg: null,          // background image (URL or dataURL) or video URL
-  onboarded: false,       // first-launch setup completed
-  shortsProvider: 'instagram', // 'instagram' | 'tiktok' | 'youtube' | 'none'
-  shortsAutoOpen: false,  // open the feed while the agent runs, close it when the run finishes
-  shortsMode: 'panel',    // 'panel' (in-app split) | 'window' (side window, full feed) | 'tab' — legacy 'split'='panel', 'popup'='window'
-  reelsWidth: null,       // px — the shorts panel width, remembered across launches
-  reelsOpen: false,       // was the shorts panel open? restored on load
-  forkCollapsed: {},      // parent session path -> true while its branches are folded away
-  autoContinueAfterCompaction: true, // nudge the agent to keep working after a compaction
-  fontFamily: '',         // '' | 'mono' | 'serif' | 'rounded' | a system font family
-  chatFontSize: 14,       // px — chat + composer text size
-  chatOpacity: 100,       // 0-100 — chat chrome (composer/topbar/sidebar) opacity
-  textOutline: true,      // outline chat text so it stays readable over a background
-  textOutlineColor: '#000000', // outline colour
-  avatarSize: 34,         // px — agent profile image in the chat
-  avatarCrop: null,       // {x, y, z} — manual crop of the profile image
-  bgCrop: null,           // {x, y, z} — manual crop of the background
-  typeAnywhere: false,    // start typing in the composer without clicking it
-  // When the agent finishes a turn (all off until switched on in Settings)
-  doneSound: false,       // short two-note chime
-  doneSoundUrl: '',       // your own sound instead of the chime: an /api/bg-file path, a URL, or a data URL
-  doneSoundVolume: 100,   // 0-100
-  doneNotify: false,      // desktop / Windows notification
-  doneOnlyUnfocused: true,// ...and only while this window is not the active one
-  // Appearance
-  gamerMode: false,       // rainbow accent (settings > appearance)
-  gamerSpeed: 16,         // seconds for one full colour cycle
-  cursorImage: '',        // custom pointer picture (data URL, /api/bg-file path, or an http(s) URL)
-  cursorSize: 32,         // px - the picture is drawn at this size
-  cursorHotX: 0,          // px - the pixel of the picture that is the real pointer tip
-  cursorHotY: 0,
-  // How many of the newest messages keep an animated avatar. -2 = every one of
-  // them, -1 (or 0, which is what the old slider wrote for "none") = none,
-  // 1-8 = a cap. Each animated message is a live video decoder, which is why the
-  // cap exists and why the whole group pauses while the tab is in the
-  // background.
-  avatarAnimate: 8,       // the slider's top; -2 ("all") is one decoder per message
-  sessionFolders: [],     // the first instance's set; kept as the source for the one-time migration
-  sessionFoldersByInstance: null,  // { instanceOrigin: [{ id, name, paths }] } — folders are per instance
-  bgOpacity: 100,         // 0-100 — background image / video transparency
-  bgAudio: false,         // play a background video's audio
-  bgVolume: 50,           // 0-100
-};
-let SET = { ...DEFAULT_SETTINGS };
-try { Object.assign(SET, JSON.parse(localStorage.getItem('piwebui-settings') || '{}')); } catch { /* defaults */ }
-let settingsLoaded = false;
-
-function saveSettings(force) {
-  applySettings();
-  try { localStorage.setItem('piwebui-settings', JSON.stringify(SET)); } catch { /* cache only */ }
-  // The server REPLACES its settings file with what is posted, so saving before
-  // the server's own copy has been read would erase the user's settings (avatar,
-  // wallpaper, folders, ...) and replace them with this browser's defaults. That
-  // happened whenever the first settings fetch was slow or failed and the
-  // first-run dialog was dismissed. `force` is only for callers that already
-  // know they hold the server's copy.
-  if (!settingsLoaded && !force) return Promise.resolve();
-  // authoritative copy lives in webui-settings.json next to the project
-  // (the promise is returned so a caller that then depends on the server's
-  // copy - adding an instance and switching to it, say - can wait for it)
-  return fetch(api('/api/ui-settings'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(SET),
-  }).catch(() => {});
-}
-
-async function loadServerSettings() {
-  try {
-    const data = await fetch(api('/api/ui-settings')).then((r) => r.json());
-    if (data && Object.keys(data).length) {
-      Object.assign(SET, data);
-      migrateFolders();
-      applySettings();
-    }
-    settingsLoaded = true;
-  } catch { /* offline bridge: keep cache */ }
-}
-
 /* How tall the composer dock is, so the jump-to-top button can float just above
  * it. Declared up here because applySettings() touches it and applySettings()
  * runs on the very first settings load, which is before the rest of this file
@@ -432,6 +356,9 @@ const S = {
   state: {},               // last get_state payload
   isStreaming: false,
   compacting: false,        // true while a compaction is in flight
+  compactionSession: null,  // the agent session the in-flight compaction belongs to
+  pinCompactionOnReturn: false, // a switch back should keep the newest result visible
+  compactionAway: false,       // a compaction finished while another session was on screen
   compactionQueue: [],      // prompts queued while compacting (sent after it finishes)
   compactionHappened: false,   // a compaction completed during this run → re-render history on settle
   compactionNeedsContinue: false, // compaction finished without auto-retry → maybe auto-continue
@@ -464,6 +391,8 @@ const S = {
   lastRun: null,           // { ms, ts } of that task
   collapsedForks: loadForkCollapse(),  // parent session path -> true when folded away
   agentBusy: null,         // last /api/sessions "busy" (null = not known yet)
+  agentMode: 'normal',     // 'normal' | 'plain' (plain has no tools/extensions/skills/AGENTS.md)
+  plainNeedsInit: false,   // a mode switch restarted the agent; re-read the new empty session
   liveDetached: null,      // { path, frag } — running session's live DOM, parked while viewing another
   favNode: null,           // the off-screen node the tab icon is drawn from, until it is released
   favSource: '',           // the picture that icon was painted from
@@ -530,9 +459,26 @@ function connect() {
     try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.bridge === 'rpc') handleRpcMessage(msg.payload);
     else if (msg.bridge === 'agent_exit') onAgentExit(msg);
-    else if (msg.bridge === 'agent_started') onAgentStarted();
+    else if (msg.bridge === 'agent_started') {
+      if (msg.mode) { S.agentMode = msg.mode === 'plain' ? 'plain' : 'normal'; updatePlainBanner(); }
+      onAgentStarted();
+    }
+    else if (msg.bridge === 'agent_mode') setAgentModeState(msg.mode, true);
     else if (msg.bridge === 'session_resumed') onSessionResumed(msg.path);
-    else if (msg.bridge === 'session_resume_failed') toast('Could not reopen your last session - starting in a new one', 'warning');
+    else if (msg.bridge === 'session_resume_failed') {
+      // The bridge could not put the agent back into the session it meant to
+      // (usually: the project folder was renamed, or the app itself was moved,
+      // and pi refuses a session whose recorded cwd is gone). It started fresh
+      // instead - say why, or the last conversation looks like it vanished.
+      const where = msg.reason === 'folder'
+        ? 'its folder no longer exists'
+        : msg.reason === 'file' ? 'the session file is gone' : '';
+      const which = msg.explicit ? 'that session' : 'your last session';
+      toast(`Could not reopen ${which}${where ? ` - ${where}` : ''}. Starting in a new one.`, 'warning');
+    }
+    else if (msg.bridge === 'settings_changed') {
+      if (msg.from !== SETTINGS_CLIENT_ID) reloadSettingsFromServer().catch(() => {});
+    }
     else if (msg.bridge === 'agent_stderr' && msg.text.trim()) console.warn('[pi stderr]', msg.text);
   };
   ws.onclose = () => {
@@ -577,7 +523,7 @@ function scheduleReconnect() {
 
 /* Liveness heartbeat.
  *
- * A half-open WebSocket (sleep/wake, a WebView2 network hiccup) may never fire
+ * A half-open WebSocket (sleep/wake, an embedded-browser network hiccup) may never fire
  * onclose on its own, leaving the UI frozen on a dead connection - so something
  * has to notice. This used to notice with `get_state`, which goes THROUGH the
  * agent, and that was wrong in a way that caused the very outage it was meant to
@@ -637,6 +583,30 @@ function send(obj) {
 
 /* Resolve when the (re)started agent reports agent_started. */
 let agentReadyWaiters = [];
+function updatePlainBanner() {
+  const b = $('plain-banner');
+  if (!b) return;
+  b.classList.toggle('hidden', S.agentMode !== 'plain');
+}
+function setAgentModeState(mode, fromEvent) {
+  const next = mode === 'plain' ? 'plain' : 'normal';
+  const changed = S.agentMode !== next;
+  S.agentMode = next;
+  if (changed && !S.pendingModePath) {
+    // The old path described the old process/mode; the new agent reports its
+    // own path in get_state. Keeping it would briefly outline the wrong row.
+    S.state.sessionFile = null;
+    S.state.sessionName = null;
+    S.viewSession = null;
+  }
+  updatePlainBanner();
+  if (!changed && !fromEvent) return;
+  // switchToSession owns the re-read when it is restarting pi for a particular
+  // session; the generic fresh-start handler must not race it with a second init.
+  S.plainNeedsInit = !S.pendingModePath;
+  if (next === 'plain') toast('Plain chat: no tools, extensions, skills or AGENTS.md');
+  else if (fromEvent) toast('Plain chat ended — normal agent restored');
+}
 function onAgentStarted() {
   // A fresh agent means the crash banner is stale - it used to sit there until
   // the page was reloaded, even after a successful restart.
@@ -646,6 +616,14 @@ function onAgentStarted() {
   refreshModels().catch(() => {});
   refreshLevels().catch(() => {});
   refreshStats().catch(() => {});
+  if (S.pendingModePath) {
+    // restartAgentForSession is waiting for this event and re-reads the target
+    // session itself; doing it here too would race two get_state calls.
+    S.plainNeedsInit = false;
+  } else if (S.plainNeedsInit) {
+    S.plainNeedsInit = false;
+    setTimeout(() => { initSession(false).catch(() => {}); }, 120);
+  }
   const w = agentReadyWaiters;
   agentReadyWaiters = [];
   w.forEach((r) => r());
@@ -661,10 +639,13 @@ function waitForAgentReady(timeoutMs = 60000) {
   });
 }
 
-function rpc(commandObj, timeoutMs = 120000) {
+function rpc(commandObj, timeoutMs = 120000, id) {
   return new Promise((resolve, reject) => {
-    const id = `req-${++S.reqId}`;
-    commandObj.id = id; // exposed so callers can correlate streamed events
+    /* `id` lets a caller reserve the request id before sending, which is what
+     * lets a streamed response (bash output) be filed before the answer lands.
+     * Otherwise the id is allocated here. */
+    const reqId = id || `req-${++S.reqId}`;
+    commandObj.id = reqId; // exposed so callers can correlate streamed events
     /* The timeout is cleared as soon as the request settles.
      *
      * It used to be left armed no matter what happened, so every answered call
@@ -674,13 +655,13 @@ function rpc(commandObj, timeoutMs = 120000) {
      * callback checks S.pending first), but it is dead weight for up to ten
      * minutes per call, and a leak is easier to prevent than to notice. */
     const timer = setTimeout(() => {
-      if (S.pending.has(id)) {
-        S.pending.delete(id);
+      if (S.pending.has(reqId)) {
+        S.pending.delete(reqId);
         reject(new Error(`${commandObj.type}: timed out`));
       }
     }, timeoutMs);
     const settle = (fn) => (v) => { clearTimeout(timer); fn(v); };
-    S.pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
+    S.pending.set(reqId, { resolve: settle(resolve), reject: settle(reject) });
     send(commandObj);
   });
 }
@@ -730,13 +711,24 @@ async function onSessionResumed(path) {
   }
 }
 
+let lastAgentExitAt = 0;
+let lastAgentExitKey = '';
 function onAgentExit(msg) {
   S.isStreaming = false;
+  if (typeof petSetState === 'function') petSetState('error');
   setConn('on');
   // Any tool card still showing "running…" is stuck — the agent is gone.
   markStuckToolCards('interrupted');
   removeCompactionLive();
   updateStreamUi(); // live dot, Stop button, ctx poll, view banner
+  // The bridge retries a dying child itself. Five identical code-1 exits in a
+  // few seconds used to paint five banners over each other; one is enough until
+  // the agent starts successfully or the failure changes.
+  const key = msg.error || `code:${msg.code}`;
+  const now = Date.now();
+  if (key === lastAgentExitKey && now - lastAgentExitAt < 60000) return;
+  lastAgentExitKey = key;
+  lastAgentExitAt = now;
   if (msg.error) {
     showBanner('error', msg.error, 'Retry', () => send({ bridge: 'restart' }));
   } else {
@@ -778,6 +770,7 @@ async function initSession(resumeLast, prefetched, alreadyDrawn, gen) {
       loadRemoteLook().catch(() => {}),   // another instance's face and background
       refreshSessions(true),
       refreshStats(),
+      refreshGoals(),
     ]);
     loadDraft();
     restoreRunClock();
@@ -808,40 +801,78 @@ async function resumeLastSession() {
     const res = await fetch(api('/api/sessions'));
     d = await res.json();
   } catch { return; /* bridge unreachable */ }
+  if (d.mode) { S.agentMode = d.mode === 'plain' ? 'plain' : 'normal'; updatePlainBanner(); }
+  // A plain-chat agent starts in a fresh session and must never be switched to
+  // the remembered normal session on connect.
+  if (S.agentMode === 'plain') return;
   const sessions = d.sessions || [];
   const remembered = d.remembered || null;
+  const resuming = d.resuming || null;
   const cur = S.state.sessionFile;
-  const find = (p) => (p ? sessions.find((s) => s.path === p) || null : null);
-  if (find(cur)) return;                       // on screen and on disk: nothing to do
+  /* Both of these used to compare paths with `===`.
+   *
+   * Everywhere else in the UI the question "is this the same session" is asked
+   * with sameSessionPath(), because the same file can arrive spelled differently
+   * (a Windows path next to a POSIX one, a host path next to the container's
+   * mapping of it, a different case). With an exact match a spelling difference
+   * made `find(cur)` miss the session the agent was *already in*, the guard below
+   * fell through, and the page then moved the agent to the remembered session -
+   * see the switch guard, which is where that went wrong. */
+  const find = (p) => (p ? sessions.find((s) => sameSessionPath(s.path, p, sessions)) || null : null);
   if (!sessions.length) return;
-  if (!remembered || remembered === cur) return;   // the bridge is in the session it intended
+  if (find(cur)) return;                       // on screen and on disk: nothing to do
+  /* A reload may never move the agent out of a session it is really in.
+   *
+   * The remembered session is whatever was written last, and /api/sessions is
+   * newest-first, so that is the first row in the sidebar - often a different
+   * conversation entirely. Reloading while the agent sat in an older session
+   * (one the scan did not return, or returned under another spelling) therefore
+   * switched the agent into the newest chat: the transcript on screen no longer
+   * matched the session the next prompt would be written to, the context counter
+   * dropped to the other session's, and the message looked discarded because it
+   * never appeared in the conversation it was typed in.
+   *
+   * If pi reports a session *file*, that is the answer to "where am I" - keep it.
+   * The heuristic below is only for an agent that has no session of its own yet
+   * (pi reports the sessions directory), which is the case it was written for.
+   * The check sits after the resume branch, because that one switches nothing:
+   * it only shows the session the bridge is already putting the agent into. */
+  if (!remembered || sameSessionPath(remembered, cur, sessions)) return;   // the bridge is in the session it intended
   let target = null;
   try { target = find(localStorage.getItem(lastSessionKey())); } catch { /* private mode */ }
   if (!target) target = find(remembered);
   if (!target) return;                         // nothing to go back to; stay where the agent is
-  if (target.path === cur) return;
-  /* The agent has no session of its own: pi reports the sessions *directory*.
-   * There is nothing here to move it into, and the alternative - asking it for
-   * its messages - takes twenty seconds to answer and describes a context the
-   * file already describes better. So the last session is shown read-only, which
-   * is what it is: the agent is not in it. */
-  if (!isSessionFile(cur)) {
+  if (sameSessionPath(target.path, cur, sessions)) return;
+  /* The bridge may already be putting the agent back into this very session
+   * (its resume is in flight). Switching as well made pi start the session a
+   * second time - and an extension that asks a question on session_start, like
+   * goal-x's "Resume paused goal?", asked it twice (issue #220). Show the target
+   * from its file in the meantime; the bridge's session_resumed announcement
+   * re-attaches the live session. */
+  if (resuming && (resuming === target.path || resuming === remembered)) {
     S.viewSession = target.path;
     S.viewSubagent = null;
     updateViewBanner();
     return;
   }
+  /* Everything past here could only move the agent, so it is the one thing a
+   * reload may not do while pi reports a session of its own. The state this page
+   * holds may still be stale - a bridge resume that finished a moment ago is the
+   * usual reason - and asking pi again is free and changes nothing. */
   try {
-    await rpc({ type: 'switch_session', sessionPath: target.path });
-    await rpc({ type: 'get_state' }).then((st) => applyState(st));
-    toast(`Resumed last session: ${(target.name || 'unnamed').slice(0, 60)}`);
-  } catch (e) {
-    // The switch failed (e.g. the session's working directory is gone). The
-    // session is still in the sidebar - clicking it offers to recreate the
-    // folder - so this is a warning, not a silent drop.
-    console.warn(`could not resume last session ${target.path}: ${e.message}`);
-    toast(`Could not resume last session: ${e.message}`, 'error');
-  }
+    const st = await rpc({ type: 'get_state' });
+    if (st) applyState(st);
+  } catch { /* agent gone or slow: keep what we have */ }
+  if (find(S.state.sessionFile)) return;
+  if (isSessionFile(S.state.sessionFile)) return;
+  /* The agent has no session of its own: pi reports the sessions *directory*.
+   * There is nothing here to move it into, and the alternative - asking it for
+   * its messages - takes twenty seconds to answer and describes a context the
+   * file already describes better. So the last session is shown read-only, which
+   * is what it is: the agent is not in it. */
+  S.viewSession = target.path;
+  S.viewSubagent = null;
+  updateViewBanner();
 }
 
 /* ── which instance is this page looking at? ──────────────────────────────
@@ -860,6 +891,7 @@ async function resumeLastSession() {
  * this machine, the voice backend (whisper runs here), and the proxy itself. */
 const LOCAL_APIS = ['/api/ui-settings', '/api/lan', '/api/instance-card', '/api/system-fonts',
                     '/api/whisper-status', '/api/whisper-start', '/api/whisper-log', '/api/tts',
+                    '/api/pets', '/api/petdex-search', '/api/pet-file',
                     '/api/proxy/', '/proxy/'];
 function api(path) {
   const p = String(path);
@@ -876,16 +908,24 @@ function lastSessionKey() {
 /* ───────────────────────── state / config refresh ───────────────────────── */
 
 function applyState(d) {
+  const previousSession = (S.state && S.state.sessionFile) || '';
   S.state = d || {};
   if (d) {
+    // A different session is a different context. Everything the ring uses to
+    // keep one turn's number from walking backwards describes the old context,
+    // so it must go before the first stats answer for the new one arrives.
+    if (d.sessionFile && previousSession && !S.viewSession
+        && !sameSessionPath(previousSession, d.sessionFile, S.sessionsList || [])) {
+      resetContextForSession();
+    }
     // Remember which session this browser is in, so a reload can get back to
     // it even if the bridge has no record (see resumeLastSession).
     if (d.sessionFile) {
       try { localStorage.setItem(lastSessionKey(), d.sessionFile); } catch { /* cache only */ }
     }
     if (d.sessionName) $('session-name').value = d.sessionName;
-    else if (!$('session-name').value) $('session-name').value = '';
     // otherwise the derived session name (first user message) fills in via refreshSessions
+    updateDocumentTitle();
     if (d.isStreaming !== undefined) S.isStreaming = d.isStreaming;
     if (d.model && d.model.id) syncSelect($('model-select'), `${d.model.provider}||${d.model.id}`);
     if (d.thinkingLevel) syncSelect($('thinking-select'), d.thinkingLevel);
@@ -1006,6 +1046,17 @@ function prettySelect(sel) {
   wrap.appendChild(sel);
   wrap.appendChild(btn);
   label();
+  /* Issue #216: the <select> itself is not what the reader sees - the
+   * button in the wrapper is. Code that hides a control does `classList.toggle
+   * ('hidden')` on the select (the TTS backend hides the Fish model list that
+   * way), and that left the button on screen for every backend. Mirror the
+   * select's visibility onto the wrapper so "hidden" means the control the
+   * reader can actually click. */
+  const syncHidden = () => wrap.classList.toggle('hidden', sel.classList.contains('hidden'));
+  syncHidden();
+  try {
+    new MutationObserver(syncHidden).observe(sel, { attributes: true, attributeFilter: ['class'] });
+  } catch { /* no MutationObserver: the initial sync still applies */ }
 }
 
 /* Every plain dropdown in the settings dialog, once. */
@@ -1218,13 +1269,35 @@ function leafPath(tree, leafId) {
   return [];
 }
 
+/* One generation for context-stat answers. A session switch starts a new one
+ * before it asks for anything, so a slow reply about the session the reader
+ * just left cannot land last and put its number back on screen. */
+let ctxStatsSeq = 0;
+
+/* Drop the ring's memory of the context. Called whenever the session the ring
+ * describes changes (a switch, a new chat, an agent that moved by itself): the
+ * high-water marks belong to the context that was on screen a moment ago, not
+ * the one that is arriving. */
+function resetContextForSession() {
+  ctxStatsSeq++;
+  resetCtxHighWater();
+  S.ctxStats = null;
+  setCtxRing(null);
+}
+
 async function refreshStats() {
+  const seq = ++ctxStatsSeq;
   try {
     const d = await rpc({ type: 'get_session_stats' });
+    if (seq !== ctxStatsSeq) return;
     const cost = d && d.cost && d.cost.total != null ? Number(d.cost.total) : null;
     setText($('stat-cost'), cost != null
       ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}`
       : '');
+    /* While another session is on screen the agent's stats are not the stats of
+     * what the reader is looking at. The read-only view sets the ring from that
+     * session's own transcript; a poll must not put the agent's number back. */
+    if (S.viewSession) { updateTotals(); return; }
     let cu = d && d.contextUsage;
     const rawTokens = cu && cu.tokens != null ? cu.tokens : null;
     // While a turn is in flight the live number is anchored to the last real
@@ -1241,6 +1314,73 @@ async function refreshStats() {
     setCtxRing(cu);
   } catch { /* ignore */ }
   updateTotals();
+}
+
+/* What the context looked like when a session was last written.
+ *
+ * A read-only session cannot ask pi for get_session_stats - pi has one session
+ * loaded and it is the agent's, not this file. The file does carry the answer
+ * the old session gave: every assistant message records the usage that produced
+ * it, and totalTokens is the context it ran against. The newest such record is
+ * therefore a real count, not an estimate; messages written after it are
+ * estimated at the same chars-per-token ratio the live ring uses.
+ *
+ * This exists because switching to another session during a turn only changes
+ * the view - the agent keeps running where it is - and leaving the old ring on
+ * screen made it look as if the click had done nothing (and made the counter
+ * disagree with the transcript under it). */
+function contextForSession(messages, compactions) {
+  const list = Array.isArray(messages) ? messages : [];
+  let at = -1;
+  let tokens = null;
+  let model = null;
+  for (let i = 0; i < list.length; i++) {
+    const m = list[i];
+    if (!m || m.role !== 'assistant' || !m.usage) continue;
+    const t = usageContextTokens(m.usage);
+    if (t == null) continue;
+    at = i;
+    tokens = t;
+    model = m;
+  }
+  if (tokens == null) {
+    /* A session that was compacted and then never answered has no usage to
+     * read, but the compaction itself recorded the post-compaction size. */
+    const marks = Array.isArray(compactions) ? compactions : [];
+    const last = marks[marks.length - 1];
+    if (last && last.estimatedTokensAfter != null) {
+      tokens = Number(last.estimatedTokensAfter);
+      at = list.length;
+    }
+  }
+  if (tokens == null) return null;
+  let chars = 0;
+  for (let i = at + 1; i < list.length; i++) chars += messageChars(list[i]);
+  if (chars) tokens += Math.max(1, Math.round(chars / (S.tokPerChar || 4)));
+  const known = model && model.id
+    ? (S.models || []).find((x) => x && x.id === model.id && (!model.provider || x.provider === model.provider))
+      || (S.models || []).find((x) => x && x.id === model.id)
+    : null;
+  const win = (known && known.contextWindow)
+    || (S.state && S.state.model && S.state.model.contextWindow)
+    || S.ctxWindow
+    || null;
+  if (!win) return null;
+  return {
+    tokens,
+    contextWindow: win,
+    percent: Math.max(0, Math.min(100, (tokens / win) * 100)),
+  };
+}
+
+/* Draw the read-only session's context in the ring. Only that session's own
+ * history may feed it; see contextForSession(). */
+function showViewedContext(messages, compactions) {
+  if (!S.viewSession) return;
+  resetCtxHighWater();
+  const cu = contextForSession(messages, compactions);
+  if (cu) setCtxRing(cu);
+  else setCtxRing(null);
 }
 
 /* context-usage progress ring + "[used/max]ctx" label.
@@ -1292,6 +1432,23 @@ function resetCtxHighWater() {
   S.ctxBaseTokens = null;
 }
 
+/* The ring's elements and circumference do not change; looking them up on
+ * every paint (12/s while streaming) forced style work for nothing. */
+let ctxRingCache = null;
+function ctxRingParts() {
+  if (ctxRingCache) return ctxRingCache;
+  const fg = $('ctx-ring-fg');
+  if (!fg) return null;
+  ctxRingCache = {
+    fg,
+    txt: $('ctx-ring-text'),
+    label: $('ctx-label'),
+    wrap: fg.closest('.ctx-ring'),
+    C: 2 * Math.PI * parseFloat(fg.getAttribute('r')),
+  };
+  return ctxRingCache;
+}
+
 function setCtxRing(cu, store = true) {
   // The window is remembered apart from the stats object it arrives in.
   // compaction_start nulls S.ctxStats on purpose - the count is about to be
@@ -1308,11 +1465,9 @@ function setCtxRing(cu, store = true) {
     S.ctxTurnPeak = peak;
     if (S.isStreaming && peak > cu.tokens) cu = { ...cu, tokens: peak, percent: cu.contextWindow ? (peak / cu.contextWindow) * 100 : cu.percent };
   }
-  const fg = $('ctx-ring-fg');
-  const txt = $('ctx-ring-text');
-  const label = $('ctx-label');
-  const wrap = fg.closest('.ctx-ring');
-  const C = 2 * Math.PI * parseFloat(fg.getAttribute('r'));
+  const parts = ctxRingParts();
+  if (!parts) return;
+  const { fg, txt, label, wrap, C } = parts;
   const tokens = cu && cu.tokens;
   const max = cu && cu.contextWindow;
   if (tokens == null || !max) {
@@ -1331,7 +1486,8 @@ function setCtxRing(cu, store = true) {
   S.ctxDisplayTokens = tokens;
   setAttr(fg, 'stroke-dasharray', `${(C * p / 100).toFixed(1)} ${C.toFixed(1)}`);
   setText(txt, p >= 10 ? String(Math.round(p)) : p.toFixed(1));
-  wrap.title = `Context: ${formatTok(tokens)} / ${formatTok(max)} tokens (${p.toFixed(1)}%)`;
+  const title = `Context: ${formatTok(tokens)} / ${formatTok(max)} tokens (${p.toFixed(1)}%)`;
+  if (wrap.title !== title) wrap.title = title;
   wrap.classList.toggle('warn', p >= 75 && p < 90);
   wrap.classList.toggle('critical', p >= 90);
   if (label) {
@@ -1392,7 +1548,7 @@ function usageContextTokens(u) {
  * of a fixed chars/4 guess. Both paths are clamped so the ring never walks
  * backwards mid-turn. */
 function liveCtxRing(estimatedExtra) {
-  if (!S.ctxStats) return;
+  if (S.viewSession || !S.ctxStats) return;
   const b = S.ctxStats;
   const peak = S.ctxTurnPeak || 0;
   let tokens;
@@ -1418,10 +1574,8 @@ function noteTokenRatio(usage, chars) {
 }
 
 /* session totals (↑ read / ↓ write) summed from assistant message usage */
-function updateTotals(extraUsage) {
-  const read = S.totals.read + ((u) => u ? (u.input || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0) : 0)(extraUsage);
-  const write = S.totals.write + (extraUsage ? (extraUsage.output || 0) : 0);
-  setText($('stat-tokens'), `↑ ${formatTok(read) ?? 0} · ↓ ${formatTok(write) ?? 0}`);
+function updateTotals() {
+  setText($('stat-tokens'), `↑ ${formatTok(S.totals.read) ?? 0} · ↓ ${formatTok(S.totals.write) ?? 0}`);
 }
 
 /* ───────────────────────── chat rendering ───────────────────────── */
@@ -1474,17 +1628,46 @@ chatScroller().addEventListener('scroll', saveReadingSoon);
 chatScroller().addEventListener('scroll', updateJumpTop, { passive: true });
 window.addEventListener('pagehide', saveReading);
 
-chatScroller().addEventListener('scroll', () => {
-  // Only an explicit wheel/touch gesture is trusted as "the user left the
-  // bottom". A scroll event that lands just after we pinned is normally the
-  // browser reacting to content being inserted above the viewport (the chat
-  // grows between our pin and the next layout pass), and treating that as a
-  // user scroll is what stopped auto-follow when a thinking block or tool card
-  // appeared mid-turn. Real gestures set S.userScrolling and are always
-  // honoured, so the guard can be strict here.
-  if (!S.userScrolling && Date.now() - lastProgrammaticScroll < 250) return;
+/* A native scrollbar drag does not fire wheel/touch events, so mark a pointer
+ * that starts on the scroller's own scrollbar as intent. Content clicks target
+ * descendants and must not count. */
+let scrollbarIntent = false;
+function noteScrollbarIntent(e) {
   const sc = chatScroller();
-  S.stickToBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 60;
+  const box = sc.getBoundingClientRect();
+  if (e.target === sc && (e.clientX >= box.left + sc.clientWidth || e.clientY >= box.top + sc.clientHeight)) {
+    scrollbarIntent = true;
+  }
+}
+chatScroller().addEventListener('pointerdown', noteScrollbarIntent, { passive: true });
+chatScroller().addEventListener('mousedown', noteScrollbarIntent, { passive: true });
+window.addEventListener('pointerup', () => {
+  if (!scrollbarIntent) return;
+  scrollbarIntent = false;
+  if (atBottom()) S.stickToBottom = true; // dragged back to the bottom → follow again
+}, { passive: true });
+window.addEventListener('pointercancel', () => { scrollbarIntent = false; }, { passive: true });
+
+let lastScrollTop = 0;
+chatScroller().addEventListener('scroll', () => {
+  const sc = chatScroller();
+  const gap = sc.scrollHeight - sc.scrollTop - sc.clientHeight;
+  const dist = Math.abs(sc.scrollTop - lastScrollTop);
+  lastScrollTop = sc.scrollTop;
+  /* Only an explicit wheel/touch/scrollbar gesture may unfollow. A scroll we
+   * did not ask for is normally the browser reacting to a layout change above
+   * the viewport: content-visibility realizing an off-screen message, scroll
+   * anchoring correcting for a tool card, or our own pin landing a frame
+   * early. Treating those as a user scroll is what randomly stopped following
+   * in long tool-heavy sessions (issue #266). If we were at the bottom, stay
+   * there. */
+  if (!S.userScrolling && !scrollbarIntent) {
+    if (S.stickToBottom) scrollBottom();
+    return;
+  }
+  if (!scrollbarIntent && Date.now() - lastProgrammaticScroll < 250) return;
+  if (dist < 4 && !scrollbarIntent) return; // jitter during a wheel/touch gesture
+  S.stickToBottom = gap < 60;
 });
 /* Re-pin once the newly inserted content has been laid out. scrollHeight read
  * in the same frame as an insert is stale, so the first pin can land short and
@@ -1495,9 +1678,27 @@ function pinSoon() {
     if (S.stickToBottom && !S.userScrolling && !S.liveDetached) scrollBottom();
   });
 }
+/* Follow content that grows after the insertion that caused it.
+ *
+ * A long tool call finishes by expanding its body (and pictures/diffs load a
+ * frame or two later). scrollBottom() runs when the node is inserted, but the
+ * height that matters is the height after those children have laid out - so the
+ * view ended a card or a few hundred pixels short of the bottom and looked
+ * stuck (issue #195). A resize observer catches the growth itself, including
+ * the final markup swap at the end of a turn, and re-pins if the reader is
+ * still at the bottom. */
+if (typeof ResizeObserver !== 'undefined') {
+  let pinFrame = null;
+  const pinObserver = new ResizeObserver(() => {
+    if (!S.stickToBottom || S.userScrolling || S.liveDetached) return;
+    if (pinFrame) return;
+    pinFrame = requestAnimationFrame(() => { pinFrame = null; scrollBottom(); });
+  });
+  pinObserver.observe(chat);
+}
 /* Explicit intent beats the guard above: a wheel-up or a touch drag is
  * unambiguous, so stop pinning before the browser even fires the scroll event.
- * Scrollbar drags are covered by the "dist < 4" check in the scroll handler. */
+ * Scrollbar drags are tracked by their pointerdown (see noteScrollbarIntent). */
 chatScroller().addEventListener('wheel', (e) => {
   if (e.deltaY < 0) S.stickToBottom = false;
   else if (atBottom()) S.stickToBottom = true;
@@ -1508,6 +1709,43 @@ chatScroller().addEventListener('wheel', (e) => {
     if (atBottom()) S.stickToBottom = true; // settled back at the bottom → follow again
   }, 180);
 }, { passive: true });
+
+/* Keyboard scrolling is reader intent too. Without this, the strict layout-
+ * scroll guard above would re-pin a PageUp/Home/arrow scroll while the agent is
+ * streaming, so keyboard users could not stop following. Only claim keys when
+ * the focused element can own the transcript's scroll (or is the page itself),
+ * and never while the key is being used to type or activate a control. */
+const SCROLL_INTENT_KEYS = new Set(['PageUp', 'PageDown', 'Home', 'End', 'ArrowUp', 'ArrowDown', ' ', 'Spacebar']);
+function noteKeyboardScrollIntent(e) {
+  if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
+  if (!SCROLL_INTENT_KEYS.has(e.key)) return;
+  const t = e.target;
+  if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/i.test(t.tagName || ''))) return;
+  if ((e.key === ' ' || e.key === 'Spacebar') && t && t.closest
+      && t.closest('button, a, summary, [role="button"]')) return;
+  const sc = chatScroller();
+  const focused = document.activeElement;
+  const canScroll = focused === sc || focused === document.body || focused === document.documentElement
+    || (sc.contains && sc.contains(focused));
+  if (!canScroll) return;
+  /* Set the direction now, not only when the scroll event arrives: the guard
+   * above deliberately ignores a scroll within 250 ms of one of our own pins,
+   * and that includes the event a PageUp produces right after new content
+   * arrived. Without this, the key looked like it had done nothing and the
+   * view snapped back to the bottom. */
+  const key = e.key === 'Spacebar' ? ' ' : e.key;
+  const pageUp = key === 'PageUp' || key === 'Home' || key === 'ArrowUp' || (key === ' ' && e.shiftKey);
+  if (pageUp) S.stickToBottom = false;
+  else if (atBottom()) S.stickToBottom = true;
+  S.userScrolling = true;
+  clearTimeout(userScrollIdle);
+  userScrollIdle = setTimeout(() => {
+    S.userScrolling = false;
+    if (atBottom()) S.stickToBottom = true;
+  }, 220);
+}
+window.addEventListener('keydown', noteKeyboardScrollIntent, { passive: true });
+
 chatScroller().addEventListener('touchstart', () => { S.userScrolling = true; }, { passive: true });
 chatScroller().addEventListener('touchmove', () => { S.stickToBottom = atBottom(); }, { passive: true });
 chatScroller().addEventListener('touchend', () => {
@@ -1611,157 +1849,15 @@ window.addEventListener('resize', () => { jumpTopDockH = 0; measureJumpTopDock()
  * and transform: scale() zooms about the centre - the crop stage, the chat
  * avatar and the background all compose the same way, so the preview in the
  * cropper is what you get. */
-const VIDEO_SRC = /\.(mp4|webm|mov|m4v|ogv|mkv)([?#]|$)/i;
-const IMAGE_SRC = /\.(png|jpe?g|gif|webp|avif|bmp|svg)([?#]|$)/i;
-function isVideoSrc(src) {
-  return /^data:video\//i.test(src || '') || VIDEO_SRC.test(src || '');
-}
 
-function mediaNode(src, cls) {
-  if (!src) return null;
-  let node;
-  if (isVideoSrc(src)) {
-    node = el('video', cls);
-    // A background video is muted unless the user asked for its sound; browsers
-    // block audible autoplay until the page has been interacted with, so that
-    // case waits for the first click instead of playing silently forever.
-    const wantsSound = cls === 'bg-node' && !!SET.bgAudio;
-    node.muted = !wantsSound;
-    node.volume = Math.max(0, Math.min(1, (SET.bgVolume == null ? 50 : Number(SET.bgVolume)) / 100));
-    node.loop = true; node.autoplay = true; node.playsInline = true;
-    node.setAttribute('playsinline', '');
-    // A background picture is decoration. Without this the browser offers its
-    // own menu on it - speed, sound, loop, "save video as" - which is useless
-    // for a file the user picked locally, and it swallows the right-click that
-    // should reach the page (spell-check suggestions included).
-    node.controls = false;
-    node.disablePictureInPicture = true;
-    node.setAttribute('disablepictureinpicture', '');
-    node.setAttribute('controlslist', 'nodownload noplaybackrate noremoteplayback');
-    node.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); return false; };
-    if (wantsSound) armBgAudioUnlock(node);
-  } else {
-    node = el('img', cls);
-  }
-  node.src = src;
-  return node;
-}
+
+
 
 /* Old object-position crops are converted by normalizeCrop; the real
 definitions live with the cropper. */
 
 /* Profile image for the chat header, the sidebar and the settings preview.
  * There is no built-in default: with no image set, only the name is shown. */
-/* ── the tab icon ─────────────────────────────────────────────────────────
- * One frame, painted once.
- *
- * This used to repaint the icon every 250ms whenever the agent's picture was a
- * video or a GIF, on the theory that an animated avatar should animate in the
- * tab. It does not: a favicon is a single image as far as every browser is
- * concerned, so those four canvases a second bought nothing anybody could see.
- * What they did buy was a 64x64 canvas allocated and PNG-encoded four times a
- * second for the entire life of the page, plus a <video> that stayed in the
- * document decoding frames nobody looked at. The tab looks exactly the same
- * and the page goes quiet. */
-let favIconPainted = false;
-let defaultFaviconHref = null;
-
-function updateFavicon() {
-  const link = document.querySelector('link[rel="icon"]');
-  if (!link) return;
-  if (defaultFaviconHref == null) defaultFaviconHref = link.getAttribute('href') || '';
-  const src = instanceMediaUrl(instanceLook().avatar) || '';
-  if (src === S.favSource && (S.favNode || favIconPainted)) return;   // already showing it
-  S.favSource = src;
-  favIconPainted = false;
-  if (S.favNode) { try { S.favNode.remove(); } catch { /* gone */ } S.favNode = null; }
-  if (!src) { link.setAttribute('href', defaultFaviconHref); favIconPainted = true; return; }
-  const media = mediaNode(src, 'fav-source');
-  if (!media) return;
-  // In the document, a few pixels off screen: a detached video never decodes a
-  // frame, so there would be nothing to draw.
-  const isVideo = media.tagName === 'VIDEO';
-  if (isVideo) {
-    media.muted = true;
-    media.loop = false;
-    media.autoplay = false;
-    media.playsInline = true;
-    // 'auto' and not 'metadata': a video stopped at metadata knows its size but
-    // has decoded nothing, and drawing it then produces an empty canvas.
-    media.preload = 'auto';
-  }
-  S.favNode = media;
-  document.body.appendChild(media);
-
-  /* Paint the icon from the first frame, and only if there *is* one.
-   *
-   * The failure this guards against is silent and total: a video that has its
-   * dimensions but no decoded frame reports a perfectly good videoWidth, so the
-   * draw goes ahead, paints nothing, and a fully transparent PNG replaces the
-   * default icon - a black square in the tab that nothing ever repairs. Asking
-   * the canvas whether it is actually empty is the only way to notice, because
-   * the browser says nothing either way. */
-  const paint = () => {
-    try {
-      const c = document.createElement('canvas');
-      c.width = 64; c.height = 64;
-      const g = c.getContext('2d');
-      const w = media.naturalWidth || media.videoWidth || 0;
-      const h = media.naturalHeight || media.videoHeight || 0;
-      if (!w || !h) return false;
-      // fills the square, cropped through the middle - like the avatar itself
-      const sc = Math.max(64 / w, 64 / h);
-      g.drawImage(media, (64 - w * sc) / 2, (64 - h * sc) / 2, w * sc, h * sc);
-      // one opaque pixel is enough to know a frame really landed
-      const px = g.getImageData(0, 0, 64, 64).data;
-      let any = false;
-      for (let i = 3; i < px.length; i += 4) { if (px[i]) { any = true; break; } }
-      if (!any) return false;
-      link.setAttribute('href', c.toDataURL('image/png'));
-      favIconPainted = true;
-      return true;
-    } catch { return false; }
-  };
-
-  /* One attempt, with a few tries: decoding a frame is not instantaneous, and a
-   * video only produces one once it has actually started. The icon is left
-   * exactly as it was until a real frame exists, so a clip that will not decode
-   * at all leaves the default icon rather than a black one. */
-  let tries = 0;
-  const giveUpAt = 6;
-  const attempt = () => {
-    if (S.favNode !== media) { drop(); return; }   // superseded by a newer avatar
-    if (paint() || ++tries >= giveUpAt) {
-      release();
-      drop();
-      return;
-    }
-    // a video that has metadata but no frame needs to be started before it will
-    // decode one; muted, so this is allowed without a click
-    if (isVideo && media.paused) media.play().catch(() => { /* retry below */ });
-    setTimeout(attempt, 180);
-  };
-  const release = () => {
-    if (S.favNode !== media) return;
-    S.favNode = null;
-    if (!isVideo) return;
-    // a video element left in the document keeps its decoder and its decoded
-    // frames alive for the rest of the session, and it is on screen for nobody
-    try { media.pause(); media.removeAttribute('src'); media.load(); } catch { /* ignore */ }
-  };
-  /* Off the page as soon as there is nothing left to do with it - a <video> is a
-   * decoder, and an <img> holding a GIF keeps animating. The timeout below is
-   * only a backstop for a source that never resolves one way or the other. */
-  const drop = () => { try { media.remove(); } catch { /* gone */ } };
-
-  // The src is set when the node is built, so a decoded image (a data URL, a
-  // small file) can already be there; a video usually needs the attempts above.
-  if (!paint()) attempt();
-  else { release(); drop(); }
-  // and a backstop, for a source that never resolves one way or the other
-  setTimeout(drop, giveUpAt * 180 + 900);
-}
-
 /* ── the instance's own face ─────────────────────────────────────────────
  * Agent name, picture and background belong to the *instance* you are looking
  * at, not to this browser: while you are on another machine you should see that
@@ -1842,80 +1938,6 @@ async function loadRemoteLook() {
  *
  * So: the sidebar keeps the animation (one decoder), everything else shows a
  * still frame captured from that video once, as a data URL. */
-const avatarStillCache = new Map();   // src -> dataURL | 'pending' | 'failed'
-const avatarStillPending = new Set();
-
-/* The picture to show for `src`: the source itself for a normal image, a still
- * for a video (null until the capture finishes, so no <video> is ever created
- * for a message header). */
-function avatarStillSrc(src) {
-  if (!src) return null;
-  if (!isVideoSrc(src)) return src;
-  const hit = avatarStillCache.get(src);
-  if (hit === 'failed') return null;
-  if (hit && hit !== 'pending') return hit;
-  if (!avatarStillPending.has(src)) captureAvatarStill(src);
-  return null;
-}
-
-/* Decode one frame off-screen, draw it square (the crop frame's default shape)
- * and keep the PNG. Never hangs: a timeout falls back to a failed mark. */
-function captureAvatarStill(src) {
-  avatarStillPending.add(src);
-  avatarStillCache.set(src, 'pending');
-  const v = document.createElement('video');
-  v.muted = true;
-  v.playsInline = true;
-  v.preload = 'auto';
-  let settled = false;
-  const finish = (ok) => {
-    if (settled) return;
-    settled = true;
-    avatarStillPending.delete(src);
-    if (ok) {
-      try {
-        const w = v.videoWidth || 96;
-        const h = v.videoHeight || 96;
-        const side = Math.max(1, Math.min(w, h));
-        const size = Math.min(160, side);
-        const c = document.createElement('canvas');
-        c.width = size;
-        c.height = size;
-        c.getContext('2d').drawImage(v, (w - side) / 2, (h - side) / 2, side, side, 0, 0, size, size);
-        avatarStillCache.set(src, c.toDataURL('image/png'));
-      } catch (e) {
-        avatarStillCache.set(src, 'failed');
-      }
-    } else {
-      avatarStillCache.set(src, 'failed');
-    }
-    releaseMedia(v);
-    refreshAvatars();          // swap the still in
-  };
-  v.addEventListener('loadeddata', () => { try { v.currentTime = 0.05; } catch (e) { finish(!!v.videoWidth); } }, { once: true });
-  v.addEventListener('seeked', () => finish(!!v.videoWidth), { once: true });
-  v.addEventListener('loadedmetadata', () => { if (!v.videoWidth) finish(false); }, { once: true });
-  v.addEventListener('error', () => finish(false), { once: true });
-  setTimeout(() => finish(!!v.videoWidth), 5000);
-  v.src = src;
-}
-
-/* Detaching a <video> is not enough: it keeps its resource, decoder and
- * buffers until the source is cleared. Dropping the old avatar nodes without
- * this is what leaked memory as videos were re-rendered. */
-function releaseMedia(node) {
-  if (!node || node.tagName !== 'VIDEO') return;
-  try { node.pause(); } catch (e) { /* ignore */ }
-  node.removeAttribute('src');
-  try { node.load(); } catch (e) { /* ignore */ }
-}
-
-/* Everything before a transcript rebuild: free the decoders first. */
-function releaseVideosIn(root) {
-  if (!root || !root.querySelectorAll) return;
-  root.querySelectorAll('video').forEach(releaseMedia);
-}
-
 /* What an avatar slot should show right now. `still` asks for the transcript
  * version (a picture); ready=false means "leave the slot alone", not "empty". */
 function avatarWant(forceLocal, still) {
@@ -1995,66 +2017,6 @@ function avatarAnimateCount() {
   if (n === AVATAR_ALL) return Infinity;
   if (!Number.isFinite(n) || n <= 0) return 0;
   return Math.max(1, Math.min(AVATAR_ANIMATE_MAX, Math.round(n)));
-}
-
-/* The frame every animated avatar should be showing: one wall-clock position,
- * taken from page load, wrapped by the clip's duration. All of them play the same
- * file, so aligning each to this clock is enough to keep the group together - and
- * unlike "follow the first video that is playing" it cannot be dragged off by a
- * freshly built one (a transcript rebuild creates videos at 0, and following one
- * of those pulled the whole group back to the start). */
-const avatarClockAt = performance.now();
-function avatarClockNow() {
-  return (performance.now() - avatarClockAt) / 1000;
-}
-function alignAvatarVideo(v) {
-  if (!v || v.readyState < 1) return;
-  // A video that is still loading can report a bogus (tiny) duration, and
-  // `t %= tiny` is ~0 - which pinned the whole group on the first frame. Only
-  // wrap for a believable duration, and only seek inside what is really seekable.
-  const d = v.duration;
-  if (!isFinite(d) || d < 2) return;
-  const t = Math.max(0, avatarClockNow()) % d;   // the group loops, so the position wraps
-  if (Math.abs(v.currentTime - t) < 0.12) return;
-  try { v.currentTime = t; } catch (e) { /* not seekable yet */ }
-}
-
-/* Keep every animated avatar on that clock. A seek only happens when one has
- * drifted, so a settled group costs nothing. */
-function syncAvatarVideos() {
-  const vids = [...document.querySelectorAll('video.avatar')];
-  // A background tab still gets its requestAnimationFrame ticks (browsers clamp
-  // them to ~1/s but do not stop them) and the browser does not skip decoding
-  // for an element nobody can see. Pausing the whole group when the document is
-  // hidden is the difference between an idle second tab costing nothing and
-  // costing four video decoders' worth of CPU.
-  const hidden = document.visibilityState !== 'visible';
-  for (const v of vids) {
-    if (hidden) { if (!v.paused) { try { v.pause(); } catch { /* ignore */ } } continue; }
-    if (v.paused) v.play().catch(() => {});
-    if (v.readyState < 2) { v.addEventListener('canplay', () => alignAvatarVideo(v), { once: true }); continue; }
-    alignAvatarVideo(v);
-  }
-}
-
-/* Pause every video this page owns when it is not on screen, and start it again
- * when it is. The same argument as the avatars above, applied to the background
- * clip: a decorative video behind a minimised window is a decoder and a buffer
- * for nothing. The background only plays when it is meant to be heard or seen,
- * and never on a tab nobody is looking at. */
-function pauseMediaWhenHidden() {
-  const hidden = document.visibilityState !== 'visible';
-  if (hidden) {
-    document.querySelectorAll('#bg-media video').forEach((v) => { if (!v.paused) { try { v.pause(); } catch { /* ignore */ } } });
-    document.querySelectorAll('video.avatar').forEach((v) => { if (!v.paused) { try { v.pause(); } catch { /* ignore */ } } });
-  } else {
-    const bg = document.querySelector('#bg-media video');
-    if (bg) {
-      const wanted = bg.dataset.wantedPlay === '1';
-      if (wanted) bg.play().catch(() => {});
-    }
-    syncAvatarVideos();
-  }
 }
 
 /* The newest few messages animate; every older one shows the still. Called after
@@ -2148,7 +2110,7 @@ function refreshAvatars() {
   const prev = $('set-avatar-preview');
   if (prev) {
     // Only the user's own image here, so "clear" visibly clears it (the app
-    // icon fallback in the RN shell is not something you can crop or delete).
+    // icon fallback in the desktop shell is not something you can crop or delete).
     // The dialog edits this machine's own settings, so its preview shows this
     // machine's picture even while you are looking at another instance.
     const local = avatarWant(true, false);
@@ -2162,6 +2124,14 @@ function refreshAvatars() {
       prev.replaceChildren();
       prev.style.visibility = 'hidden';
     }
+  }
+  // These two only make sense for a picture that exists. Leaving them visible
+  // on an empty row put three buttons beside "Profile image" and made the
+  // upload button look like one of a set rather than the way in.
+  const hasAvatar = !!SET.avatar;
+  for (const id of ['btn-avatar-crop', 'btn-avatar-clear']) {
+    const b = $(id);
+    if (b) b.classList.toggle('hidden', !hasAvatar);
   }
 }
 
@@ -2193,9 +2163,7 @@ function addToolButton(container, label, title, fn) {
 }
 
 function addCopyButton(tools, getText) {
-  addToolButton(tools, 'copy', 'Copy text', () => {
-    navigator.clipboard.writeText(getText()).then(() => toast('Copied'));
-  });
+  addToolButton(tools, 'copy', 'Copy text', () => copyText(getText(), 'Copied'));
 }
 
 function addSpeakButton(tools, getText) {
@@ -2283,118 +2251,8 @@ function restoreReading(retries = 3, force) {
   // for a couple of seconds rather than landing short.
   const delays = [60, 200, 450, 900, 1600];
   const step = delays.length - Math.max(0, retries);
-  if (retries > 0 && step >= 0) setTimeout(() => restoreReading(retries - 1, force), delays[Math.min(step, delays.length - 1)]);
-  else if (retries > 0) setTimeout(() => restoreReading(retries - 1, force), 1600);
+  if (retries > 0) setTimeout(() => restoreReading(retries - 1, force), delays[Math.min(step, delays.length - 1)]);
 }
-
-function sessionUiKey() {
-  const p = S.viewSession || (S.state && S.state.sessionFile) || 'none';
-  // ...and per instance: the same path on two machines is two different sessions.
-  return `piwebui-session-ui:${instanceKey()}:${String(p).slice(-120)}`;
-}
-function saveSessionUi(patch) {
-  try {
-    const raw = localStorage.getItem(sessionUiKey());
-    const cur = raw ? JSON.parse(raw) : {};
-    localStorage.setItem(sessionUiKey(), JSON.stringify({ ...cur, ...patch, at: Date.now() }));
-  } catch { /* private mode / quota */ }
-}
-function loadSessionUi() {
-  try {
-    const raw = localStorage.getItem(sessionUiKey());
-    if (!raw) return null;
-    const d = JSON.parse(raw);
-    // old enough to be noise rather than state
-    if (!d || !d.at || Date.now() - d.at > 12 * 3600 * 1000) return null;
-    return d;
-  } catch { return null; }
-}
-
-/* ── the task clock (the number at the bottom) ───────────────────────────
- * "How long did that take?" means the whole task: from the message you sent to
- * the agent's last word, across every turn, tool call and compaction in between.
- * It is kept per session in localStorage, so a reload keeps counting instead of
- * starting over - and only sending a message starts a new one, because the
- * automatic continue after a compaction is the same task, not a new one. */
-function startRunClock() {
-  S.runStartTs = Date.now();
-  S.runMs = null;
-  saveSessionUi({ runStart: S.runStartTs, runMs: null });
-  paintRunStat();
-  ensureTick();
-}
-function finishRunClock(atMs) {
-  if (!S.runStartTs) { paintRunStat(); return; }
-  const end = Number(atMs) > S.runStartTs ? Number(atMs) : Date.now();
-  S.runMs = Math.max(0, end - S.runStartTs);
-  S.runStartTs = null;
-  S.lastRun = { ms: S.runMs, ts: Date.now() };
-  saveSessionUi({ runStart: null, runMs: S.runMs });
-  paintRunStat();
-  ensureTick();
-}
-function paintRunStat() {
-  const stat = $('stat-turn');
-  if (!stat) return;
-  const live = !!S.runStartTs;
-  const ms = live ? Date.now() - S.runStartTs : (S.runMs || 0);
-  stat.classList.toggle('live', live);
-  if (!ms && !live) { setText(stat, ''); stat.title = 'how long the task took'; return; }
-  setText(stat, `total ${fmtElapsed(ms)}`);
-  stat.title = live
-    ? 'time since you sent your message — every turn, tool call and compaction counts'
-    : 'how long the last task took, from your message to the agent’s last word';
-}
-/* The timestamp of the agent's last word: that is when a task ended, which is a
- * better boundary than "whenever this page noticed". */
-function lastAssistantTs() {
-  const b = [...chat.querySelectorAll('.msg.assistant')].pop();
-  return b ? Number(b.dataset.ts) || 0 : 0;
-}
-/* After a reload: still running means keep counting from the same start; already
- * finished means show the number it stopped at. */
-function restoreRunClock() {
-  const kept = loadSessionUi();
-  if (kept) {
-    if (kept.runStart && !S.runStartTs) { S.runStartTs = kept.runStart; S.runMs = null; }
-    else if (!S.runStartTs && !S.runMs && kept.runMs) S.runMs = kept.runMs;
-  }
-  // The page may have been away when it ended: the agent is idle now, so the
-  // agent's last message is where the clock stopped.
-  if (S.runStartTs && S.agentBusy === false && !S.compacting) {
-    const endTs = lastAssistantTs();
-    if (endTs > S.runStartTs) finishRunClock(endTs);
-  }
-  paintRunStat();
-  ensureTick();
-}
-
-function stampTurnTimer() {
-  const start = S.turnStartTs;
-  S.turnStartTs = null;
-  if (!start) return;
-  const ms = Date.now() - start;
-  // Remembered so a later re-render (or a session reload) can put the total
-  // back on the last message instead of losing it.
-  S.lastTurn = { ms, ts: Date.now() };
-  saveSessionUi({ lastTurn: S.lastTurn });
-  const bubbles = chat.querySelectorAll('.msg.assistant .bubble');
-  const bubble = bubbles.length ? bubbles[bubbles.length - 1] : null;
-  if (!bubble) return;
-  bubble.querySelectorAll('.turn-timer').forEach((n) => n.remove());
-  bubble.appendChild(el('div', 'turn-timer', `turn took ${fmtElapsed(ms)}`));
-}
-
-/* The bottom indicator is the task clock now (see paintRunStat), so a turn
- * starting only has to make sure one is running. It used to be a per-turn
- * stopwatch here, which reset to zero on every assistant turn - so a task with
- * five turns never showed its real total, and a reload started over. */
-function startTurnTimer() {
-  paintRunStat();
-  ensureTick();
-  return () => {};
-}
-
 
 /* ── manual crop ──────────────────────────────────────────────────────────
  * Drag to move, scroll (or use the slider) to zoom. The crop is stored as an
@@ -2590,7 +2448,6 @@ function notifyTurnDone() {
  * is passed through untouched (and, if it is too big, still will not show -
  * which the note under the field says).
  */
-const CURSOR_MAX = 128;         // Chromium's documented maximum for a CSS cursor
 
 
 
@@ -2604,7 +2461,11 @@ wireCodePreview();     // the eye on html/svg code blocks (issue #175)
 // The list is fetched by the settings voice dropdown (and by speak()), never at
 // boot: the first getVoices() can block for a second or more on Firefox, and
 // nothing on the page is waiting for it until the reader asks for it.
-speechSynthesis?.addEventListener?.('voiceschanged', () => { refreshTtsVoices(); populateTtsVoiceSelect(); });
+/* A browser voiceschanged event must not call getVoices() by itself: on
+ * Firefox the first call can block for a second, and this event fires after the
+ * page has painted. Invalidate the cache; the settings voice dropdown fetches
+ * when it is actually opened (issue #150). */
+speechSynthesis?.addEventListener?.('voiceschanged', () => { ttsVoiceCache = null; });
 applyReelsWidth();   // reads SET; must run after this script (issue #54)
 wireTypeAnywhere();
 applySettings();
@@ -2647,6 +2508,23 @@ chat.addEventListener('contextmenu', (e) => {
 if ($('btn-subagents')) {
   $('btn-subagents').onclick = (e) => { e.stopPropagation(); openSubagentsMenu($('btn-subagents')); };
   updateSubagentsBtn();
+}
+if ($('plain-exit')) {
+  $('plain-exit').onclick = async () => {
+    const btn = $('plain-exit');
+    btn.disabled = true;
+    try {
+      const r = await fetch(api('/api/agent-mode'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'normal' }),
+      });
+      const d = await r.json();
+      if (!r.ok || !d.ok) throw new Error(d.error || `failed (${r.status})`);
+      toast('Leaving plain chat…');
+    } catch (e) {
+      toast(`Could not leave plain chat: ${e.message}`, 'error');
+    } finally { btn.disabled = false; }
+  };
 }
 if ($('subagent-close')) $('subagent-close').onclick = () => $('subagent-dialog').close();
 if ($('subagent-copy')) $('subagent-copy').onclick = () => copyText($('subagent-body').textContent || '', 'Copied what it wrote');
@@ -2695,8 +2573,10 @@ wireDropRow($('setup-bg-upload') && $('setup-bg-upload').closest('.rate-row'), (
     if (e.target.closest('.session-item') || e.target.closest('.session-folder')) return;
     e.preventDefault();
     openMenu(e.target.closest('.session-list') || list, [
-      { label: 'new folder…', hint: 'group sessions by hand', onPick: () => addFolderDialog() },
       { label: 'refresh the list', onPick: () => refreshSessions(true) },
+      // Keep "new folder…" at the bottom: it is the occasional action here,
+      // while refreshing is what this menu is usually opened for.
+      { label: 'new folder…', hint: 'group sessions by hand', onPick: () => addFolderDialog() },
     ], { title: 'sessions', width: 320, force: true, at: { x: e.clientX, y: e.clientY } });
   });
   list.addEventListener('dragover', (e) => {
@@ -2735,6 +2615,7 @@ if ($('btn-instance')) {
   $('btn-instance').onclick = (e) => { e.stopPropagation(); openInstanceMenu($('btn-instance')); };
   updateInstanceBtn();
   setTimeout(() => { pollInstances().catch(() => {}); }, 1500);
+  startGoalPoll();
   refreshGoals().catch(() => {});
   // Every eight seconds means a request to every configured instance, all day,
   // to keep one dot in a menu that is closed almost all of the time. Polled only

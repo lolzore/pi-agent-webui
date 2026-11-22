@@ -8,8 +8,11 @@
  */
 'use strict';
 
+const sessionModes = require('../session-modes');
+
 module.exports = function sessionRoutes(deps) {
   const {
+    PI_AGENT_DIR,
     SESSION_DIR,
     WRITE_CHUNK,
     agentStatus,
@@ -54,19 +57,36 @@ module.exports = function sessionRoutes(deps) {
     // identical from the outside (a session path that is not in this list), and
     // guessing between them is what made a new chat jump somewhere else on a
     // quick reload.
+    const scanned = await scanSessions();
+    const modes = sessionModes.read(PI_AGENT_DIR);
+    const sessions = scanned.map((s) => ({ ...s, mode: modes[s.path] === 'plain' ? 'plain' : 'normal' }));
+    const current = agentStatus.sessionFile;
+    const pending = current && /\.jsonl$/i.test(current) && !sessions.some((s) => s.path === current)
+      ? { path: current, fileName: path.basename(current), name: agentStatus.sessionName || 'new session', mtime: Date.now(), size: 0, pending: true, mode: agentStatus.mode || 'normal' }
+      : null;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       sessionDir: SESSION_DIR,
       remembered: loadLastSession(),
-      sessions: await scanSessions(),
+      sessions,
+      pending,
       // A scan that failed is reported alongside the empty list, so the sidebar
       // can say "the session directory could not be read" instead of looking
       // like an account with no sessions in it (issue #30).
       scanError: scanState.lastScanError,
+      // Bytes the last scan had to read (0 when every file was a cache hit).
+      scanBytes: scanState.lastScanBytes || 0,
       // What the agent is doing right now, so a page that reloads in the middle
       // of it (or a second tab) shows the same thing as the one that started it.
       busy: agentStatus.busy,
       compacting: agentStatus.compacting,
+      // A resume the bridge itself is performing. The page must wait for it
+      // instead of switching to the same session again: session_start fires for
+      // each switch, and extensions that ask a question there (goal-x) ask it
+      // twice (issue #220).
+      resuming: agentStatus.resuming || null,
+      // 'normal' or 'plain' - plain has no tools/extensions/skills/AGENTS.md.
+      mode: agentStatus.mode || 'normal',
     }));
     return;
   }
@@ -147,7 +167,15 @@ module.exports = function sessionRoutes(deps) {
         res.end(JSON.stringify({ error: 'that image is no longer at that line' }));
         return;
       }
-      const mime = String(block.mimeType || 'image/png');
+      const mime = String(block.mimeType || 'image/png').toLowerCase();
+      /* The MIME comes out of the session file, so it is data, not a promise:
+       * an "image" block could claim text/html and be served inline on the
+       * bridge origin. Only real image types are served. */
+      if (!/^image\/[a-z0-9.+-]+$/.test(mime)) {
+        res.writeHead(415, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ error: `unsupported image type ${JSON.stringify(mime)}` }));
+        return;
+      }
       const data = /^data:/i.test(block.data) ? block.data.slice(block.data.indexOf(',') + 1) : block.data;
       const bytes = Buffer.from(data, 'base64');
       const etag = `"${crypto.createHash('sha1').update(`${ref.path || ref.container}:${wantLine}:${wantPart}:${data.length}`).digest('hex')}"`;
@@ -158,6 +186,7 @@ module.exports = function sessionRoutes(deps) {
       }
       res.writeHead(200, {
         'Content-Type': mime,
+        'X-Content-Type-Options': 'nosniff',
         'Content-Length': bytes.length,
         ETag: etag,
         // immutable: the URL changes whenever the file does, so this can be cached

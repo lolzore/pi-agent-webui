@@ -7,6 +7,10 @@
  */
 'use strict';
 
+/* Chromium's documented maximum for a CSS cursor; larger pictures are dropped
+ * silently, so appearance.js normalises every cursor down to this. */
+const CURSOR_MAX = 128;
+
 let cursorApplied = { src: '', size: 0, url: '' };   // what is in the CSS right now
 let cursorDrawing = false;
 
@@ -117,8 +121,10 @@ function cursorNoteTimerSoon() {
 
 async function verifyCustomCursor() {
   const src = (SET.cursorImage || '').trim();
-  const note = $('cursor-note');
-  const say = (t) => { if (note) note.textContent = t; };
+  // The explanation lives behind the ? on "Custom cursor"; this row is only
+  // the live result (and the reason when the picture cannot be used).
+  const status = $('cursor-status');
+  const say = (t) => { if (!status) return; status.textContent = t; status.classList.toggle('hidden', !t); };
   if (!src) { say(''); return true; }
   const seen = await cursorImageLoads(src);
   if (!seen.ok) {

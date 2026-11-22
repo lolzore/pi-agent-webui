@@ -140,9 +140,14 @@ const getJson = (p) => new Promise((res, rej) => {
     window.__rpc = [];
     window.rpc = (m, t) => { window.__rpc.push(m && m.type); return real(m, t); };
     bar().querySelector('button').click();
-    await new Promise((r) => setTimeout(r, 400));
+    // The bar clears after abort_retry is answered, so wait for the state
+    // instead of a fixed 400ms: a busy bridge answered late and the check read
+    // the bar as stuck (the same failure appeared in one run out of three).
     res.cancelSent = window.__rpc.slice();
+    const until = Date.now() + 15000;
+    while (Date.now() < until && !bar().classList.contains('hidden')) await new Promise((r) => setTimeout(r, 50));
     res.hiddenAfterCancel = bar().classList.contains('hidden');
+    res.cancelWaitMs = 15000 - (until - Date.now());
     // auto_retry_end hides it too, and agent_settled leaves nothing behind.
     handleRpcMessage({ type: 'auto_retry_start', attempt: 3, maxAttempts: 5, delayMs: 1000, errorMessage: 'again' });
     const shownAgain = !bar().classList.contains('hidden');

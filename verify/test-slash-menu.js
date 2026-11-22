@@ -97,9 +97,38 @@ const getJson = (p) => new Promise((res, rej) => {
   const press = (sel) => `{ const el = document.querySelector(${JSON.stringify(sel)}); const r = el ? el.getBoundingClientRect() : null;
     (el || document.body).dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: r ? r.left + 4 : 4, clientY: r ? r.top + 4 : 4 })); }`;
 
+  const geometry = () => evalJs(`(() => {
+    const m = document.querySelector('.slash-menu');
+    if (!m) return JSON.stringify({ missing: true });
+    const b = m.getBoundingClientRect();
+    const r = document.querySelector('.composer-row').getBoundingClientRect();
+    const vv = window.visualViewport;
+    return JSON.stringify({
+      menu: { x: b.x, y: b.y, w: b.width, h: b.height, right: b.right, bottom: b.bottom },
+      row: { x: r.x, y: r.y, w: r.width, h: r.height, right: r.right, bottom: r.bottom },
+      vw: vv ? vv.width : innerWidth,
+      vh: vv ? vv.height : innerHeight,
+    });
+  })()`).then((v) => JSON.parse(v));
+  const checkGeometry = (g, where) => {
+    if (g.missing) fail(where + ': the menu disappeared');
+    if (g.menu.x < -1 || g.menu.right > g.vw + 1) fail(where + ': the menu is outside the viewport horizontally: ' + JSON.stringify(g));
+    if (g.menu.y < -1 || g.menu.bottom > g.vh + 1) fail(where + ': the menu is outside the viewport vertically: ' + JSON.stringify(g));
+    if (g.menu.bottom > g.row.y + 1) fail(where + ': the menu is not above the composer row: ' + JSON.stringify(g));
+  };
+
   let s = await act(typeSlash());
   console.log(`  typed "/"                    : open=${s.open} menus=${s.menus}`);
   if (!s.open) fail('the slash menu did not open on "/" at all, so nothing below means anything');
+  checkGeometry(await geometry(), 'initial open');
+
+  /* Follow the composer when the page settles under an open menu (the menu
+   * used to stay at the position it had at open). */
+  await evalJs("document.getElementById('composer-dock').style.transform = 'translateY(-180px)'; true");
+  await sleep(250);
+  checkGeometry(await geometry(), 'after the composer moved up');
+  await evalJs("document.getElementById('composer-dock').style.transform = ''; true");
+  await sleep(150);
 
   s = await act(press('#chat'));
   console.log(`  then clicked the transcript  : open=${s.open} menus=${s.menus}`);
@@ -131,6 +160,18 @@ const getJson = (p) => new Promise((res, rej) => {
   s = await act(`input.value = '/zzz-nothing-matches-this'; input.setSelectionRange(input.value.length, input.value.length); input.dispatchEvent(new Event('input', { bubbles: true }));`);
   if (s.open) fail('a query that matches no command still shows the menu');
   ok('#51 Escape still closes it, and a query with no matches shows nothing');
+
+  /* Issue #203: the menu must stay inside the visible viewport, and follow the
+   * composer when the window changes while it is open - a menu placed once at
+   * the old size ends up below the visible chat area and only a reload puts it
+   * back. */
+  await act(typeSlash());
+  checkGeometry(await geometry(), 'open before the resize');
+  await send('Emulation.setDeviceMetricsOverride', { width: 380, height: 320, deviceScaleFactor: 1, mobile: false });
+  await sleep(300);
+  checkGeometry(await geometry(), 'resize while the menu is open');
+  await act(typeSlash());
+  checkGeometry(await geometry(), 'reopened at 380x320');
 
   if (problems.length) fail(problems.slice(0, 3).join(' | '));
   ws.close(); cleanup();

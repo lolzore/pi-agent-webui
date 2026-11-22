@@ -18,7 +18,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRIDGE_DIR="$ROOT/bridge"
-SOURCE_FILE="$BRIDGE_DIR/agent-source.txt"
+SOURCE_FILE="${PI_WEBUI_SOURCE_FILE:-$BRIDGE_DIR/agent-source.txt}"
 PORT="${PORT:-}"
 INSTANCE="${INSTANCE:-}"
 
@@ -38,6 +38,18 @@ if [ -n "$INSTANCE" ]; then
   REAL_HOME="$HOME"
   export HOME="${PI_WEBUI_INSTANCE_HOME:-$REAL_HOME/.pi/webui-instances/$INSTANCE}"
   mkdir -p "$HOME"
+  # The pi launcher looks for its managed Node under $HOME. A new instance has
+  # no copy there, so without this it falls back to the system Node 18, which is
+  # too old for this pi release (enableCompileCache is missing) and the agent
+  # exits code 1 while the bridge keeps restarting it. Put the real managed Node
+  # on PATH before anything invokes pi.
+  for _nodebin in "$REAL_HOME/.local/share/pi-node/current/bin" "${XDG_DATA_HOME:-$REAL_HOME/.local/share}/pi-node/current/bin"; do
+    if [ -x "$_nodebin/node" ]; then
+      PATH="$_nodebin:$PATH"
+      export PATH
+      break
+    fi
+  done
   # HOME is not always enough: pi's own variables override it, and a shell that
   # has them exported (PI_CODING_AGENT_DIR) would point the second agent at the
   # first one's config. Pin every name the two programs read to this home.
@@ -45,6 +57,30 @@ if [ -n "$INSTANCE" ]; then
   export PI_CODING_AGENT_SESSION_DIR="$PI_CODING_AGENT_DIR/sessions"
   export PI_AGENT_DIR="$PI_CODING_AGENT_DIR"
   export PI_SESSION_DIR="$PI_CODING_AGENT_SESSION_DIR"
+  mkdir -p "$PI_CODING_AGENT_DIR"
+  # Share the main agent's configuration and resources - extensions, skills,
+  # prompts, themes, packages, MCP servers, models and settings - while keeping
+  # sessions and the managed install private. A new instance otherwise starts
+  # with none of the extensions the main one has and looks like a different app.
+  # A regular file that is already identical to the main one is migrated to a
+  # symlink; a file the instance deliberately changed is left alone.
+  for _shared in auth.json models.json models-store.json schizodev-catalog.json \
+                 settings.json mcp.json mcp-auth.json mcp-cache.json AGENTS.md \
+                 extensions skills prompts themes npm pets \
+                 webui-settings.json webui-session-modes.json webui-model-cache.json; do
+    _src="$REAL_HOME/.pi/agent/$_shared"
+    _dst="$PI_CODING_AGENT_DIR/$_shared"
+    [ -e "$_src" ] || continue
+    if [ -L "$_dst" ]; then continue; fi
+    if [ -e "$_dst" ]; then
+      if [ -f "$_dst" ] && [ -f "$_src" ] && cmp -s "$_src" "$_dst" 2>/dev/null; then
+        rm -f "$_dst"
+        ln -s "$_src" "$_dst" 2>/dev/null || cp -R "$_src" "$_dst" 2>/dev/null || true
+      fi
+      continue
+    fi
+    ln -s "$_src" "$_dst" 2>/dev/null || cp -R "$_src" "$_dst" 2>/dev/null || true
+  done
   # Keep the managed installer pointed at the install this launcher already
   # uses; a fresh HOME has no version cache of its own.
   export PI_MANAGED_INSTALL_ROOT="${PI_MANAGED_INSTALL_ROOT:-$REAL_HOME/.pi/agent/install}"
@@ -83,7 +119,7 @@ choose_source() {
   say "   1. Natively on this machine  (pi CLI installed)"
   say "   2. Inside a Docker container"
   printf 'Select [1/2]: '
-  read -r pick
+  read -r pick || die "no selection made."
   case "$pick" in
     1) SOURCE=native ;;
     2)
@@ -95,7 +131,7 @@ choose_source() {
       local i=1
       for n in "${names[@]}"; do say "   $i. $n"; i=$((i + 1)); done
       printf 'Pick container number [1-%d]: ' "${#names[@]}"
-      read -r num
+      read -r num || die "no selection made."
       [[ "$num" =~ ^[0-9]+$ ]] || die "not a number."
       CONTAINER="${names[$((num - 1))]:-}"
       [ -n "$CONTAINER" ] || die "invalid selection."
@@ -103,7 +139,16 @@ choose_source() {
       ;;
     *) die "no selection made." ;;
   esac
-  { echo "source=$SOURCE"; [ -n "$CONTAINER" ] && echo "container=$CONTAINER"; } > "$SOURCE_FILE"
+  # Do not use `[ -n "$CONTAINER" ] && echo ...` here: with `set -e`, the
+  # failed test on the native path made the whole launcher exit on the very
+  # first run, right after asking where pi lives. The saved file appeared, so
+  # the next launch skipped the prompt and worked - exactly the "it closes
+  # once, then is fine when reopened" report.
+  if [ -n "$CONTAINER" ]; then
+    { echo "source=$SOURCE"; echo "container=$CONTAINER"; } > "$SOURCE_FILE"
+  else
+    echo "source=$SOURCE" > "$SOURCE_FILE"
+  fi
 }
 
 [ -n "$SOURCE" ] || choose_source
@@ -136,7 +181,7 @@ if [ -n "$HOLDER" ]; then
   say " Something is already listening on port ${PORT}:"
   say "   $HOLDER"
   printf 'Stop it and start a fresh WebUI? [y/N]: '
-  read -r answer
+  read -r answer || answer=''
   case "$answer" in
     y|Y)
       if command -v fuser >/dev/null 2>&1; then fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true; fi
@@ -158,7 +203,7 @@ export WORKSPACE_DIR="${WORKSPACE_DIR:-$ROOT}"
 
 say ""
 say "Starting the Pi Agent WebUI on http://localhost:${PORT}"
-[ -n "${PI_INSTANCE_NOTE:-}" ] && say "  ${PI_INSTANCE_NOTE}"
+if [ -n "${PI_INSTANCE_NOTE:-}" ]; then say "  ${PI_INSTANCE_NOTE}"; fi
 say "  agent     : $PI_COMMAND"
 say "  workspace : $WORKSPACE_DIR"
 say "  sessions  : $PI_SESSION_DIR"

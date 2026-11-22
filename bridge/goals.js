@@ -56,6 +56,11 @@ function goalSummary(rec, focused, file) {
     id: rec.id || null,
     objective: String(rec.objective || '').trim(),
     status: rec.status || 'unknown',
+    // goal-x records the owning session id in its scheduler. The route turns
+    // this into a session file so the WebUI can follow a goal back to the
+    // conversation it was started in.
+    sessionId: (rec.scheduler && typeof rec.scheduler.owner === 'string' && rec.scheduler.owner !== 'unknown-session')
+      ? rec.scheduler.owner : null,
     focused: !!focused,
     sisyphus: !!rec.sisyphus,
     autoContinue: rec.autoContinue !== false,
