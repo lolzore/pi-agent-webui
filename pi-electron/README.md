@@ -1,9 +1,7 @@
 # Pi Agent — desktop app (Electron)
 
 The WebUI in a native window, with the **real** shorts feeds beside it. One
-codebase for Windows and Linux, and it replaces the React Native Windows app
-(`pi-desktop/`) — that app's only extra capability, the native webview, is
-exactly what this one keeps.
+codebase for Windows and Linux.
 
 ## Why a webview and not the browser
 
@@ -24,7 +22,7 @@ app exists; everything else is the WebUI you already know.
   feed, kept mounted so switching tabs is instant and each feed keeps its
   cookies/login (`persist:shorts-<feed>`). Drag the toolbar's left edge to
   resize.
-- **Per-feed identity** (`feeds.js`, shared with the native app): desktop UA for
+- **Per-feed identity** (`feeds.js`): desktop UA for
   Instagram/TikTok, mobile UA for YouTube Shorts; scrollbars and the rubber-band
   overscroll are hidden; autoplay is unblocked with a preload that runs before
   the page's own scripts; cookie/install nags are scrubbed after load.

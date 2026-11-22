@@ -215,7 +215,7 @@ function makeErrorBlock(msg) {
   return d;
 }
 
-function renderAssistantMessage(msg, timing) {
+function renderAssistantMessage(msg, timing, opts = {}) {
   timing = timingFor(msg, timing);
   const { root, tools, bubble } = makeMsgShell('assistant', timeStr(msg.timestamp));
   root._msg = msg;
@@ -267,7 +267,16 @@ function renderAssistantMessage(msg, timing) {
       // literally still executing.
       const prev = S.toolCards.get(block.id);
       const wasRunning = !!(prev && prev._timer);
-      const card = makeToolCard(block.name, { toolCallId: block.id, state: wasRunning ? 'running' : 'done' });
+      /* A page that was reloaded mid-run rebuilds this card from the session
+       * file, where the toolCall exists but its toolResult does not yet - pi
+       * writes that when the tool ends. It used to be drawn as "done" with no
+       * timer, so a long bash command looked finished for as long as it kept
+       * running (issue #279). `openTools` carries those calls in from
+       * refreshMessages; one in the last message while the agent is streaming
+       * is running right now, and one whose run is over was interrupted. */
+      const openAt = opts.openTools ? opts.openTools.get(block.id) : undefined;
+      const pending = openAt !== undefined ? (opts.openLive ? 'running' : 'interrupted') : null;
+      const card = makeToolCard(block.name, { toolCallId: block.id, state: wasRunning ? 'running' : (pending || 'done') });
       if (wasRunning) {
         clearInterval(prev._timer);
         card._start = prev._start;
@@ -275,7 +284,8 @@ function renderAssistantMessage(msg, timing) {
         startCardTimer(card);
       }
       noteToolTimeout(card, block.arguments);
-      fillToolBody(card, block.name, block.arguments);
+      if (!wasRunning && pending === 'running') startCardTimer(card, openAt);
+      fillToolBody(card, block.arguments);
       bubble.appendChild(card.card);
       S.toolCards.set(block.id, card);
     }
@@ -286,7 +296,9 @@ function renderAssistantMessage(msg, timing) {
    * to display. */
   if (msg.errorMessage || msg.stopReason === 'error') bubble.appendChild(makeErrorBlock(msg));
   if (!bubble.childNodes.length) bubble.appendChild(el('div', 'md', '(empty message)'));
-  transcriptHost().appendChild(root);  scrollBottom();
+  transcriptHost().appendChild(root);
+  maybeCelebrate(msg);
+  scrollBottom();
 }
 
 function makeThinking(text) {
@@ -323,8 +335,12 @@ function makeToolCard(name, opts = {}) {
   head.appendChild(el('span', 'tool-name', `${name}`));
   const state = opts.state || 'running';
   // finished cards keep their colour too: the rebuilt-from-history cards used to
-  // come back with no state class at all, so a done call lost its green label
-  const stateCls = state === 'running' ? ' running' : (state === 'done' || state === 'error' ? ` ${state}` : '');
+  // come back with no state class at all, so a done call lost its green label.
+  // An interrupted call is red like an error: the command never finished, and
+  // saying "done" about it is worse than saying nothing (issue #279).
+  const stateCls = state === 'running' ? ' running'
+    : state === 'done' ? ' done'
+      : (state === 'error' || state === 'interrupted') ? ' error' : '';
   const stateEl = el('span', `tool-state${stateCls}`);
   stateEl.appendChild(el('span', 'tool-state-label', state));
   if (state === 'running') stateEl.appendChild(makeDots());
@@ -409,7 +425,7 @@ function lineDiff(a, b) {
 
 /* Fill a tool card body: diff for edits, pretty JSON otherwise. Diff bodies
  * are shown automatically since the diff is the interesting part. */
-function fillToolBody(card, name, args) {
+function fillToolBody(card, args) {
   const filePath = args && typeof args === 'object'
     ? (args.path || args.file || args.file_path || args.filePath || '') : '';
   const lowerArgs = {};
@@ -627,7 +643,6 @@ function renderCompactionSummary(msg, extra) {
 /* Build the "conversation compacted" marker WITHOUT inserting it, so callers can
  * put it exactly where the compaction happened. */
 function buildCompactionSummary(msg, extra) {
-  const live = !!(extra && extra.live);
   const root = el('div', 'msg compaction');
   const who = el('div', 'who');
   /* A compaction pi finished without a summary - it can answer a manual
@@ -669,6 +684,18 @@ function buildCompactionSummary(msg, extra) {
  * again, so scrolling back and forth reloads instead of hoarding. */
 let mediaNear = null;
 let mediaFar = null;
+/* Images and videos are registered with both viewport observers. Removing a
+ * transcript node used to leave it observed for the life of the page, so every
+ * session switch added another set of detached nodes (with their data URLs) to
+ * the observers' target lists. */
+function unobserveMedia(root) {
+  if (!root || !root.querySelectorAll) return;
+  for (const n of root.querySelectorAll('img, video')) {
+    try { if (mediaNear) mediaNear.unobserve(n); } catch { /* gone */ }
+    try { if (mediaFar) mediaFar.unobserve(n); } catch { /* gone */ }
+  }
+}
+
 function lazySrc(node, src) {
   if (!node || !src) return node;
   node.dataset.src = src;
@@ -748,17 +775,8 @@ function renderCompactionNoop(reason) {
 function renderCompactionBlock(result, reason) {
   removeCompactionLive();
   for (const old of chat.querySelectorAll('.msg.compaction.pinned')) old.remove();
-  const root = el('div', 'msg compaction pinned');
-  const who = el('div', 'who');
-  const before = result.tokensBefore != null ? `${formatTok(result.tokensBefore)} tok` : 'context';
-  const after = result.estimatedTokensAfter != null ? ` → ${formatTok(result.estimatedTokensAfter)} tok` : '';
-  who.textContent = `conversation compacted · ${before}${after}${reason ? ` · ${reason}` : ''}`;
-  const detail = el('details', 'compaction-detail');
-  detail.appendChild(el('summary', null, 'show compacted summary'));
-  const body = el('div', 'md compaction-body');
-  body.innerHTML = renderMarkdown(result.summary || '');
-  detail.appendChild(body);
-  root.append(who, detail);
+  const root = buildCompactionSummary(result, { reason, estimatedTokensAfter: result.estimatedTokensAfter });
+  root.classList.add('pinned');
   transcriptHost().appendChild(root);
   if (S.stickToBottom) scrollBottom();
 }
@@ -906,6 +924,62 @@ async function fetchSession(sessionPath, signal) {
   };
 }
 
+/* Tool calls the session file has no result for, in its newest assistant message.
+ *
+ * pi writes an assistant message (toolCall blocks included) as soon as the model
+ * has finished writing the call; the toolResult only arrives when the tool ends.
+ * So while a command runs, the file has that assistant message and no result for
+ * the call. A transcript rebuilt from the file - a reload, a reconnect - used to
+ * draw every one of those calls as "done" and without a timer, so a long bash
+ * command looked finished for as long as it kept running (issue #279).
+ *
+ * The newest assistant message is the one that can still be running, even when
+ * it is not the literal last line: an assistant message can contain several tool
+ * calls, and the results arrive one at a time, so a reload between the first and
+ * second result leaves a toolResult as the last message while another call is
+ * still executing. A newer assistant message ends that run; unresolved calls
+ * before it belong to a run that died before the tool did, and are labelled
+ * interrupted instead of running forever.
+ *
+ * Returns Map(toolCallId -> the message's timestamp), or null.
+ */
+function openToolCalls(msgs) {
+  if (!Array.isArray(msgs) || !msgs.length) return null;
+  let last = null;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m && m.role === 'assistant') { last = m; break; }
+  }
+  if (!last || !Array.isArray(last.content)) return null;
+  const results = new Set();
+  for (const m of msgs) {
+    if (m && m.role === 'toolResult' && m.toolCallId) results.add(m.toolCallId);
+  }
+  const open = new Map();
+  for (const block of last.content) {
+    if (block && block.type === 'toolCall' && block.id && !results.has(block.id)) {
+      open.set(block.id, Number(last.timestamp) || 0);
+    }
+  }
+  return open.size ? open : null;
+}
+
+/* One message, whichever view is drawing it. `prevTs` lets a history render
+ * derive a turn's duration; `facts` is the per-session store of compaction
+ * facts (see loadCompactionFacts). */
+function renderMessageRow(m, opts = {}) {
+  if (m.role === 'user') renderUserMessage(m);
+  else if (m.role === 'assistant') {
+    noteHistoryTiming(m, opts.prevTs);
+    renderAssistantMessage(m, undefined, opts);
+  } else if (m.role === 'toolResult') renderToolResult(m);
+  else if (m.role === 'bashExecution') renderBashExecution(m);
+  else if (m.role === 'compactionSummary') {
+    const f = m.summary && opts.facts ? opts.facts.get(summaryHash(m.summary)) : null;
+    renderCompactionSummary(m, f ? { estimatedTokensAfter: f.a, reason: f.r } : undefined);
+  }
+}
+
 async function refreshMessages(prefetched) {
   /* Which load owns the transcript. Every load takes a number; a load that is
    * superseded stops at its next yield instead of carrying on and writing over
@@ -925,8 +999,7 @@ async function refreshMessages(prefetched) {
   S.historyAbort = ac;
   // A read-only view carries its own entry ids, and a session switch used to
   // block on the fork list before it fetched the transcript at all.
-  if (!S.viewSession) ensureForkable();
-  else resetForkQueue();
+  if (S.viewSession) resetForkQueue();
   // Subagent runs belong to the session you are looking at. The bridge answers
   // per session, so switching cannot show another one's jobs - and a reload gets
   // them back from disk instead of an empty panel.
@@ -1093,6 +1166,9 @@ async function refreshMessages(prefetched) {
       if (Number.isFinite(n)) m.timestamp = n;
     }
   }
+  // A read-only view owns the ring too: its transcript carries the last usage
+  // count the old session reported.
+  if (S.viewSession) showViewedContext(msgs, fileMarks);
   // Keep the reading position (distance from the bottom) across the re-render.
   const distFromBottom = chatScroller().scrollHeight - chatScroller().scrollTop - chatScroller().clientHeight;
   /* Rows drawn from a send that the session file does not have yet.
@@ -1104,6 +1180,7 @@ async function refreshMessages(prefetched) {
    * dropped naturally once the file version is on screen. */
   const pendingLiveRows = [...chat.querySelectorAll('.msg.user[data-live="1"]')];
   releaseVideosIn(chat);
+  unobserveMedia(chat);
   chat.innerHTML = '';
   if (!S.viewSession) {
     // Only the agent's own session owns the live tool cards; a read-only
@@ -1156,26 +1233,17 @@ async function refreshMessages(prefetched) {
    * page and the composer, the scrollbar and the button keep answering while it
    * goes up. */
   S.historyPartial = !!partial;
+  /* Which calls the file has no result for, in its newest message. A tool that
+   * is executing right now has its assistant message written (with the
+   * toolCall) but not its toolResult; the rebuild above drew that as "done".
+   * See renderAssistantMessage. */
+  const openTools = openToolCalls(msgs);
+  const openLive = !!openTools && !!S.isStreaming && !S.viewSession;
   // Render one message the same way whichever end of the session it came from.
   const drawMessage = (m) => {
     const host = S.renderInto || chat;   // an older batch lives away from the chat
     const firstNew = host.children.length;
-    if (m.role === 'user') renderUserMessage(m);
-    else if (m.role === 'assistant') {
-      noteHistoryTiming(m, prevTs);
-      renderAssistantMessage(m);
-    }
-    else if (m.role === 'toolResult') renderToolResult(m);
-    else if (m.role === 'bashExecution') renderBashExecution(m);
-    else if (m.role === 'compactionSummary') {
-      // In place, in order - a compaction marker belongs at the point in the
-      // conversation where it happened, and it scrolls away with it. Pinning the
-      // newest one to the bottom left a marker permanently on screen.
-      // pi's version of this message carries the summary and tokensBefore and
-      // nothing else, so the rest is looked up from what we kept (issue #47).
-      const f = m.summary ? facts.get(summaryHash(m.summary)) : null;
-      renderCompactionSummary(m, f ? { estimatedTokensAfter: f.a, reason: f.r } : undefined);
-    }
+    renderMessageRow(m, { prevTs, facts, openTools, openLive });
     // Stamp whatever node(s) this message produced, so a compaction marker can
     // be anchored to a point in time instead of a shifting position.
     if (m.timestamp != null) {
@@ -1331,6 +1399,19 @@ async function refreshMessages(prefetched) {
     // A compaction still in flight keeps its "compacting…" indicator: the
     // re-render above wiped the DOM node it lived in.
     if (S.compacting && !S.compactionLive) S.compactionLive = renderCompactionLive();
+    // Coming back to the running session after browsing another one: keep the
+    // newest finished compaction at the bottom as well as inline. The inline
+    // marker is historically placed, often hundreds of messages up, so without
+    // this the result appeared to vanish on the way back.
+    if (S.pinCompactionOnReturn && !S.compacting) {
+      S.pinCompactionOnReturn = false;
+      const latest = marks.length ? marks[marks.length - 1] : null;
+      if (latest && !chat.querySelector('.msg.compaction.pinned')) {
+        const node = buildCompactionSummary(latest, { count: marks.length, reason: latest.reason });
+        node.classList.add('pinned');
+        chat.appendChild(node);
+      }
+    }
   }
   // Totals are high-water marks: a compaction removes the older messages from
   // the session file, and recomputing the sum from what is left made the read /
@@ -1451,3 +1532,36 @@ function zoomImage(src) {
   document.addEventListener('keydown', onKey);
   document.body.appendChild(ov);
 }
+
+/* Turning off the thinking and tool-call blocks left their messages behind as
+ * bare headers with token counts - a column of empty boxes. A message with nothing
+ * visible left is marked and hidden. */
+function bubbleHasVisibleText(bubble) {
+  // An error block is the whole content of a failed turn, and it must count as
+  // visible or markHollowMessages() would hide the one thing worth reading (#59).
+  if (bubble.querySelector('.msg-error')) return true;
+  for (const n of bubble.querySelectorAll('.md, .md *')) {
+    if (n.closest('.tool-card')) continue;              // cards count via the toggle below
+    if (n.children.length) continue;                    // text sits in the leaves
+    if ((n.textContent || '').trim()) return true;
+  }
+  return false;
+}
+
+function markHollowMessages() {
+  const hideThinking = SET.showThinking === false;
+  const hideTools = SET.showToolCalls === false;
+  for (const m of chat.querySelectorAll('.msg.assistant')) {
+    if (!hideThinking && !hideTools) { delete m.dataset.hollow; continue; }
+    const bubble = m.querySelector('.bubble');
+    if (!bubble) continue;
+    const hasThinking = !!bubble.querySelector('details.thinking, .thinking');
+    const hasTools = !!bubble.querySelector('.tool-card');
+    const visible = bubbleHasVisibleText(bubble)
+      || (hasThinking && !hideThinking)
+      || (hasTools && !hideTools);
+    if (visible) delete m.dataset.hollow;
+    else m.dataset.hollow = '1';
+  }
+}
+

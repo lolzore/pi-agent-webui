@@ -142,6 +142,20 @@ const getJson = (p) => new Promise((res, rej) => {
       ev({ type: 'message_update', assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 0, delta: bj.slice(i, i + 7) } });
     }
     out.bash = bodyOf('tc-bash');
+
+    // ── an edit call streams its change, not the raw JSON prefix ───────────
+    S.live = null; S.liveDetached = null;
+    document.getElementById('chat').innerHTML = '';
+    const editArgs = JSON.stringify({ path: '/tmp/edit-me.js', edits: [{ oldText: 'const oldValue = 1;', newText: 'const newValue = 2;' }] });
+    ev({ type: 'message_start', message: { role: 'assistant' } });
+    ev({ type: 'message_update', assistantMessageEvent: { type: 'toolcall_start', contentIndex: 0, id: 'tc-edit-live' } });
+    for (let i = 0; i < editArgs.length; i += 9) {
+      ev({ type: 'message_update', assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 0, delta: editArgs.slice(i, i + 9) } });
+    }
+    out.editStream = bodyOf('tc-edit-live');
+    out.editLabel = S.toolCards.get('tc-edit-live').card.querySelector('.tool-name').textContent;
+    ev({ type: 'message_update', assistantMessageEvent: { type: 'toolcall_end', contentIndex: 0, toolCall: { id: 'tc-edit-live', name: 'edit', arguments: { path: '/tmp/edit-me.js', edits: [{ oldText: 'const oldValue = 1;', newText: 'const newValue = 2;' }] } } } });
+    out.editEnd = bodyOf('tc-edit-live');
     return JSON.stringify(out);
   })()`);
 
@@ -174,6 +188,11 @@ const getJson = (p) => new Promise((res, rej) => {
   if (!r.bash || !r.bash.text.includes('echo hello && ls -la /very/long/path/that/goes/on')) {
     fail('#67 a streamed bash call does not show its command: ' + JSON.stringify(r.bash && r.bash.text.slice(0, 120)));
   }
+  if (r.editLabel !== 'edit') fail('#223 a nameless streamed edit is still labelled ' + JSON.stringify(r.editLabel));
+  if (!r.editStream || !/editing \/tmp\/edit-me\.js/.test(r.editStream.text) || /\{"edits"/.test(r.editStream.text)) {
+    fail('#223 a streamed edit still shows raw argument JSON: ' + JSON.stringify(r.editStream && r.editStream.text.slice(0, 160)));
+  }
+  if (!r.editEnd || !/oldValue|newValue/.test(r.editEnd.text)) fail('#223 the finished edit card does not show the change');
   if (problems.length) fail('the page reported errors:\n' + problems.join('\n'));
 
   console.log('  PASS #67 a long stream keeps its beginning, names what it hides, and finishes whole');

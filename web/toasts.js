@@ -24,7 +24,10 @@
 function notice(text, kind = 'info', detail) {
   try {
     if (!S.notices) S.notices = [];
-    S.notices.push({ t: Date.now(), text: String(text).slice(0, 500), kind, detail: detail ? String(detail).slice(0, 800) : null });
+    // Keep the whole notification so the expand arrow has something to show,
+    // but cap it: a run that dumps a stack trace on every event must not turn
+    // the log into a memory leak.
+    S.notices.push({ t: Date.now(), text: String(text).slice(0, 2000), kind, detail: detail ? String(detail).slice(0, 4000) : null });
     if (S.notices.length > 200) S.notices.splice(0, S.notices.length - 200);
     S.noticesUnread = (S.noticesUnread || 0) + 1;
     updateBell();
@@ -32,7 +35,9 @@ function notice(text, kind = 'info', detail) {
       S.noticesFromCommand = false;
       openNoticesDialog();
     }
+    return S.notices[S.notices.length - 1] || null;
   } catch { /* never let logging break the thing being logged */ }
+  return null;
 }
 
 function updateBell() {
@@ -74,11 +79,33 @@ function renderNotices() {
     const time = at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     const day = at.toDateString() === new Date().toDateString() ? '' : `${at.toLocaleDateString()} `;
     const row = el('div', `notice-row${n.kind === 'error' ? ' error' : ''}`);
-    row.appendChild(el('span', 'n-time', `${day}${time}`));
-    row.appendChild(el('span', 'n-text', n.text));
-    if (n.kind && n.kind !== 'info') row.appendChild(el('span', 'n-kind', n.kind));
-    row.title = n.detail ? 'Click to copy the details' : n.text;
-    row.onclick = () => { if (n.detail) copyText(n.detail, 'Copied the details'); };
+    const meta = el('div', 'n-meta');
+    meta.appendChild(el('span', 'n-time', `${day}${time}`));
+    if (n.kind && n.kind !== 'info') meta.appendChild(el('span', 'n-kind', n.kind));
+    row.appendChild(meta);
+    const body = el('div', 'n-body');
+    body.appendChild(el('div', 'n-text', n.text));
+    if (n.detail) body.appendChild(el('div', 'n-detail', n.detail));
+    row.appendChild(body);
+    // Most notifications are one or two lines and stay compact. The ones with
+    // more text (or a separate detail block) get a small arrow, so the panel
+    // can show the whole thing without every row taking half the window.
+    if (n.detail || n.text.length > 150) {
+      // Inline expansion still helps for a short detail, but a long stack trace
+      // or provider error needs a real page: this arrow opens the notification
+      // on its own, full-window, instead of squeezing it into a row.
+      const toggle = el('button', 'n-toggle', '↗');
+      toggle.type = 'button';
+      toggle.title = 'Open this notification in a full window';
+      toggle.setAttribute('aria-label', 'Open this notification in a full window');
+      toggle.onclick = (e) => {
+        e.stopPropagation();
+        openNoticeDetail(n);
+      };
+      row.appendChild(toggle);
+    }
+    row.title = 'Click to open this notification in a full window';
+    row.onclick = () => openNoticeDetail(n);
     list.appendChild(row);
   }
 }
@@ -91,7 +118,7 @@ function openNoticesDialog() {
   if (sub) {
     const n = (S.notices || []).length;
     sub.textContent = n
-      ? `${n} notification${n === 1 ? '' : 's'}, newest first. Click a row to copy its details.`
+      ? `${n} notification${n === 1 ? '' : 's'}, newest first. Click a row or its arrow to read it in a full window with its formatting intact.`
       : 'Everything the app reports shows up here.';
   }
   if (!dlg.open) dlg.showModal();
@@ -102,8 +129,45 @@ function closeNoticesDialog() {
   if (dlg && dlg.open) dlg.close();
 }
 
-/* Kept for the callers that used to open the dropdown. */
-function openBellMenu() { openNoticesDialog(); }
+/* A single notification, at reading size, with its whitespace preserved. The
+ * compact list is for finding the notice; this is for actually reading the
+ * stack trace or the provider's HTML error page. */
+let noticeDetailCurrent = null;
+function openNoticeDetail(n) {
+  if (!n) return;
+  const dlg = $('notice-detail-dialog');
+  if (!dlg) return;
+  noticeDetailCurrent = n;
+  const title = $('notice-detail-title');
+  const meta = $('notice-detail-meta');
+  const body = $('notice-detail-body');
+  if (title) title.textContent = n.kind && n.kind !== 'info'
+    ? `${n.kind[0].toUpperCase()}${n.kind.slice(1)} notification`
+    : 'Notification';
+  if (meta) {
+    const at = new Date(n.t || Date.now());
+    meta.textContent = `${at.toLocaleDateString()} ${at.toLocaleTimeString()}`;
+  }
+  if (body) {
+    body.innerHTML = '';
+    body.appendChild(el('div', 'notice-detail-text', n.text || ''));
+    if (n.detail) body.appendChild(el('pre', 'notice-detail-code', n.detail));
+  }
+  if (!dlg.open) dlg.showModal();
+}
+
+function closeNoticeDetail() {
+  const dlg = $('notice-detail-dialog');
+  if (dlg && dlg.open) dlg.close();
+}
+
+if ($('notice-detail-done')) $('notice-detail-done').onclick = closeNoticeDetail;
+if ($('notice-detail-copy')) {
+  $('notice-detail-copy').onclick = () => {
+    if (!noticeDetailCurrent) return;
+    copyText(noticeDetailCurrent.detail || noticeDetailCurrent.text || '', 'Copied the notification');
+  };
+}
 
 /* (The dropdown builder that lived here is replaced by renderNotices above. The
  * panel keeps every affordance it had - newest first, the time and the kind on
@@ -136,9 +200,28 @@ const QUIET_TOASTS = [
   /^Looking at .+ \(through this machine\)$/,
 ];
 
+/* Repeats of the same toast, by text (issue #215). One wedged turn reports the
+ * same extension error once per handler and again on the next turn; a burst of
+ * identical toasts is what hid the rest of the screen. Only verbatim repeats
+ * inside a few seconds are dropped, and the notification log keeps the first. */
+const RECENT_TOASTS = new Map();
+
 function toast(text, kind = 'info') {
-  if (!QUIET_TOASTS.some((r) => r.test(String(text)))) notice(text, kind);
+  const key = String(text);
+  const now = Date.now();
+  const last = RECENT_TOASTS.get(key);
+  if (last !== undefined && now - last < 5000) return;
+  RECENT_TOASTS.set(key, now);
+  if (RECENT_TOASTS.size > 50) {
+    for (const [k, t] of RECENT_TOASTS) if (now - t > 5000) RECENT_TOASTS.delete(k);
+    if (RECENT_TOASTS.size > 50) RECENT_TOASTS.clear();
+  }
+  const logged = QUIET_TOASTS.some((r) => r.test(key)) ? null : notice(key, kind);
   const t = el('div', `toast ${kind}`, text);
+  if (logged) {
+    t.title = 'Click to open this notification in a full window';
+    t.onclick = () => openNoticeDetail(logged);
+  }
   $('toasts').appendChild(t);
   setTimeout(() => t.remove(), 5000);
 }

@@ -90,9 +90,16 @@ $('model-select').onchange = async (e) => {
   if (isLlama && !S.models.some((m) => m.provider === provider)) {
     const live = llamaServerForProvider(provider);
     const all = (llamaLiveServers.length ? llamaLiveServers : [live]);
-    if (live && confirm(`pi has not registered the llama.cpp server at ${live.url} yet.\n\nPoint pi at ${all.length > 1 ? `all ${all.length} live servers` : 'it'} and restart the agent? (writes llamaSettings.servers in your pi config)`)) {
-      S.pendingModel = { provider, modelId };
-      fixLlamaConfig(all.map((x) => x.url));
+    if (live) {
+      const yes = await askDialog({
+        title: 'pi has not registered the llama.cpp server yet',
+        body: `Point pi at ${all.length > 1 ? `all ${all.length} live servers` : live.url} and restart the agent? (writes llamaSettings.servers in your pi config)`,
+        okLabel: 'point pi at it',
+      });
+      if (yes) {
+        S.pendingModel = { provider, modelId };
+        fixLlamaConfig(all.map((x) => x.url));
+      }
     }
     return;
   }

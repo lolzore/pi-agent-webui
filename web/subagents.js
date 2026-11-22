@@ -103,8 +103,7 @@ function noteSubagentInspect(d) {
   noteSubagent({ id, output: d.finalOutput || d.output || '', task: d.task || '', label: d.label || d.agent || '' });
 }
 
-/* Bytes as something a person reads: KB while that is meaningful, then MB, then
- * GB. A session at 30 MB was shown as "30720.0 KB". */
+/* Elapsed time, short: "42s", "3m07", "2h05". */
 function fmtElapsedShort(ms) {
   if (!ms || ms < 0) return '';
   const s = Math.round(ms / 1000);
@@ -164,7 +163,6 @@ function openSubagentsMenu(anchor) {
   const menu = openMenu(anchor, items, { title: `subagents (${runs.length})`, width: 460, force: true, align: 'right' });
   if (menu) {
     menu._subagents = true;
-    menu.addEventListener('remove', () => { S.subagentMenuOpen = false; });
     // The menu is rebuilt from what is known now; a run that finishes while it is
     // open updates in place (see refreshSubagentMenu).
     const obs = new MutationObserver(() => { if (!menu.isConnected) { S.subagentMenuOpen = false; obs.disconnect(); } });
@@ -185,39 +183,6 @@ function refreshSubagentMenu() {
     if (label) label.textContent = r.label || 'subagent';
   }
   updateSubagentsBtn();
-}
-
-/* Turning off the thinking and tool-call blocks left their messages behind as
- * bare headers with token counts - a column of empty boxes. A message with nothing
- * visible left is marked and hidden. */
-function bubbleHasVisibleText(bubble, hideThinking, hideTools) {
-  // An error block is the whole content of a failed turn, and it must count as
-  // visible or markHollowMessages() would hide the one thing worth reading (#59).
-  if (bubble.querySelector('.msg-error')) return true;
-  for (const n of bubble.querySelectorAll('.md, .md *')) {
-    if (hideThinking && n.closest('details.thinking')) continue;
-    if (n.closest('.tool-card')) continue;              // cards count via the toggle below
-    if (n.children.length) continue;                    // text sits in the leaves
-    if ((n.textContent || '').trim()) return true;
-  }
-  return false;
-}
-
-function markHollowMessages() {
-  const hideThinking = SET.showThinking === false;
-  const hideTools = SET.showToolCalls === false;
-  for (const m of chat.querySelectorAll('.msg.assistant')) {
-    if (!hideThinking && !hideTools) { delete m.dataset.hollow; continue; }
-    const bubble = m.querySelector('.bubble');
-    if (!bubble) continue;
-    const hasThinking = !!bubble.querySelector('details.thinking, .thinking');
-    const hasTools = !!bubble.querySelector('.tool-card');
-    const visible = bubbleHasVisibleText(bubble, hideThinking, hideTools)
-      || (hasThinking && !hideThinking)
-      || (hasTools && !hideTools);
-    if (visible) delete m.dataset.hollow;
-    else m.dataset.hollow = '1';
-  }
 }
 
 /* One transcript line as a readable block. */
@@ -474,15 +439,10 @@ async function refreshSubagentView(force) {
   S.subagentViewCount = n;
   const distFromBottom = chatScroller().scrollHeight - chatScroller().scrollTop - chatScroller().clientHeight;
   releaseVideosIn(chat);          // a detached <video> keeps its decoder and buffers
+  unobserveMedia(chat);
   chat.innerHTML = '';
   transcriptTarget = chat;
-  for (const m of d.messages) {
-    if (m.role === 'user') renderUserMessage(m);
-    else if (m.role === 'assistant') renderAssistantMessage(m);
-    else if (m.role === 'toolResult') renderToolResult(m);
-    else if (m.role === 'bashExecution') renderBashExecution(m);
-    else if (m.role === 'compactionSummary') renderCompactionSummary(m);
-  }
+  for (const m of d.messages) renderMessageRow(m);
   transcriptTarget = null;
   if (S.stickToBottom && distFromBottom < 80) scrollBottom(true);
   updateViewBanner();

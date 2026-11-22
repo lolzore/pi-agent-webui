@@ -21,6 +21,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const sessionModes = require('./session-modes');
 const zlib = require('zlib');   // streaming gzip for the session transcript response
 /* Shared JSON reply. It only needs the response, so it lives at module scope
  * now that the route modules use it too (issue #54). */
@@ -28,6 +29,11 @@ function jsonOut(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(obj));
 }
+/* Clients that save their UI settings: the saving one skips its own broadcast,
+ * every other open page reloads the server copy. Declared up here because the
+ * settings route below and the agent supervisor (created at the bottom) share
+ * the same client set. */
+let settingsBroadcast = null;
 const { StringDecoder } = require('string_decoder');
 const { spawn, execFile, execSync } = require('child_process');
 const { pathToFileURL } = require('url');
@@ -179,7 +185,12 @@ const WEB_DIR = path.join(__dirname, '..', 'web');
  * app.js alone was not enough: a stylesheet change with app.js untouched left
  * the old CSS in the browser, which is exactly the mixed-version layout the
  * issue reported. */
+let webBuildCache = { at: 0, value: null };
 function webBuild() {
+  // Called on every /api/health poll (8 s per instance) and every index.html
+  // request; the directory cannot change between two requests a millisecond
+  // apart. One second is short enough that an edit is still picked up on reload.
+  if (webBuildCache.value !== null && Date.now() - webBuildCache.at < 1000) return webBuildCache.value;
   try {
     let newest = 0, total = 0;
     for (const f of fs.readdirSync(WEB_DIR)) {
@@ -189,7 +200,8 @@ function webBuild() {
       newest = Math.max(newest, Math.round(st.mtimeMs));
       total += st.size;
     }
-    return newest + '-' + total;
+    webBuildCache = { at: Date.now(), value: newest + '-' + total };
+    return webBuildCache.value;
   } catch { return null; }
 }
 let whisperUrl = null; // set once the local whisper STT server (if any) is up
@@ -233,6 +245,12 @@ const FALLBACK_BUILTIN_COMMANDS = [
   { name: 'quit', description: 'Quit pi' },
 ];
 
+/* Resolve a command's stdout without holding the event loop (the first
+ * /api/builtin-commands call used to block on two synchronous shell calls). */
+const execOut = (cmd, args) => new Promise((resolve) => {
+  execFile(cmd, args, { timeout: 8000 }, (e, stdout) => resolve(e ? '' : String(stdout || '')));
+});
+
 // Locate the installed pi package and read its BUILTIN_SLASH_COMMANDS so the
 // WebUI can offer every current (and future) command. Tries a local install,
 // the global npm root, and the path implied by PI_COMMAND, then falls back.
@@ -240,15 +258,14 @@ async function loadBuiltinCommands() {
   const candidates = [];
   try { candidates.push(require.resolve('@earendil-works/pi-coding-agent/dist/core/slash-commands.js')); } catch { /* not local */ }
   try {
-    const g = execSync('npm root -g', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+    const g = (await execOut('npm', ['root', '-g'])).trim();
     if (g) candidates.push(path.join(g, '@earendil-works', 'pi-coding-agent', 'dist', 'core', 'slash-commands.js'));
   } catch { /* no npm */ }
   try {
     const cmd0 = (PI_COMMAND.split(/\s+/)[0] || '').trim();
     if (cmd0 && !cmd0.includes(' ') && !cmd0.startsWith('docker')) {
       const which = isWin ? 'where' : 'which';
-      const bin = execSync(`${which} ${JSON.stringify(cmd0)}`, { stdio: ['ignore', 'pipe', 'ignore'] })
-        .toString().trim().split(/\r?\n/)[0];
+      const bin = (await execOut(which, [cmd0])).trim().split(/\r?\n/)[0];
       if (bin) candidates.push(path.resolve(path.dirname(bin), '..', '..', 'dist', 'core', 'slash-commands.js'));
     }
   } catch { /* not a direct binary */ }
@@ -699,6 +716,8 @@ proxyWss.on('connection', (client, req, parsed) => {
   client.on('error', () => { try { upstream.terminate(); } catch { /* already closed */ } });
 });
 
+const staticCache = new Map();   // key -> { etag, headers, data }
+
 function serveStatic(req, res) {
   let urlPath;
   try {
@@ -728,34 +747,47 @@ function serveStatic(req, res) {
     res.writeHead(403).end('forbidden');
     return;
   }
-  fs.readFile(file, (err, data) => {
-    if (err) {
-      res.writeHead(404).end('not found');
+  fs.stat(file, (err, st) => {
+    if (err || !st.isFile()) { res.writeHead(404).end('not found'); return; }
+    const isHtml = path.extname(file) === '.html';
+    const build = isHtml ? (webBuild() || '') : '';
+    /* The body and ETag are reused while mtime/size are unchanged; for
+     * index.html the build is part of the key because the placeholder rewrite
+     * depends on the newest file in web/. Reading and SHA-1ing every asset on
+     * every page load was the per-request cost. */
+    const key = `${file}|${st.mtimeMs}|${st.size}|${build}`;
+    const cached = staticCache.get(key);
+    if (cached) {
+      if (req.headers['if-none-match'] === cached.etag) { res.writeHead(304, cached.headers).end(); return; }
+      res.writeHead(200, cached.headers);
+      res.end(cached.data);
       return;
     }
-    // The UI is edited live from disk, so a stale app.js/style.css would
-    // silently hide new features. Revalidate on every load: the files are tiny
-    // and served from localhost, and a 304 keeps repeat loads cheap.
-    if (path.extname(file) === '.html') {
-      const build = webBuild();
-      if (build) {
+    fs.readFile(file, (err2, data) => {
+      if (err2) {
+        res.writeHead(404).end('not found');
+        return;
+      }
+      if (isHtml && build) {
         data = Buffer.from(String(data)
           .replace(/(href|src)="([^"?/:][^"]*\.(?:css|js))"/g, `$1="$2?v=${build}"`)
           .replace('content="__BUILD__"', `content="${build}"`));
       }
-    }
-    const etag = `"${data.length.toString(16)}-${crypto.createHash('sha1').update(data).digest('hex').slice(0, 12)}"`;
-    const headers = {
-      'Content-Type': MIME[path.extname(file)] || 'application/octet-stream',
-      'Cache-Control': 'no-cache, must-revalidate',
-      'ETag': etag,
-    };
-    if (req.headers['if-none-match'] === etag) {
-      res.writeHead(304, headers).end();
-      return;
-    }
-    res.writeHead(200, headers);
-    res.end(data);
+      const etag = `"${data.length.toString(16)}-${crypto.createHash('sha1').update(data).digest('hex').slice(0, 12)}"`;
+      const headers = {
+        'Content-Type': MIME[path.extname(file)] || 'application/octet-stream',
+        'Cache-Control': 'no-cache, must-revalidate',
+        'ETag': etag,
+      };
+      staticCache.set(key, { etag, headers, data });
+      while (staticCache.size > 80) staticCache.delete(staticCache.keys().next().value);
+      if (req.headers['if-none-match'] === etag) {
+        res.writeHead(304, headers).end();
+        return;
+      }
+      res.writeHead(200, headers);
+      res.end(data);
+    });
   });
 }
 
@@ -848,6 +880,7 @@ async function readSessionEdges(file, bytes = 64 * 1024) {
     const headLen = Math.min(bytes, st.size);
     const headBuf = Buffer.alloc(headLen);
     const headRead = await fh.read(headBuf, 0, headLen, 0);
+    let bytesRead = headRead.bytesRead;
     const head = headBuf.toString('utf8', 0, headRead.bytesRead);
     // a file smaller than one window IS its own tail, exactly as nameFromTail
     // treated it - otherwise a session under 64 KB would lose its explicit name
@@ -857,10 +890,11 @@ async function readSessionEdges(file, bytes = 64 * 1024) {
       const tailLen = Math.min(bytes, st.size);
       const tailBuf = Buffer.alloc(tailLen);
       const r = await fh.read(tailBuf, 0, tailLen, st.size - tailLen);
+      bytesRead += r.bytesRead;
       tail = tailBuf.toString('utf8', 0, r.bytesRead);
       tailTruncated = true;
     }
-    return { head, tail, tailTruncated, mtimeMs: st.mtimeMs, size: st.size };
+    return { head, tail, tailTruncated, mtimeMs: st.mtimeMs, size: st.size, bytesRead };
   } catch {
     return null;
   } finally {
@@ -926,13 +960,59 @@ function readSessionRecord(file) {
   } catch { return null; }
 }
 
-/* Sync check for a local path, null when it is a container path (those can only
- * be asked about with an exec, which is why the async version exists). */
-function sessionFileExistsNow(p) {
-  if (typeof p !== 'string' || !p.trim()) return false;
-  if (parseSessionDir()) return null;
-  try { return fs.statSync(p).isFile(); } catch { return false; }
+/* The working directory a session file names in its header line, or null when
+ * that cannot be answered (a session no message has been written to yet, no
+ * header, a header that does not parse). Only the first chunk is read: the
+ * header is the file's first line, and the file itself can be tens of megabytes. */
+function sessionCwdFromHeader(text) {
+  const line = String(text || '').split('\n', 1)[0];
+  if (!line.trim()) return null;
+  try {
+    const head = JSON.parse(line);
+    const cwd = head && typeof head.cwd === 'string' ? head.cwd.trim() : '';
+    return cwd || null;
+  } catch { return null; }
 }
+
+function sessionCwdOf(p) {
+  let fd;
+  try {
+    fd = fs.openSync(p, 'r');
+    const buf = Buffer.allocUnsafe(64 * 1024);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    return sessionCwdFromHeader(buf.slice(0, n).toString('utf8'));
+  } catch { return null; } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* already closed */ } }
+  }
+}
+
+/* Why a session cannot be opened, or null when it can.
+ *
+ * "The file is still there" is not the whole question. pi refuses a session
+ * whose recorded working directory has gone - the project folder was renamed, or
+ * the whole app was moved - and in RPC mode it does not ask what to do: started
+ * with `--session` it prints "Stored session working directory does not exist"
+ * and exits code 1. The bridge resumes the last session by starting *in* it, so a
+ * stale record became a crash loop: every restart resumed the same dead session
+ * and died the same way, and every command from the page was answered with "the
+ * agent is not running".
+ *
+ * Returns 'file' (no such file), 'folder' (its recorded cwd is gone) or null.
+ * A path in a container cannot be asked about here: null means "cannot tell",
+ * which must never be treated as "gone". */
+function sessionProblemNow(p) {
+  if (typeof p !== 'string' || !p.trim()) return 'file';
+  if (parseSessionDir()) return null;
+  try { if (!fs.statSync(p).isFile()) return 'file'; } catch { return 'file'; }
+  const cwd = sessionCwdOf(p);
+  if (!cwd) return null;                      // nothing recorded to check
+  try { fs.statSync(cwd); return null; } catch { return 'folder'; }
+}
+
+/* The recorded session the last loadLastSession() had to skip, and why. The
+ * bridge decides this before a browser's socket is open, so the page is handed
+ * the news when it connects (and again from startAgent, see bridge/agent.js). */
+let lastSessionSkipped = null;   // { path, reason } | null
 
 function loadLastSession() {
   const own = readSessionRecord(LAST_SESSION_FILE);
@@ -940,11 +1020,14 @@ function loadLastSession() {
     // A record whose session is gone is worse than no record: resuming it fails,
     // and with a pi that does not answer the failed switch wedges the agent until
     // it is restarted. Drop it here instead, before anything is asked of the agent.
-    if (sessionFileExistsNow(own) === false) {
-      console.warn(`forgetting last session (gone): ${own}`);
+    const problem = sessionProblemNow(own);
+    if (problem) {
+      lastSessionSkipped = { path: own, reason: problem };
+      console.warn(`forgetting last session (${problem === 'folder' ? 'its folder is gone' : 'gone'}): ${own}`);
       forgetLastSession();
       return null;
     }
+    lastSessionSkipped = null;
     return own;
   }
   // If the record file was named explicitly (PI_WEBUI_LAST_SESSION), that name is
@@ -971,6 +1054,18 @@ function forgetLastSession() {
   try { fs.rmSync(LAST_SESSION_FILE, { force: true }); } catch { /* nothing to forget */ }
 }
 
+/* Forget the record only when it names this session. A failed start in a session
+ * the user picked (a mode switch into a plain chat) says nothing about the
+ * normal chat's record, which must survive it. */
+function forgetLastSessionIf(p) {
+  const own = readSessionRecord(LAST_SESSION_FILE);
+  if (!own || !p) return;
+  const norm = (v) => { try { return path.resolve(String(v)); } catch { return String(v); } };
+  const a = isWin ? norm(own).toLowerCase() : norm(own);
+  const b = isWin ? norm(p).toLowerCase() : norm(p);
+  if (a === b) forgetLastSession();
+}
+
 function saveLastSession(p) {
   if (typeof p !== 'string' || !p) return;
   // Only ever a session belonging to *this* bridge. The record is what the agent
@@ -990,6 +1085,9 @@ function saveLastSession(p) {
     console.warn(`not recording a session outside this bridge's session dir: ${p}`);
     return;
   }
+  // A new record means the skipped one is history; it is still in the page's
+  // notice log and in lastResumeFailed for anyone who needs to say why.
+  lastSessionSkipped = null;
   try {
     fs.writeFileSync(LAST_SESSION_FILE, JSON.stringify({ path: p, at: Date.now() }, null, 2) + '\n');
   } catch (e) {
@@ -997,26 +1095,41 @@ function saveLastSession(p) {
   }
 }
 
-// Does a session file exist - locally, or inside a "docker:<ctr>:<dir>" session
-// dir (the path is an absolute path inside the container)? A docker failure
-// (container stopped, daemon down) reports "not found": the agent cannot start
-// either in that case, so starting fresh is the right fallback.
-async function sessionFileExists(p) {
-  if (typeof p !== 'string' || !p.trim()) return false;
+// Why the agent cannot open this session - locally, or inside a
+// "docker:<ctr>:<dir>" session dir (the path is an absolute path inside the
+// container) - or null when it can. A docker failure (container stopped, daemon
+// down) reports "not found": the agent cannot start either in that case, so
+// starting fresh is the right fallback.
+//
+// Both the file and the working directory pi recorded in it are checked, because
+// pi exits rather than opens a session whose cwd is gone (see sessionProblemNow).
+async function sessionProblem(p) {
+  if (typeof p !== 'string' || !p.trim()) return 'file';
   const remote = parseSessionDir();
-  if (remote) {
-    const ctr = safeContainerName(remote.container);
-    if (!ctr) return false;
-    // This one escaped its quotes by hand - `p.replace(/'/g, "'\\''")` is the
-    // correct POSIX trick, and it was the only place in the file that got it
-    // right. It is still quoting to be read by a shell when it does not have to:
-    // the path goes in as argv, so there is nothing left to escape. */
-    return await new Promise((resolve) => {
-      execFile('docker', ['exec', ctr, 'sh', '-c', 'test -f "$1"', 'sh', p],
-        { timeout: 15000 }, (err) => resolve(!err));
-    });
-  }
-  try { return fs.statSync(p).isFile(); } catch { return false; }
+  if (!remote) return sessionProblemNow(p);
+  const ctr = safeContainerName(remote.container);
+  if (!ctr) return 'file';
+  // This one escaped its quotes by hand - `p.replace(/'/g, "'\\''")` is the
+  // correct POSIX trick, and it was the only place in the file that got it
+  // right. It is still quoting to be read by a shell when it does not have to:
+  // the path goes in as argv, so there is nothing left to escape. */
+  const hasFile = await new Promise((resolve) => {
+    execFile('docker', ['exec', ctr, 'sh', '-c', 'test -f "$1"', 'sh', p],
+      { timeout: 15000 }, (err) => resolve(!err));
+  });
+  if (!hasFile) return 'file';
+  // The session's recorded cwd has to be asked about in there too.
+  const first = await new Promise((resolve) => {
+    execFile('docker', ['exec', ctr, 'head', '-n', '1', p],
+      { timeout: 15000, maxBuffer: 64 * 1024 }, (err, stdout) => resolve(err ? '' : String(stdout)));
+  });
+  const cwd = sessionCwdFromHeader(first);
+  if (!cwd) return null;                    // nothing recorded to check
+  const hasCwd = await new Promise((resolve) => {
+    execFile('docker', ['exec', ctr, 'sh', '-c', 'test -e "$1"', 'sh', cwd],
+      { timeout: 15000 }, (err) => resolve(!err));
+  });
+  return hasCwd ? null : 'folder';
 }
 
 // ---------------------------------------------------------------- llama.cpp + pi config
@@ -1146,7 +1259,8 @@ const llamaSupport = require('./llama')({
 const {
   ALLOWED_APIS, BUILTIN_PROVIDER_IDS, MODEL_FIELDS, PROVIDER_ID_RE, authEntryKind, fetchLlamaModels,
   isLocalLlamaAddress, llamaConfiguredUrls, llamaLan, llamaLanUrls, llamaModelsCache,
-  llamaServerCandidates, llamaServerIdentity, maskKey, readLlamaServerUrl,
+  llamaServerCandidates, llamaServerIdentity, maskKey, normalizeProviderBaseUrl, readLlamaServerUrl,
+  readModelsFile,
   writeJsonAtomic, writeModelsFile,
 } = llamaSupport;
 
@@ -1158,14 +1272,20 @@ const piRoutes = require('./routes/pi')({
   PI_MODELS_FILE: PI_MODELS_FILE,
   PI_SETTINGS_FILE: PI_SETTINGS_FILE,
   PROVIDER_ID_RE: PROVIDER_ID_RE,
+  SESSION_DIR: SESSION_DIR,
   WORKSPACE_DIR: WORKSPACE_DIR,
+  // A resumed session can belong to a different project than the bridge's
+  // WORKSPACE_DIR; goal-x follows the session cwd, so the goal endpoints do too.
+  currentSessionPath: () => agentStatus.sessionFile || loadLastSession(),
   fs: fs,
   http: http,
   jsonOut: jsonOut,
   maskKey: maskKey,
+  normalizeProviderBaseUrl: normalizeProviderBaseUrl,
   os: os,
   path: path,
   readJsonSafe: readJsonSafe,
+  readModelsFile: readModelsFile,
   serveStatic: serveStatic,
   writeJsonAtomic: writeJsonAtomic,
   writeModelsFile: writeModelsFile,
@@ -1176,6 +1296,16 @@ const uploadRoutes = require('./routes/uploads')({
   fs: fs,
   http: http,
   path: path,
+});
+const websearchRoutes = require('./routes/websearch')({
+  PI_AGENT_DIR: PI_AGENT_DIR,
+  execFile: execFile,
+  fs: fs,
+  http: http,
+  jsonOut: jsonOut,
+  os: os,
+  path: path,
+  writeJsonAtomic: writeJsonAtomic,
 });
 const mcpRoutes = require('./routes/mcp')({
   PI_AGENT_DIR: PI_AGENT_DIR,
@@ -1197,7 +1327,8 @@ const instanceRoutes = require('./routes/instances')({
  * bridge/agent.js fills this same object in when it is required at the end of
  * the file, and the session routes read it while handling a request. Declared
  * here so requiring them cannot hit its temporal dead zone. */
-const agentStatus = { busy: false, sessionName: null, compacting: null };
+const agentStatus = { busy: false, sessionName: null, sessionFile: null, compacting: null, resuming: null, mode: 'normal' };
+let agentSetMode = null;
 
 /* The last session-scan error, shared the same way: bridge/sessions.js fills
  * this object in, /api/sessions reads it (issue #54 phase 10). */
@@ -1225,7 +1356,14 @@ const {
   sessionStamp, writeStream,
 } = sessionStore;
 
+const statisticsRoutes = require('./routes/statistics')({
+  jsonOut: jsonOut,
+  scanSessions: sessionStore.scanSessions,
+  sessionLines: sessionStore.sessionLines,
+  sessionRef: sessionStore.sessionRef,
+});
 const sessionRoutes = require('./routes/sessions')({
+  PI_AGENT_DIR: PI_AGENT_DIR,
   SESSION_DIR: SESSION_DIR,
   WRITE_CHUNK: WRITE_CHUNK,
   agentStatus: agentStatus,
@@ -1271,6 +1409,7 @@ const llamaRoutes = require('./routes/llama')({
   llamaServerCandidates: llamaServerCandidates,
   llamaServerIdentity: llamaServerIdentity,
   path: path,
+  writeJsonAtomic: writeJsonAtomic,
   readLlamaServerUrl: readLlamaServerUrl,
 });
 const subagentRoutes = require('./routes/subagents')({
@@ -1298,6 +1437,11 @@ const systemRoutes = require('./routes/system')({
   execFile: execFile,
   fs: fs,
   path: path,
+});
+const petRoutes = require('./routes/pets')({
+  fs: fs,
+  jsonOut: jsonOut,
+  PI_AGENT_DIR: PI_AGENT_DIR,
 });
 async function handleRequest(req, res) {
   // A client that goes away mid-response (a closed tab, a laptop lid, a Ctrl-C on
@@ -1338,11 +1482,29 @@ async function handleRequest(req, res) {
   if (req.url.startsWith('/api/ui-settings')) {
     if (req.method === 'POST') {
       let body = '';
+      const from = (() => { try { return new URL(req.url, 'http://x').searchParams.get('from') || ''; } catch { return ''; } })();
       req.on('data', (c) => { body += c; if (body.length > 2 * 1024 * 1024) req.destroy(); });
       req.on('end', () => {
         try {
-          JSON.parse(body); // validate
-          fs.writeFileSync(SETTINGS_FILE, body);
+          const parsed = JSON.parse(body); // validate
+          delete parsed.ttsApiKey;      // only /api/tts-key writes it
+          delete parsed.ttsApiKeySet;   // derived, never stored
+          // Keep the key the bridge already holds: it is no longer part of the
+          // settings the page can read, so a save cannot preserve it by itself.
+          try {
+            const current = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+            if (current && current.ttsApiKey) parsed.ttsApiKey = current.ttsApiKey;
+          } catch { /* no settings yet */ }
+          // Atomic, like every other file the bridge owns: a crash mid-write
+          // must leave the previous settings, not truncated JSON.
+          writeJsonAtomic(SETTINGS_FILE, parsed);
+          /* Other open pages hold their own copy of SET. Without this, the next
+           * save from one of them posted its stale full object and silently
+           * undid this change (two tabs, last writer wins). The saving page
+           * recognises its own id and does not reload. */
+          if (settingsBroadcast) {
+            try { settingsBroadcast({ bridge: 'settings_changed', from }); } catch { /* no listeners */ }
+          }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end('{"ok":true}');
         } catch (e) {
@@ -1353,9 +1515,38 @@ async function handleRequest(req, res) {
     } else {
       let data = {};
       try { data = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); } catch { /* defaults */ }
+      /* The voice key never travels to the page: the bridge is what calls the
+       * TTS service. The page only needs to know whether one is set. */
+      const keySet = !!(data && data.ttsApiKey);
+      delete data.ttsApiKey;
+      data.ttsApiKeySet = keySet;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(data));
     }
+    return;
+  }
+
+  /* Set, replace or clear the cloud TTS key. Kept out of /api/ui-settings so
+   * the key is never part of the object the page loads, caches and posts. */
+  if (req.url === '/api/tts-key') {
+    if (req.method !== 'POST') { res.writeHead(405).end(); return; }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 8192) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const { key } = JSON.parse(body || '{}');
+        if (typeof key !== 'string') throw new Error('key must be a string (empty clears it)');
+        let settings = {};
+        try { settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); } catch { /* first write */ }
+        if (key.trim()) settings.ttsApiKey = key.trim(); else delete settings.ttsApiKey;
+        writeJsonAtomic(SETTINGS_FILE, settings);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ttsApiKeySet: !!settings.ttsApiKey }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
     return;
   }
   if (req.url.startsWith('/api/config')) {
@@ -1475,6 +1666,35 @@ async function handleRequest(req, res) {
     return jsonOut(res, 200, { instances: localBridgesCache.data });
   }
 
+  if (req.url === '/api/agent-mode') {
+    if (req.method !== 'POST') { jsonOut(res, 405, { ok: false, error: 'use POST' }); return; }
+    if (!agentSetMode) { jsonOut(res, 503, { ok: false, error: 'the agent supervisor is not ready' }); return; }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 4096) req.destroy(); });
+    req.on('end', () => {
+      let j = null;
+      try { j = JSON.parse(body || '{}'); } catch { j = null; }
+      try {
+        const target = j && typeof j.sessionPath === 'string' && j.sessionPath.trim() ? j.sessionPath.trim() : null;
+        if (target) {
+          const ref = sessionRef(target);
+          if (!ref) throw new Error('that session path is not in the session directory');
+          // The registry is authoritative for an existing plain chat: clicking
+          // it must always restart pi in plain mode, even if a caller omitted
+          // or guessed the mode.
+          const known = sessionModes.modeFor(PI_AGENT_DIR, target);
+          const requested = known === 'plain' ? 'plain' : ((j && j.mode) || 'normal');
+          const out = agentSetMode(requested, target);
+          jsonOut(res, out.ok ? 200 : 409, out);
+        } else {
+          const out = agentSetMode(j && j.mode);
+          jsonOut(res, out.ok ? 200 : 409, out);
+        }
+      } catch (e) { jsonOut(res, 400, { ok: false, error: e.message }); }
+    });
+    return;
+  }
+
   if (req.url.startsWith('/api/health')) {
     // Which build is this? Two machines on the same URL can be serving very
     // different copies of web/, and there was no way to tell them apart. The
@@ -1491,6 +1711,7 @@ async function handleRequest(req, res) {
       build,
       busy: agentStatus.busy,
       name: agentStatus.sessionName || null,
+      mode: agentStatus.mode,
     };
     if (url.searchParams.get('verbose')) payload.whisper = whisperStatus().state;
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
@@ -1525,10 +1746,13 @@ async function handleRequest(req, res) {
         if (!key) throw new Error('no API key set for this voice');
         let url, payload, headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` };
         if (provider === 'fish') {
-          // Fish Audio: text + a reference id (a voice you made or picked), or the
-          // model's default voice when none is given.
+          /* Fish Audio's current API selects the model with a `model` header,
+           * not a body field. s1 is deprecated (retired 2026-12-31); s2.1-pro is
+           * the documented production model. `reference_id` still selects a
+           * cloned/saved voice; without one the model's default voice is used. */
           url = `${base || 'https://api.fish.audio'}/v1/tts`;
-          payload = { text, format: 'mp3', model: model || 's1' };
+          headers.model = model || 's2.1-pro';
+          payload = { text, format: 'mp3' };
           if (voice) payload.reference_id = voice;
         } else {
           // Anything OpenAI-compatible: /v1/audio/speech with model + voice.
@@ -1588,12 +1812,24 @@ async function handleRequest(req, res) {
     if (req.method !== 'POST') { res.writeHead(405).end(); return; }
     let body = '';
     req.on('data', (c) => { body += c; if (body.length > 8192) req.destroy(); });
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
-        const { path: dir } = JSON.parse(body || '{}');
+        const { path: dir, session: sessionPath } = JSON.parse(body || '{}');
         if (typeof dir !== 'string' || !dir.trim()) throw new Error('path is required');
+        /* This endpoint exists to put back a session's recorded working
+         * directory after a rename. It used to create whatever absolute path
+         * it was given; now the path must be exactly the cwd recorded in the
+         * session that is being opened. */
+        const ref = sessionRef(sessionPath);
+        if (!ref) throw new Error('a session in the session directory is required');
+        let head = '';
+        if (ref.kind === 'docker') head = await dockerCapture(ref.container, ['head', '-n', '1', ref.path], 15000);
+        else { try { head = fs.readFileSync(ref.path, 'utf8').split('\n', 1)[0]; } catch { head = ''; } }
+        let header = null;
+        try { header = JSON.parse(head); } catch { header = null; }
+        if (!header || typeof header.cwd !== 'string' || !header.cwd) throw new Error('that session records no working directory');
         const abs = path.resolve(dir.trim());
-        if (!path.isAbsolute(abs)) throw new Error('an absolute path is required');
+        if (abs !== path.resolve(header.cwd)) throw new Error('that path is not the working directory recorded in this session');
         const existed = fs.existsSync(abs);
         fs.mkdirSync(abs, { recursive: true });
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1606,9 +1842,12 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (petRoutes.match(req)) { await petRoutes.handle(req, res); return; }
   if (uploadRoutes.match(req)) { await uploadRoutes.handle(req, res); return; }
+  if (websearchRoutes.match(req)) { await websearchRoutes.handle(req, res); return; }
   if (mcpRoutes.match(req)) { await mcpRoutes.handle(req, res); return; }
   if (instanceRoutes.match(req)) { await instanceRoutes.handle(req, res); return; }
+  if (statisticsRoutes.match(req)) { await statisticsRoutes.handle(req, res); return; }
   if (sessionRoutes.match(req)) { await sessionRoutes.handle(req, res); return; }
   if (mediaRoutes.match(req)) { await mediaRoutes.handle(req, res); return; }
   if (llamaRoutes.match(req)) { await llamaRoutes.handle(req, res); return; }
@@ -1671,7 +1910,9 @@ async function handleRequest(req, res) {
         if (typeof baseUrl !== 'string' || !/^https?:\/\//i.test(baseUrl.trim())) {
           throw new Error('baseUrl must be an http(s) URL');
         }
-        const base = baseUrl.trim().replace(/\/+$/, '');
+        // Accept the endpoint people copy from a provider's docs as well as
+        // the base URL pi needs (see normalizeProviderBaseUrl).
+        const base = normalizeProviderBaseUrl(baseUrl.trim());
         const key = apiKey || '';
         const headers = { 'Content-Type': 'application/json' };
         if (key) headers['Authorization'] = `Bearer ${key}`;
@@ -1713,6 +1954,7 @@ async function handleRequest(req, res) {
         res.end(JSON.stringify({
           ok: !err && !empty,
           status, error: err, empty,
+          baseUrl: base,
           model,
           sample: text.trim().slice(0, 120) || null,
           models: models.slice(0, 50),
@@ -1733,12 +1975,13 @@ async function handleRequest(req, res) {
     req.on('data', (c) => { body += c; if (body.length > 64 * 1024) req.destroy(); });
     req.on('end', async () => {
       try {
-        const { url } = JSON.parse(body || '{}');
+        const { url, apiKey } = JSON.parse(body || '{}');
         if (typeof url !== 'string' || !/^https?:\/\//i.test(url.trim())) {
           throw new Error('url must be an http(s) base URL');
         }
-        const clean = url.trim().replace(/\/+$/, '');
-        const models = await fetchLlamaModels(clean);
+        const clean = normalizeProviderBaseUrl(url.trim());
+        const headers = apiKey ? { Authorization: `Bearer ${String(apiKey).trim()}` } : undefined;
+        const models = await fetchLlamaModels(clean, 8000, headers);
         if (!models) throw new Error(`no models found at ${clean} (tried /v1/models and /models)`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ url: clean, models }));
@@ -1763,7 +2006,7 @@ async function handleRequest(req, res) {
     // checkedAt, etag }, ... }. Reading it as store.providers found nothing, so
     // known providers showed up as raw ids with no catalog behind them.
     const store = readJsonSafe(path.join(PI_AGENT_DIR, 'models-store.json')) || {};
-    const modelsFile = readJsonSafe(PI_MODELS_FILE) || {};
+    const modelsFile = readModelsFile();
     const cached = (store && typeof store === 'object' && !Array.isArray(store)) ? store : {};
     const ids = new Set([
       ...Object.keys(auth),
@@ -1864,6 +2107,14 @@ async function handleRequest(req, res) {
  * rejection: Node prints it and exits, taking every tab and the agent with it.
  * Answer 500 when the response has not started, and drop the socket when it
  * has; the server keeps running either way. */
+/* The same rule one level out: an async listener (`req.on('end', async …)`) is
+ * not covered by the per-request catch above. An unexpected rejection there
+ * would exit Node and take the agent and every tab with it, so log it and keep
+ * serving. Individual handlers should still answer their own 500. */
+process.on('unhandledRejection', (e) => {
+  console.error('unhandled rejection (bridge kept running):', (e && e.stack) || e);
+});
+
 const server = http.createServer((req, res) => {
   handleRequest(req, res).catch((e) => {
     console.error(`request failed (${req.method} ${String(req.url).slice(0, 80)}):`, (e && e.stack) || e);
@@ -1884,7 +2135,7 @@ const server = http.createServer((req, res) => {
 /* ── agent supervision ──────────────────────────────────────────────────────
  * Split out to bridge/agent.js (issue #54, phase 6): the child process, the
  * RPC pipe, the WebSocket fan-out and the restart/idle bookkeeping. */
-require('./agent')({
+const agentSupervisor = require('./agent')({
   agentStatus: agentStatus,
   isWin: isWin,
   fs: fs,
@@ -1900,19 +2151,25 @@ require('./agent')({
   allowedHostNames,
   execSync,
   forgetLastSession,
+  forgetLastSessionIf,
   hostOnly,
   hostSpawnDir,
   http,
   lanAddress,
+  lastSessionSkipped: () => lastSessionSkipped,
   loadLastSession,
   path,
   proxyWss,
   saveLastSession,
   server,
-  sessionFileExists,
+  sessionProblem,
+  sessionProblemNow,
   spawn,
   splitProxyPath,
   startWhisper,
+  stopStartedInstances: instanceRoutes.stopAllStarted,
   stopWhisper,
   whisperUrl,
 });
+agentSetMode = agentSupervisor.setAgentMode;
+settingsBroadcast = agentSupervisor.broadcast || null;

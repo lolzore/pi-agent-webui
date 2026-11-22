@@ -129,6 +129,10 @@ const getJson = (p) => new Promise((res, rej) => {
     return r.result && r.result.result ? r.result.result.value : undefined;
   };
   await send('Runtime.enable'); await send('Page.enable');
+  /* A desktop viewport: under 760px the sidebar (and its instance button) is an
+   * off-screen drawer, so the anchor would be outside the window and the test
+   * would be measuring the mobile layout instead of menu placement. */
+  await send('Emulation.setDeviceMetricsOverride', { width: 1200, height: 900, deviceScaleFactor: 1, mobile: false });
   await send('Page.navigate', { url: `http://127.0.0.1:${PORT}/` });
   for (let i = 0; i < 100; i++) {
     if (await evalJs("typeof openSettings === 'function' && typeof openInstanceMenu === 'function' && typeof openMenu === 'function' ? 1 : 0")) break;

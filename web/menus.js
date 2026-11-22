@@ -22,14 +22,25 @@ function askDialog(opts = {}) {
     const fields = opts.fields || [];
     const inputs = {};
     for (const f of fields) {
-      const row = el('label', 'ask-row');
+      const row = el('div', 'ask-row');
       row.appendChild(el('span', 'ask-label', f.label));
-      const input = el('input');
-      input.type = 'text';
-      input.value = f.value || '';
-      input.placeholder = f.placeholder || '';
-      input.autocomplete = 'off';
-      row.appendChild(input);
+      let input;
+      if (f.type === 'checkbox') {
+        const check = el('label', 'ask-check');
+        input = el('input');
+        input.type = 'checkbox';
+        input.checked = f.value === true;
+        check.appendChild(input);
+        check.appendChild(el('span', null, f.text || ''));
+        row.appendChild(check);
+      } else {
+        input = el('input');
+        input.type = 'text';
+        input.value = f.value || '';
+        input.placeholder = f.placeholder || '';
+        input.autocomplete = 'off';
+        row.appendChild(input);
+      }
       body.appendChild(row);
       inputs[f.name] = input;
     }
@@ -46,7 +57,9 @@ function askDialog(opts = {}) {
     dlg.addEventListener('close', onClose);
     $('ask-ok').onclick = () => {
       const out = {};
-      for (const f of fields) out[f.name] = inputs[f.name].value.trim();
+      for (const f of fields) {
+        out[f.name] = f.type === 'checkbox' ? !!inputs[f.name].checked : inputs[f.name].value.trim();
+      }
       if (opts.require) {
         const missing = opts.require.find((n) => !out[n]);
         if (missing) { inputs[missing].focus(); return; }
@@ -81,7 +94,7 @@ function openSessionMenu(s, anchor) {
 /* Download a session file. showSaveFilePicker is a real "where do you want it"
  * dialog; the plain anchor fallback still saves to the download folder. */
 async function exportSession(s) {
-  const url = `/api/session-file?path=${encodeURIComponent(s.path)}`;
+  const url = api(`/api/session-file?path=${encodeURIComponent(s.path)}`);
   const name = String(s.fileName || 'session.jsonl');
   try {
     if (window.showSaveFilePicker) {
@@ -210,6 +223,17 @@ async function openBranchesMenu(a, b) {
   });
 }
 
+async function finishFork(res) {
+  await initSession(false);
+  const again = res && typeof res.text === 'string' ? res.text.trim() : '';
+  if (again && !res.cancelled) {
+    toast('Forked - continuing from here');
+    rpc({ type: 'prompt', message: res.text }).catch((e) => toast(`Continue failed: ${e.message}`, 'error'));
+  } else {
+    toast('Forked - continue from here');
+  }
+}
+
 async function forkAt(entryId, text) {
   const ok = await askDialog({
     title: 'Start a new branch?',
@@ -223,15 +247,7 @@ async function forkAt(entryId, text) {
     // can send it again - that is what its own UI does with the reply. Ignoring
     // it left the new branch ending one turn earlier than the turn you clicked,
     // which is why every fork looked like it came from the wrong turn.
-    const res = await rpc({ type: 'fork', entryId });
-    await initSession(false);
-    const again = res && typeof res.text === 'string' ? res.text.trim() : '';
-    if (again && !res.cancelled) {
-      toast('Forked - continuing from here');
-      rpc({ type: 'prompt', message: res.text }).catch((e) => toast(`Continue failed: ${e.message}`, 'error'));
-    } else {
-      toast('Forked - continue from here');
-    }
+    await finishFork(await rpc({ type: 'fork', entryId }));
   } catch (e) {
     toast(`Fork failed: ${e.message}`, 'error');
   }
@@ -312,16 +328,8 @@ async function forkInOtherSession(entryId, text) {
     S.state.sessionFile = target;
     S.viewSession = null;
     S.liveDetached = null;
-    await initSession(false);
     const res = await rpc({ type: 'fork', entryId });
-    await initSession(false);
-    const again = res && typeof res.text === 'string' ? res.text.trim() : '';
-    if (again && !res.cancelled) {
-      toast('Forked - continuing from here');
-      rpc({ type: 'prompt', message: res.text }).catch((e) => toast(`Continue failed: ${e.message}`, 'error'));
-    } else {
-      toast('Forked - continue from here');
-    }
+    await finishFork(res);
   } catch (e) {
     toast(`Fork failed: ${e.message}`, 'error');
   }

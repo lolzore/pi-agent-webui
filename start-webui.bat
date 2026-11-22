@@ -20,6 +20,18 @@ set "SOURCE_FILE=%~dp0bridge\agent-source.txt"
 set "SOURCE="
 set "CONTAINER="
 
+rem -- an explicit argument wins, exactly as in start-webui.sh (the instance
+rem    route passes "native" so a second bridge never stops at this prompt) --
+if /i "%~1"=="native" (
+  set "SOURCE=native"
+  goto :native
+)
+if /i "%~1"=="docker" (
+  set "SOURCE=docker"
+  set "CONTAINER=%~2"
+  goto :docker
+)
+
 rem -- reuse a saved choice unless switch_pi_agent_source.bat deleted it --
 if exist "%SOURCE_FILE%" if "%~1"=="" (
   for /f "usebackq tokens=1,* delims==" %%A in ("%SOURCE_FILE%") do (
@@ -120,7 +132,11 @@ if /i "!SOURCE!"=="native" (
   set "PI_SESSION_DIR=docker:!CONTAINER!:/root/.pi/agent/sessions"
 )
 
-set PORT=3080
+rem The instance route passes PI_WEBUI_PORT for the second agent; this used to
+rem stay hardcoded at 3080, so it found the first WebUI, asked to stop it, and
+rem never started the instance (issue #119).
+if defined PI_WEBUI_PORT set "PORT=%PI_WEBUI_PORT%"
+if not defined PORT set "PORT=3080"
 rem LAN access is configured in bridge\lan.json ("lan": true) - the bridge
 rem reads it on start and prints the LAN address when it is enabled.
 

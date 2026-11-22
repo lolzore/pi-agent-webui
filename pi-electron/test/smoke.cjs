@@ -37,7 +37,7 @@ function electronBin() {
     console.error('  (electron is not installed in pi-electron/node_modules - skipping)');
     process.exit(77);
   }
-  const userData = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'pi-desktop-test-'));
+  const userData = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'pi-electron-test-'));
   /* A known agent picture, so the app icon path is exercised: the page paints
    * it into the favicon, main reads that PNG back and calls win.setIcon. The
    * picture must be opaque - a transparent frame is deliberately rejected. */

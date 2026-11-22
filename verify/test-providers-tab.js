@@ -50,6 +50,16 @@ function startFakeLlama() {
       const u = (req.url || '').split('?')[0].replace(/\/+$/, '') || '/';
       res.setHeader('Content-Type', 'application/json');
       if (u === '/v1/models' || u === '/models') { res.end(JSON.stringify({ data: FAKE_MODELS })); return; }
+      if (u === '/v1/chat/completions' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => {
+          let model = 'verify-llama-a';
+          try { model = JSON.parse(body).model || model; } catch { /* fake */ }
+          res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'OK' } }], model }));
+        });
+        return;
+      }
       if (u === '/props') { res.end(JSON.stringify({ default_generation_settings: { model: 'verify.gguf', n_ctx: 4096 }, model_path: 'verify.gguf' })); return; }
       res.statusCode = 404; res.end('{}');
     });
@@ -217,7 +227,75 @@ const getJson = (p) => new Promise((res, rej) => {
   }
   console.log('  a server that answers later appears on the probe retry');
 
-  /* 3. The provider picker: opens on click with the full list, filters, keyboard. */
+  /* 3. Add a provider from the form with the endpoint people actually copy
+   *    (.../v1/chat/completions) and no model list: the endpoint is trimmed,
+   *    the key is forwarded, and the models are discovered before saving. */
+  const added = JSON.parse(await evalJs(`(async () => JSON.stringify(await (async () => {
+    $('prov-id').value = 'ui-provider';
+    $('prov-base-url').value = ${JSON.stringify(FAKE_URL + '/v1/chat/completions')};
+    $('prov-api').value = 'openai-completions';
+    $('prov-api-key').value = 'sk-test-ui';
+    $('prov-models').value = '';
+    const thinkingToggle = !!$('prov-reasoning');
+    $('btn-prov-add').click();
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000) {
+      const row = [...$('pi-providers-list').querySelectorAll('.prov-row .prov-id')].find((x) => x.textContent === 'ui-provider');
+      if (row) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    return { base: $('prov-base-url').value, models: $('prov-models').value, thinkingToggle, row: !!($('pi-providers-list').textContent || '').includes('ui-provider') };
+  })()))()`));
+  if (added.base !== FAKE_URL + '/v1') fail('the add form kept the chat endpoint as the base URL: ' + JSON.stringify(added));
+  if (added.thinkingToggle) fail('the custom-provider thinking toggle is still in the form (issue #264)');
+  if (!added.row) fail('the provider added from the form does not appear in the list: ' + JSON.stringify(added));
+  let saved = null;
+  for (let i = 0; i < 30; i++) {
+    try { saved = JSON.parse(fs.readFileSync(modelsPath, 'utf8')); } catch { saved = null; }
+    if (saved && saved.providers && saved.providers['ui-provider']) break;
+    await sleep(150);
+  }
+  if (typeof saved !== 'object' || !saved.providers || !saved.providers['ui-provider']) {
+    fail('the provider file is not an object with the added provider: ' + JSON.stringify(saved));
+  }
+  const ui = saved.providers['ui-provider'];
+  if (ui.baseUrl !== FAKE_URL + '/v1') fail('the saved provider kept the chat endpoint: ' + JSON.stringify(ui.baseUrl));
+  if (!ui.models || !ui.models.every((m) => m.reasoning === true)) {
+    fail('the "supports thinking" choice was not saved on the models: ' + JSON.stringify(ui.models));
+  }
+  if (ui.apiKey !== 'sk-test-ui') fail('the saved provider lost its API key');
+  if (!ui.models || !ui.models.some((m) => m.id === 'verify-llama-a')) {
+    fail('the provider was saved without the discovered models: ' + JSON.stringify(ui.models));
+  }
+  console.log('  a pasted /v1/chat/completions URL is trimmed, the key kept, models discovered and saved');
+
+  /* 3a. The row has no separate "thinking on/off" button: edit is the single
+   * control, and it loads the provider's full model list into the form. */
+  const edited = JSON.parse(await evalJs(`(async () => JSON.stringify(await (async () => {
+    const row = [...$('pi-providers-list').querySelectorAll('.prov-row')]
+      .find((r) => (r.querySelector('.prov-id') || {}).textContent === 'ui-provider');
+    if (!row) return { missing: true };
+    const labels = [...row.querySelectorAll('button')].map((b) => b.textContent.trim());
+    const edit = [...row.querySelectorAll('button')].find((b) => b.textContent.trim() === 'edit');
+    if (edit) edit.click();
+    await new Promise((r) => setTimeout(r, 100));
+    return {
+      labels,
+      id: $('prov-id').value,
+      models: $('prov-models').value,
+    };
+  })()))()`));
+  if (edited.missing) fail('the added provider row disappeared');
+  if (edited.labels.some((x) => /^thinking (on|off)$/.test(x))) {
+    fail('the separate thinking toggle button is still in the provider row: ' + JSON.stringify(edited.labels));
+  }
+  if (!edited.labels.includes('edit')) fail('the provider row has no edit button: ' + JSON.stringify(edited.labels));
+  if (edited.id !== 'ui-provider' || !edited.models.includes('verify-llama-a')) {
+    fail('edit did not load the provider into the form: ' + JSON.stringify(edited));
+  }
+  console.log('  the row has edit and no thinking control; edit loads its models');
+
+  /* 4. The provider picker: opens on click with the full list, filters, keyboard. */
   const picker = JSON.parse(await evalJs(`(async () => JSON.stringify(await (async () => {
     const out = {};
     const inp = $('auth-provider');

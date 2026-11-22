@@ -1,10 +1,8 @@
 /* The WebUI's bridge to the Electron shell.
  *
- * The React Native/WebView2 shell gave the page window.chrome.webview.postMessage
- * for its split-pane surface. Electron has no such object, so the page used the
- * iframe fallback and the real Reels feed never loaded. Expose the same one-way
- * postMessage (and a small state query) under a namespaced object; web/shorts.js
- * checks for it before window.chrome.
+ * Expose the split-pane's one-way postMessage channel (and a small state query)
+ * under a namespaced object; web/shorts.js checks for it before falling back to
+ * the browser iframe.
  */
 const { contextBridge, ipcRenderer } = require('electron');
 

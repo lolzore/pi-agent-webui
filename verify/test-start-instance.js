@@ -38,6 +38,17 @@ fs.mkdirSync(agentDir, { recursive: true });
 fs.mkdirSync(homeDir, { recursive: true });
 fs.mkdirSync(stubBin, { recursive: true });
 fs.writeFileSync(path.join(agentDir, 'settings.json'), '{}');
+// The launcher seeds a fresh instance home from the real agent config; give it
+// something to seed so the check is about the copy, not an empty fixture.
+const realAgent = path.join(homeDir, '.pi', 'agent');
+fs.mkdirSync(realAgent, { recursive: true });
+fs.writeFileSync(path.join(realAgent, 'auth.json'), '{}');
+fs.writeFileSync(path.join(realAgent, 'models.json'), JSON.stringify({ providers: {} }));
+fs.writeFileSync(path.join(realAgent, 'settings.json'), JSON.stringify({ defaultProvider: 'fixture', defaultModel: 'fixture-model' }));
+fs.mkdirSync(path.join(realAgent, 'extensions'), { recursive: true });
+fs.writeFileSync(path.join(realAgent, 'extensions', 'fixture.ts'), 'export default () => {}\n');
+fs.mkdirSync(path.join(realAgent, 'skills', 'fixture-skill'), { recursive: true });
+fs.writeFileSync(path.join(realAgent, 'skills', 'fixture-skill', 'SKILL.md'), '# fixture\n');
 // The launcher insists on a `pi` on PATH; this one is the mock agent, so the
 // second instance is a real bridge without a real model behind it.
 fs.writeFileSync(path.join(stubBin, 'pi'), `#!/bin/sh\nexec ${process.execPath} ${path.join(ROOT, 'bridge', 'mock_agent.js')} "$@"\n`);
@@ -121,6 +132,14 @@ const down = async (port, tries) => {
   if (!await up(first.body.port)) fail('the started bridge never answered on port ' + first.body.port + '\n' + (() => { try { return fs.readFileSync(first.body.log, 'utf8').slice(-600); } catch { return ''; } })());
   const health = await getJson(first.body.port, '/api/health');
   if (!health.ok) fail('the started bridge is not healthy: ' + JSON.stringify(health));
+  const instanceAgent = path.join(homeDir, '.pi', 'webui-instances', String(first.body.instance), '.pi', 'agent');
+  if (!fs.existsSync(path.join(instanceAgent, 'auth.json')) || !fs.existsSync(path.join(instanceAgent, 'models.json'))) {
+    fail('the instance home was not seeded with auth/models, so its agent has no model: ' + instanceAgent);
+  }
+  if (!fs.existsSync(path.join(instanceAgent, 'settings.json'))) fail('the instance home has no settings.json');
+  for (const shared of ['extensions', 'skills']) {
+    if (!fs.existsSync(path.join(instanceAgent, shared))) fail(`the instance home does not share ${shared}`);
+  }
   const started = await getJson(PORT, '/api/local-started');
   if (!started.started.some((r) => Number(r.port) === Number(first.body.port) && r.running)) {
     fail('the started instance is not recorded as running: ' + JSON.stringify(started));
@@ -193,7 +212,6 @@ const down = async (port, tries) => {
 
   // Open the menu and look at the row for the instance we started.
   const menu = JSON.parse(await evalJs(`(async () => JSON.stringify(await (async () => {
-    window.confirm = () => true;
     await refreshLocalInstances(true);
     await refreshStartedInstances(true);
     openInstanceMenu($('btn-instance'), true);
@@ -211,8 +229,14 @@ const down = async (port, tries) => {
   if (!/started here/.test(stopRow.text)) fail('the row does not say it was started here: ' + JSON.stringify(stopRow));
   console.log('  menu: "start another agent" present; the started instance carries a stop control');
 
-  // Stop it through that control.
+  // Stop it through that control. stopInstance asks first, with the in-app
+  // dialog (issue #243); answer it the way a reader would.
   await evalJs(`document.querySelector('[data-stop-port="${first.body.port}"]').click(); true`);
+  for (let i = 0; i < 20; i++) {
+    if (await evalJs("!!(document.getElementById('ask-dialog') && document.getElementById('ask-dialog').open)")) break;
+    await sleep(100);
+  }
+  await evalJs("document.getElementById('ask-ok').click(); true");
   if (!await down(first.body.port)) fail('the started bridge still answers after stop');
   const afterStop = await getJson(PORT, '/api/local-started');
   const stoppedRec = afterStop.started.find((r) => Number(r.port) === Number(first.body.port));
@@ -321,6 +345,17 @@ const down = async (port, tries) => {
   console.log('  forget removes the record (and only that one)');
 
   if (problems.length) fail('the page reported errors:\n' + problems.join('\n'));
+
+  // Issue #268: shutting the main bridge down stops the instances it started,
+  // instead of leaving their process groups running after the window closes.
+  const leave = await postJson(PORT, '/api/start-instance', {});
+  if (leave.status !== 200 || !leave.body.port) fail('starting the shutdown-test instance failed: ' + JSON.stringify(leave.body));
+  if (!await up(leave.body.port)) fail('the shutdown-test instance never answered');
+  bridge.kill('SIGTERM');
+  if (!await down(leave.body.port, 20)) {
+    fail('the instance this bridge started is still answering after the main bridge was stopped (issue #268)');
+  }
+  console.log('  stopping the main bridge also stopped the instance it started');
 
   console.log('  PASS #79 the UI starts a second local agent, finds it, and stops only what it started');
   cleanupBrowser();

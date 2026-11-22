@@ -31,7 +31,7 @@ async function healthy(url, timeoutMs = 1500) {
   }
 }
 
-export async function ensureBridge({ host, port, userData, workspace }) {
+export async function ensureBridge({ host, port, userData, workspace, spawnImpl = spawn }) {
   const url = `http://${host}:${port}`;
   if (await healthy(url)) return { url, started: false, child: null };
   const root = bridgeRoot();
@@ -48,7 +48,7 @@ export async function ensureBridge({ host, port, userData, workspace }) {
   try { fs.mkdirSync(workspaceDir, { recursive: true }); } catch (e) {
     throw new Error(`cannot create the workspace ${workspaceDir}: ${e.message}`);
   }
-  const child = spawn(process.execPath, [script], {
+  const child = spawnImpl(process.execPath, [script], {
     cwd: root,
     env: {
       ...process.env,
@@ -65,13 +65,21 @@ export async function ensureBridge({ host, port, userData, workspace }) {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  let lastErr = '';
+  let spawnError = null;
   child.stdout.on('data', () => { /* the bridge logs to stdout; nothing to do */ });
-  child.stderr.on('data', (d) => console.error('[bridge]', String(d).trimEnd()));
+  child.stderr.on('data', (d) => { lastErr = (lastErr + String(d)).slice(-4000); console.error('[bridge]', String(d).trimEnd()); });
+  // A spawn failure (bad NODE_PATH, permissions, a missing script) emits
+  // 'error' and may never set exitCode. Without this the app waited the full
+  // 30 seconds and then reported a misleading timeout.
+  child.once('error', (e) => { spawnError = e; });
+  const tail = () => (lastErr.trim() ? `\n${lastErr.trim()}` : '');
   const deadline = Date.now() + 30000;
   while (Date.now() < deadline) {
+    if (spawnError) throw new Error(`could not start the bridge: ${spawnError.message}${tail()}`);
     if (await healthy(url)) return { url, started: true, child };
-    if (child.exitCode !== null) throw new Error(`the bridge exited with code ${child.exitCode}`);
+    if (child.exitCode !== null) throw new Error(`the bridge exited with code ${child.exitCode}${tail()}`);
     await new Promise((r) => setTimeout(r, 400));
   }
-  throw new Error('the bridge did not answer /api/health within 30 seconds');
+  throw new Error(`the bridge did not answer /api/health within 30 seconds${tail()}`);
 }

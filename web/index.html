@@ -29,7 +29,12 @@
     </div>
     <div class="sidebar-search">
       <input id="session-filter" type="search" placeholder="Filter sessions…">
-      <button id="btn-new-folder" class="btn icon" title="New folder — group sessions by hand (or drag one onto it)">＋</button>
+      <button id="btn-new-folder" class="btn icon" title="New folder — group sessions by hand (or drag one onto it)" aria-label="New folder">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h5l2 2h8A1.5 1.5 0 0 1 21 9.5v8A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5z"/>
+          <path d="M3 10h18"/>
+        </svg>
+      </button>
       <button id="btn-refresh-sessions" class="btn icon" title="Refresh session list">⟳</button>
     </div>
     <div id="session-list" class="session-list"></div>
@@ -63,6 +68,13 @@
 
     <!-- "Viewing another session" banner (the agent runs in its own). -->
     <div id="view-banner" class="view-banner hidden"></div>
+
+    <!-- Plain chat: the agent was started without tools, extensions, skills or
+         AGENTS.md. Persistent while the mode is active, with the way out. -->
+    <div id="plain-banner" class="plain-banner hidden">
+      <span>Plain chat — no tools, extensions, skills or AGENTS.md.</span>
+      <button id="plain-exit" class="btn small" type="button">leave plain chat</button>
+    </div>
 
     <!-- The chat column scrolls, not the message list inside it. The scrollbar
          then runs all the way to the bottom of the window (like the session list)
@@ -181,6 +193,19 @@
   </div>
 </dialog>
 
+<!-- Hidden model/token tracker, opened by /statistics (like Settings, but
+     deliberately not in the header). -->
+<dialog id="statistics-dialog">
+  <h3>Model statistics</h3>
+  <p class="setup-sub" id="statistics-sub">Loading session usage…</p>
+  <div class="statistics-scroll">
+    <div id="statistics-list"></div>
+  </div>
+  <div class="dialog-buttons">
+    <button id="statistics-close" class="btn primary">close</button>
+  </div>
+</dialog>
+
 <!-- Manual crop for the background and the agent's profile image -->
 <dialog id="crop-dialog">
   <h3 id="crop-title">Crop</h3>
@@ -244,6 +269,8 @@
     <p class="setup-sub">Recommended packages. Ticked ones are installed when you finish, and the agent
       restarts to pick them up.</p>
     <div id="setup-packages-list"></div>
+    <label class="check-label"><input id="setup-websearch" type="checkbox" checked> set up web search now — set up a local SearXNG and install Camoufox</label>
+    <div class="hint" id="setup-websearch-status"></div>
   </div>
   <div id="setup-step-prefs" class="hidden">
   <div class="settings-grid">
@@ -314,12 +341,26 @@
        dialog styling the settings, crop, ask and subagent panels already share. -->
   <dialog id="notices-dialog">
     <h3>Notifications</h3>
-    <p class="setup-sub" id="notices-sub">Everything the app has reported, newest first. Click a row to copy its details.</p>
+    <p class="setup-sub" id="notices-sub">Everything the app has reported, newest first. Use the arrow to read one in full; click a row to copy its details.</p>
     <div id="notices-list" class="notices-list"></div>
     <div class="dialog-row notices-foot">
       <button id="notices-clear" class="btn small">clear</button>
       <span class="notices-spacer"></span>
       <button id="notices-done" class="btn primary">Done</button>
+    </div>
+  </dialog>
+
+  <!-- One notification, opened on its own. The compact row in the list keeps the
+       panel scannable; this is where a stack trace or a long provider error is
+       actually readable, with its real line breaks instead of a clamp. -->
+  <dialog id="notice-detail-dialog">
+    <h3 id="notice-detail-title">Notification</h3>
+    <div id="notice-detail-meta" class="notice-detail-meta"></div>
+    <div id="notice-detail-body" class="notice-detail-body"></div>
+    <div class="dialog-row notices-foot">
+      <button id="notice-detail-copy" class="btn small">copy text</button>
+      <span class="notices-spacer"></span>
+      <button id="notice-detail-done" class="btn primary">Done</button>
     </div>
   </dialog>
 
@@ -342,6 +383,7 @@
     <button class="tab active" data-tab="general">General</button>
     <button class="tab" data-tab="voice">Voice</button>
     <button class="tab" data-tab="appearance">Appearance</button>
+    <button class="tab" data-tab="fun">Fun</button>
     <button class="tab" data-tab="shorts">Shorts</button>
     <button class="tab" data-tab="providers">Pi providers</button>
     <button class="tab" data-tab="extensions">Extensions</button>
@@ -351,8 +393,8 @@
     <div class="settings-grid">
       <label>Agent name</label>
       <input id="set-agent-name" type="text" placeholder="pi">
-      <label>Profile image</label>
-      <div class="avatar-row">
+      <div class="avatar-row avatar-settings-row">
+        <label for="avatar-input">Profile image</label>
         <span id="set-avatar-preview" class="avatar-wrap avatar-big"></span>
         <button id="btn-avatar-upload" class="btn small">upload…</button>
         <button id="btn-avatar-crop" class="btn small">crop…</button>
@@ -364,13 +406,13 @@
         <input id="set-avatar-size" type="range" min="16" max="96" step="2" value="34">
         <span id="set-avatar-size-val">34px</span>
       </div>
-      <label>Animated avatars</label>
-      <div class="rate-row">
+      <label id="label-avatar-animate">Animated avatars</label>
+      <div class="rate-row" id="row-avatar-animate">
         <input id="set-avatar-animate" type="range" min="0" max="9" step="1" value="9">
         <span id="set-avatar-animate-val">all of them</span>
       </div>
       <label></label>
-      <div class="hint">How many messages keep a moving profile picture. The slider runs <b>none of them</b> → 1 … 8 → <b>all of them</b>, with no hidden ceiling behind that last one. Each animated message is a live video decoder, so on a very long transcript the numbers are cheaper; they all pause while this tab is in the background.</div>
+      <div class="hint" data-note-help data-help-target="#label-avatar-animate">How many messages keep a moving profile picture. The slider runs <b>none of them</b> → 1 … 8 → <b>all of them</b>, with no hidden ceiling behind that last one. Each animated message is a live video decoder, so on a very long transcript the numbers are cheaper; they all pause while this tab is in the background.</div>
       <label>Thinking</label>
       <label class="check-label"><input id="set-show-thinking" type="checkbox"> show thinking blocks</label>
       <label></label>
@@ -379,16 +421,36 @@
       <label class="check-label"><input id="set-show-tools" type="checkbox"> show tool call cards</label>
       <label></label>
       <label class="check-label"><input id="set-expand-tools" type="checkbox"> auto-expand tool call output</label>
+      <label id="label-web-search">Web search</label>
+      <div class="rate-row">
+        <input id="set-searxng-url" type="text" placeholder="http://localhost:8080" style="flex:1;min-width:0">
+        <button id="btn-searxng-test" class="btn small">test</button>
+        <button id="btn-searxng-setup" class="btn small" title="Install and start a local SearXNG — uses Docker when available, otherwise a private Python install">set up</button>
+      </div>
+      <label></label>
+      <div class="hint" id="set-searxng-note" data-note-help data-help-target="#label-web-search">pi-searxng reads ~/.pi/searxng.json. Camoufox is only for browsing, not search; give it a running SearXNG instance.</div>
       <label>Compaction</label>
       <label class="check-label"><input id="set-auto-continue" type="checkbox"> auto-continue the task after compaction</label>
       <label class="check-label"><input id="set-pi-compaction" type="checkbox"> pi auto-compaction (pi's own threshold compaction)<span id="set-pi-compaction-note"></span></label>
+      <label id="label-compaction-threshold">Compaction threshold</label>
+      <div class="rate-row" id="row-compaction-threshold">
+        <input id="set-pi-compaction-threshold" type="range" min="0" max="9" step="1" title="Compaction threshold">
+        <span id="set-pi-compaction-threshold-val" class="hint threshold-value" role="button" tabindex="0" title="Click to type an exact token count"></span>
+        <input id="set-pi-compaction-threshold-manual" class="threshold-manual hidden" type="number" min="2048" max="1000000" step="1" inputmode="numeric" aria-label="Compaction threshold in tokens">
+      </div>
+      <label></label>
+      <span id="set-pi-compaction-threshold-note" class="hint" data-note-help data-help-target="#label-compaction-threshold">how much free context is left when pi compacts; saved to pi's settings and applied when pi reloads</span>
+      <label id="label-block-images">Agent images</label>
+      <label class="check-label"><input id="set-pi-block-images" type="checkbox"> block images for the agent (pi's own setting)<span id="set-pi-block-images-note"></span></label>
+      <label></label>
+      <div class="hint" data-note-help data-help-target="#label-block-images">pi's <code>images.blockImages</code>: the agent cannot read a picture and attachments never reach the model. This is pi's setting, not a way to hide pictures in the transcript.</div>
       <label>When the agent finishes</label>
       <label class="check-label"><input id="set-done-sound" type="checkbox"> play a sound</label>
       <label></label>
       <label class="check-label"><input id="set-done-notify" type="checkbox"> desktop notification</label>
       <label></label>
       <label class="check-label"><input id="set-done-only-unfocused" type="checkbox"> only when this window is not focused</label>
-      <label>Notification sound</label>
+      <label id="label-done-sound">Notification sound</label>
       <div class="rate-row sound-row">
         <input id="set-done-sound-file" type="text" placeholder="your own sound: an audio file, or a URL" spellcheck="false" autocomplete="off">
         <button id="btn-done-sound-upload" class="btn small" title="Pick an audio file on this machine">upload…</button>
@@ -397,23 +459,23 @@
         <input id="done-sound-input" type="file" accept="audio/*,.mp3,.wav,.ogg,.m4a,.aac,.flac,.webm" hidden>
       </div>
       <label></label>
-      <div class="hint" id="done-sound-note">mp3 / wav / ogg / m4a — stored on this machine, never sent to the model. The built-in two-note chime is used until you pick one.</div>
-      <label>Agent</label>
+      <div class="hint" id="done-sound-note" data-note-help data-help-target="#label-done-sound">mp3 / wav / ogg / m4a — stored on this machine, never sent to the model. The built-in two-note chime is used until you pick one.</div>
+      <label id="label-agent">Agent</label>
       <div class="rate-row">
         <button id="btn-reload-pi" class="btn small" title="Reload what pi loads from disk: extensions, skills, prompt templates, keybindings and themes. Nothing you wrote in this session is lost — the conversation is replayed from the session file.">/reload</button>
-        <span class="hint">re-reads extensions, skills, prompts, keybindings, themes</span>
+        <span class="hint" data-note-help data-help-target="#label-agent">re-reads extensions, skills, prompts, keybindings, themes</span>
       </div>
-      <label>Network</label>
+      <label id="set-label-network">Network</label>
       <label class="check-label"><input id="set-lan" type="checkbox"> let other devices on this network open this WebUI</label>
       <label></label>
-      <div class="hint" id="lan-hint"></div>
-      <label>Default model</label>
+      <div class="hint" id="lan-hint" data-note-help data-help-target="#set-label-network"></div>
+      <label id="label-default-model">Default model</label>
       <div class="rate-row">
         <select id="set-default-model"></select>
       </div>
       <label></label>
-      <p class="hint">The model a new chat starts on. "Same as the last used model" keeps whatever the picker is set to.</p>
-      <label>Pi location</label>
+      <p class="hint" data-note-help data-help-target="#label-default-model">The model a new chat starts on. "Same as the last used model" keeps whatever the picker is set to.</p>
+      <label id="set-label-pi-location">Pi location</label>
       <div class="rate-row">
         <select id="set-pi-source">
           <option value="native">on this machine</option>
@@ -422,7 +484,7 @@
         <select id="set-pi-container" class="hidden"></select>
       </div>
       <label></label>
-      <p class="hint" id="set-pi-hint"></p>
+      <p class="hint" id="set-pi-hint" data-note-help data-help-target="#set-label-pi-location"></p>
     </div>
   </div>
 
@@ -444,18 +506,18 @@
         <option value="browser">Browser (built in - default, nothing to download)</option>
         <option value="whisper">Local Whisper server</option>
       </select>
-      <label>Whisper model</label>
+      <label id="label-whisper-model">Whisper model</label>
       <div class="rate-row">
         <select id="set-stt-model"></select>
         <button id="btn-stt-start" class="btn small">download &amp; start</button>
       </div>
       <label></label>
-      <div class="hint" id="stt-model-note"></div>
+      <div class="hint" id="stt-model-note" data-note-help data-help-target="#label-whisper-model">The local whisper.cpp model. Larger models are slower and more accurate; the first use downloads it.</div>
       <label></label>
       <div class="hint hidden" id="stt-status"></div>
-      <label>Whisper endpoint</label>
+      <label id="label-whisper-endpoint">Whisper endpoint</label>
       <input id="set-stt-endpoint" type="text" placeholder="http://localhost:8081/inference (filled in automatically)">
-      <label>TTS backend</label>
+      <label id="label-tts-backend">TTS backend</label>
       <select id="set-tts-backend">
         <option value="browser">Browser voices (built in, nothing to set up)</option>
         <option value="endpoint">Local TTS server — Piper, Kokoro, openedai-speech…</option>
@@ -471,14 +533,24 @@
       </div>
       <label id="tts-cloud-key-label" class="hidden">Cloud API key</label>
       <input id="set-tts-apikey" class="hidden" type="password" placeholder="sk-… — kept on this machine, sent by the bridge" autocomplete="off">
+      <label id="tts-fish-model-label" class="hidden">Fish Audio model</label>
+      <select id="set-tts-fish-model" class="hidden">
+        <option value="s2.1-pro">s2.1-pro (default)</option>
+        <option value="s2.1-pro-free">s2.1-pro-free (free developer tier)</option>
+        <option value="s1">s1</option>
+        <option value="s2-pro">s2-pro</option>
+        <option value="drama-3">drama-3</option>
+      </select>
       <label id="tts-cloud-model-label" class="hidden">Cloud model</label>
-      <input id="set-tts-cloud-model" class="hidden" type="text" placeholder="fish: s1 · openai: tts-1 or gpt-4o-mini-tts">
+      <input id="set-tts-cloud-model" class="hidden" type="text" placeholder="tts-1 or gpt-4o-mini-tts">
       <label id="tts-cloud-voice-label" class="hidden">Cloud voice</label>
       <input id="set-tts-cloud-voice" class="hidden" type="text" placeholder="fish: a reference id · openai: alloy / nova / …">
       <label id="tts-cloud-url-label" class="hidden">Service URL</label>
       <input id="set-tts-cloud-url" class="hidden" type="text" placeholder="https://api.fish.audio · https://api.openai.com">
       <label></label>
-      <div class="hint hidden" id="tts-cloud-note"></div>
+      <div class="hint hidden" id="tts-cloud-note" data-note-help data-help-target="#tts-cloud-key-label"></div>
+      <label></label>
+      <div class="hint hidden" id="tts-fish-note" data-note-help data-help-target="#tts-fish-model-label">Fish Audio has a model list of its own: s2.1-pro is the default, s2.1-pro-free is the free developer tier, and s1 / s2-pro / drama-3 are the older ones the endpoint still accepts. The voice is a reference id from your Fish Audio library — <a href="https://fish.audio" target="_blank" rel="noopener">fish.audio</a> lists them; leave it blank for the default voice.</div>
     </div>
   </div>
 
@@ -488,13 +560,6 @@
       <div class="rate-row">
         <input id="set-accent" type="color" value="#5b9dff">
         <button id="btn-accent-reset" class="btn small">default</button>
-      </div>
-      <label></label>
-      <label class="check-label"><input id="set-gamer" type="checkbox"> gamer mode — let the theme colour drift through the rainbow</label>
-      <label id="gamer-speed-label" class="hidden">Colour cycle</label>
-      <div class="rate-row hidden" id="gamer-speed-row">
-        <input id="set-gamer-speed" type="range" min="1" max="60" step="1" value="16">
-        <span id="set-gamer-speed-val">16s</span>
       </div>
       <label>Background</label>
       <div class="rate-row">
@@ -525,10 +590,10 @@
       <div class="rate-row">
         <label class="check-label"><input id="set-text-outline" type="checkbox"> outline chat text (keeps it readable over the background)</label>
       </div>
-      <label>Outline color</label>
+      <label id="label-outline-color">Outline color</label>
       <div class="rate-row">
         <input id="set-outline-color" type="color" value="#000000">
-        <span class="hint">1px around every glyph</span>
+        <span class="hint" data-note-help data-help-target="#label-outline-color">1px around every glyph</span>
       </div>
       <label>Typing</label>
       <label class="check-label"><input id="set-type-anywhere" type="checkbox"> start typing anywhere in the window (no need to click the box)</label>
@@ -543,7 +608,7 @@
         <input id="set-font-size" type="range" min="12" max="20" step="1">
         <span id="set-font-size-val">14px</span>
       </div>
-      <label>Custom cursor</label>
+      <label id="label-custom-cursor">Custom cursor</label>
       <div class="rate-row cursor-row">
         <input id="set-cursor-file" type="text" placeholder="pointer picture: a PNG, or a URL" spellcheck="false" autocomplete="off">
         <button id="btn-cursor-upload" class="btn small" title="Pick a cursor picture on this machine">upload…</button>
@@ -551,7 +616,8 @@
         <input id="cursor-input" type="file" accept="image/png,image/webp,image/gif,image/svg+xml,.png" hidden>
       </div>
       <label></label>
-      <div class="hint" id="cursor-note">Your picture is redrawn at the size below and written out as a PNG, because a browser silently ignores a CSS cursor that is too large or in a format it will not use as one. The hotspot is the pixel that sits on the real pointer tip — usually the top-left corner (0, 0). Everything gets the picture, including text fields; the browser's own text caret is kept.</div>
+      <div class="hint hidden" id="cursor-status"></div>
+      <div class="hint" id="cursor-note" data-note-help data-help-target="#label-custom-cursor">Your picture is redrawn at the size below and written out as a PNG, because a browser silently ignores a CSS cursor that is too large or in a format it will not use as one. The hotspot is the pixel that sits on the real pointer tip — usually the top-left corner (0, 0). Everything gets the picture, including text fields; the browser's own text caret is kept.</div>
       <label>Cursor size</label>
       <div class="rate-row">
         <input id="set-cursor-size" type="range" min="16" max="128" step="2">
@@ -562,6 +628,47 @@
         <input id="set-cursor-hot-x" type="range" min="0" max="127" step="1">
         <input id="set-cursor-hot-y" type="range" min="0" max="127" step="1">
         <span id="set-cursor-hot-val">0, 0</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="tab-panel hidden" id="tab-fun">
+    <div class="settings-grid">
+      <label>Gamer mode</label>
+      <label class="check-label"><input id="set-gamer" type="checkbox"> let the theme colour drift through the rainbow</label>
+      <label id="gamer-speed-label" class="hidden">Colour cycle</label>
+      <div class="rate-row hidden" id="gamer-speed-row">
+        <input id="set-gamer-speed" type="range" min="1" max="60" step="1" value="16">
+        <span id="set-gamer-speed-val">16s</span>
+      </div>
+      <label>Emoji</label>
+      <label class="check-label"><input id="set-party-confetti" type="checkbox"> confetti when a reply contains 🎉 or 🥳</label>
+      <label id="label-pet-enabled">Desktop pet</label>
+      <label class="check-label"><input id="set-pet-enabled" type="checkbox"> show a little desktop pet in the corner</label>
+      <label data-pet-option>Pet size</label>
+      <div class="rate-row" data-pet-option>
+        <input id="set-pet-size" type="range" min="64" max="160" step="8" value="96">
+        <span id="set-pet-size-val">96px</span>
+      </div>
+      <label data-pet-option>Pet skin</label>
+      <div class="rate-row pet-skin-row" data-pet-option>
+        <select id="set-pet-skin">
+          <option value="builtin">DeepSeek whale (built-in)</option>
+        </select>
+        <button id="btn-pet-refresh" class="btn small" type="button" title="Reload the downloaded Petdex library">refresh</button>
+      </div>
+      <label data-pet-option>Petdex gallery</label>
+      <div class="rate-row pet-search-row" data-pet-option>
+        <input id="pet-search" type="text" placeholder="search Petdex pets…" autocomplete="off">
+        <button id="btn-pet-search" class="btn small" type="button">search</button>
+      </div>
+      <label data-pet-option></label>
+      <div id="pet-results" class="pet-results" data-pet-option></div>
+      <label data-pet-option></label>
+      <div class="hint" data-note-help data-help-target="#label-pet-enabled" data-pet-option>A little desk pet inspired by <a href="https://github.com/orxz/deepseek-harness-pets" target="_blank" rel="noopener">deepseek-harness-pets</a> and the <a href="https://petdex.dev/pets/deepseek" target="_blank" rel="noopener">Petdex gallery</a>. Search the gallery, download a pet, then pick it in <b>Pet skin</b>. It floats in the bottom-right, follows the agent's state, and can be dragged anywhere; its position is remembered in this browser.</div>
+      <label data-pet-option></label>
+      <div class="rate-row" data-pet-option>
+        <button id="btn-pet-reset" class="btn small" type="button">reset pet position</button>
       </div>
     </div>
   </div>
@@ -581,10 +688,10 @@
 
   <!-- Pi providers: write to ~/.pi/agent/models.json so pi picks them up -->
   <div class="tab-panel hidden" id="tab-providers">
-    <p class="hint" style="margin-top:2px">Custom model providers saved to <code>~/.pi/agent/models.json</code> (pi reloads it on every /model).</p>
+    <p class="hint" style="margin-top:2px" data-note-help data-help-target="#label-provider-id">Custom model providers saved to <code>~/.pi/agent/models.json</code> (pi reloads it on every /model).<br><br>Use the provider's <b>base</b> URL, not its <code>/chat/completions</code> endpoint — a full endpoint pasted into the field is trimmed automatically.</p>
     <div id="pi-providers-list" class="prov-list"></div>
     <div class="settings-grid">
-      <label>Provider id</label>
+      <label id="label-provider-id">Provider id</label>
       <input id="prov-id" type="text" placeholder="my-provider" autocomplete="off">
       <label>Base URL</label>
       <input id="prov-base-url" type="text" placeholder="https://api.example.com/v1" autocomplete="off">
@@ -610,9 +717,9 @@
 
     <!-- pi /login: credentials in ~/.pi/agent/auth.json -->
     <div class="prov-section" style="margin-top:14px; border-top:1px solid var(--border); padding-top:10px">
-      <p class="hint" style="margin-top:2px">Log in to a provider — this writes to <code>~/.pi/agent/auth.json</code>, the same file pi's <code>/login</code> uses. The agent restarts to pick up the change.</p>
+      <p class="hint" style="margin-top:2px" data-note-help data-help-target="#label-auth-provider">Log in to a provider — this writes to <code>~/.pi/agent/auth.json</code>, the same file pi's <code>/login</code> uses. The agent restarts to pick up the change.<br><br>Subscription / OAuth logins (ChatGPT, Claude, GitHub Copilot, OpenRouter, xAI…) open a browser flow — run <code>/login &lt;provider&gt;</code> in a pi terminal for those.</p>
       <div class="settings-grid">
-        <label>Provider</label>
+        <label id="label-auth-provider">Provider</label>
         <input id="auth-provider" type="text" placeholder="search or type a provider id…" autocomplete="off">
         <label>API key</label>
         <input id="auth-key" type="password" placeholder="sk-…" autocomplete="off">
@@ -623,7 +730,6 @@
         <button id="btn-auth-logout" class="btn small" title="Remove the provider's credentials from auth.json — same as /logout">logout (remove)</button>
       </div>
       <div id="auth-logged-in" class="prov-list auth-logged-in"></div>
-      <p class="hint">Subscription / OAuth logins (ChatGPT, Claude, GitHub Copilot, OpenRouter, xAI…) open a browser flow — run <code>/login &lt;provider&gt;</code> in a pi terminal for those.</p>
     </div>
   </div>
 
@@ -632,25 +738,25 @@
        +path/-path entries in settings.json rather than a second mechanism of our
        own. There is no install button on purpose - see the note at the end. -->
   <div class="tab-panel hidden" id="tab-extensions">
-    <p class="hint" style="margin-top:2px">
+    <p class="hint" style="margin-top:2px" data-note-help data-help-target="#ext-head-extensions">
       From <code id="ext-agent-dir">~/.pi/agent</code>. Disabling writes
       <code>+path</code>/<code>-path</code> into <code id="ext-settings-file">settings.json</code> — pi's own
       setting, so pi and this tab always agree. Press <b>reload agent</b> after a change to apply it.
     </p>
 
     <div class="prov-section">
-      <h4 class="ext-head">Extensions <span class="ext-count" id="ext-ext-count"></span></h4>
+      <h4 class="ext-head" id="ext-head-extensions">Extensions <span class="ext-count" id="ext-ext-count"></span></h4>
       <div id="ext-extensions" class="prov-list"></div>
     </div>
 
     <div class="prov-section" style="margin-top:12px">
-      <h4 class="ext-head">Skills <span class="ext-count" id="ext-skill-count"></span></h4>
+      <h4 class="ext-head" id="ext-head-skills">Skills <span class="ext-count" id="ext-skill-count"></span></h4>
       <div id="ext-skills" class="prov-list"></div>
     </div>
 
     <div class="prov-section" style="margin-top:12px">
-      <h4 class="ext-head">Packages <span class="ext-count" id="ext-pkg-count"></span></h4>
-      <p class="hint" style="margin:2px 0 6px">Entries in <code>settings.json</code> → <code>packages</code>. Removing one is
+      <h4 class="ext-head" id="ext-head-packages">Packages <span class="ext-count" id="ext-pkg-count"></span></h4>
+      <p class="hint" style="margin:2px 0 6px" data-note-help data-help-target="#ext-head-packages">Entries in <code>settings.json</code> → <code>packages</code>. Removing one is
         immediate; adding one only lists it — pi fetches it the next time it starts.</p>
       <div id="ext-packages" class="prov-list"></div>
       <div class="rate-row prov-actions">
@@ -660,8 +766,8 @@
     </div>
 
     <div class="prov-section" style="margin-top:12px">
-      <h4 class="ext-head">MCP servers <span class="ext-count" id="ext-mcp-count"></span></h4>
-      <p class="hint" style="margin:2px 0 6px">From <code id="ext-mcp-file">mcp.json</code> — pi connects every enabled server
+      <h4 class="ext-head" id="ext-head-mcp">MCP servers <span class="ext-count" id="ext-mcp-count"></span></h4>
+      <p class="hint" style="margin:2px 0 6px" data-note-help data-help-target="#ext-head-mcp">From <code id="ext-mcp-file">mcp.json</code> — pi connects every enabled server
         when a session starts. Project servers come from <code>.pi/mcp.json</code> and are read-only here.</p>
       <div id="ext-mcp" class="prov-list"></div>
       <div class="rate-row prov-actions">
@@ -670,8 +776,8 @@
     </div>
 
     <div class="prov-section" style="margin-top:12px">
-      <h4 class="ext-head">AGENTS.md</h4>
-      <p class="hint" style="margin:2px 0 6px">
+      <h4 class="ext-head" id="ext-head-agents">AGENTS.md</h4>
+      <p class="hint" style="margin:2px 0 6px" data-note-help data-help-target="#ext-head-agents">
         The global file is <code>&lt;agent dir&gt;/AGENTS.md</code> and is editable here. The per-project files
         are shown for reference only — they live at whatever paths the project uses, and writing one would
         be a write anywhere on disk. Saving an empty box deletes the global file.
@@ -683,13 +789,14 @@
       </div>
     </div>
 
-    <p class="hint" style="margin-top:10px; border-top:1px solid var(--border); padding-top:8px">
+    <p class="hint" style="margin-top:10px; border-top:1px solid var(--border); padding-top:8px" data-note-help data-help-target="#ext-head-extensions">
       <b>No install button, on purpose.</b> An extension is code the agent loads and runs. This bridge
       has no password — only a check that the request came from this page rather than another origin —
       so &quot;install&quot; here would mean &quot;run my code on that machine&quot; for anyone who can reach the port.
       Install from a pi terminal with <code>pi install …</code>, then press reload agent.
     </p>
   </div>
+  <div id="settings-help-sources" class="help-sources hidden" aria-hidden="true"></div>
   <div class="dialog-buttons">
     <button id="settings-close" class="btn primary">Done</button>
   </div>
@@ -744,7 +851,12 @@
 
 
     <script src="util.js"></script>
+<script src="settings-state.js"></script>
+<script src="clock.js"></script>
+<script src="media.js"></script>
+<script src="pet.js"></script>
 <script src="markdown.js"></script>
+<script src="party.js"></script>
 <script src="toasts.js"></script>
 <script src="voice.js"></script>
 <script src="attachments.js"></script>
@@ -763,6 +875,8 @@
 <script src="menus.js"></script>
 <script src="transcript.js"></script>
 <script src="stream.js"></script>
+<script src="settings-tools.js"></script>
+<script src="settings-pi.js"></script>
 <script src="settings-ui.js"></script>
 <script src="terminals.js"></script>
 <script src="model-menu.js"></script>
@@ -770,6 +884,7 @@
 <script src="appearance.js"></script>
 <script src="agent-source.js"></script>
 <script src="code-preview.js"></script>
+<script src="statistics.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

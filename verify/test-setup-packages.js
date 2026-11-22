@@ -145,6 +145,11 @@ const getJson = (p) => new Promise((res, rej) => {
     res.goal = goal ? { checked: goal.checked, disabled: goal.disabled } : null;
     res.sub = sub ? { checked: sub.checked, disabled: sub.disabled } : null;
     res.hasLinks = [...document.querySelectorAll('#setup-packages-list a')].map((a) => a.href);
+    // This test is about the package checklist, not web search (which has its
+    // own test). The setup checkbox is on by default now; turn it off so Next
+    // does not wait on the web-search step or auto-select pi-searxng.
+    const ws = $('setup-websearch');
+    if (ws) ws.checked = false;
     // tick the subagents package and go through the wizard
     if (sub) sub.checked = true;
     $('setup-done').click();

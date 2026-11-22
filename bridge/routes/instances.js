@@ -13,7 +13,7 @@
  */
 'use strict';
 
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const net = require('net');
 const http = require('http');
 
@@ -137,15 +137,33 @@ module.exports = function instanceRoutes(deps) {
     const up = await answers(wanted);
     let killed = false;
     if (up) {
-      // The launcher runs the bridge in its own process group and traps TERM
+      // On Windows the record's pid is the cmd/bat launcher, not the node
+      // bridge; taskkill /T is what actually takes the child with it. On POSIX
+      // the launcher runs the bridge in its own process group and traps TERM
       // with `kill 0`, so the group signal takes the agent process with it.
-      try { process.kill(-rec.pid, 'SIGTERM'); killed = true; } catch { /* no group */ }
+      if (process.platform === 'win32') {
+        try { execFileSync('taskkill', ['/T', '/F', '/PID', String(rec.pid)], { stdio: 'ignore' }); killed = true; } catch { /* already gone */ }
+      } else {
+        try { process.kill(-rec.pid, 'SIGTERM'); killed = true; } catch { /* no group */ }
+      }
       if (!killed) { try { process.kill(rec.pid, 'SIGTERM'); } catch { /* already gone */ } }
     }
     /* The record stays (running: false) so the menu can offer to start it
      * again with the same home and port (issue #119). */
     writeStarted(started.map((r) => (r === rec ? Object.assign({}, rec, { running: false, stoppedAt: new Date().toISOString() }) : r)));
     return { ok: true, port: wanted, pid: rec.pid, killed };
+  }
+
+  /* Stop every instance this bridge started. Called from the main server's
+   * shutdown (issue #268): closing the window should not leave the extra
+   * agents running in the background. Sequential on purpose - each stop()
+   * rewrites the shared record file, and parallel writes would lose entries.
+   * stop() only kills when the recorded port answers, so a stale record whose
+   * pid was reused by an unrelated process is marked stopped, not killed. */
+  async function stopAllStarted() {
+    const running = readStarted().filter((r) => r.running !== false && alive(r.pid));
+    for (const rec of running) await stop(rec.port);
+    return running.length;
   }
 
   /* Forget a stopped instance's record. Its home (sessions, auth, settings) is
@@ -182,11 +200,12 @@ module.exports = function instanceRoutes(deps) {
       let body = '';
       req.on('data', (c) => { body += c; if (body.length > 1 << 16) req.destroy(); });
       req.on('end', async () => {
-        let j = null;
-        try { j = JSON.parse(body || '{}'); } catch { j = null; }
-        const out = await start(j && j.instance);
-        if (out.error) { jsonOut(res, out.code || 500, { ok: false, error: out.error }); return; }
-        jsonOut(res, 200, out);
+        try {
+          const j = (() => { try { return JSON.parse(body || '{}'); } catch { return null; } })();
+          const out = await start(j && j.instance);
+          if (out.error) { jsonOut(res, out.code || 500, { ok: false, error: out.error }); return; }
+          jsonOut(res, 200, out);
+        } catch (e) { jsonOut(res, 500, { ok: false, error: e.message }); }
       });
       return;
     }
@@ -207,17 +226,19 @@ module.exports = function instanceRoutes(deps) {
       let body = '';
       req.on('data', (c) => { body += c; if (body.length > 1 << 16) req.destroy(); });
       req.on('end', async () => {
-        let j = null;
-        try { j = JSON.parse(body || '{}'); } catch { j = null; }
-        if (!j || typeof j !== 'object') { jsonOut(res, 400, { ok: false, error: 'expected a JSON body' }); return; }
-        const out = await stop(j.port);
-        if (out.error) { jsonOut(res, out.code || 400, { ok: false, error: out.error }); return; }
-        jsonOut(res, 200, out);
+        try {
+          let j = null;
+          try { j = JSON.parse(body || '{}'); } catch { j = null; }
+          if (!j || typeof j !== 'object') { jsonOut(res, 400, { ok: false, error: 'expected a JSON body' }); return; }
+          const out = await stop(j.port);
+          if (out.error) { jsonOut(res, out.code || 400, { ok: false, error: out.error }); return; }
+          jsonOut(res, 200, out);
+        } catch (e) { jsonOut(res, 500, { ok: false, error: e.message }); }
       });
       return;
     }
     jsonOut(res, 404, { ok: false, error: 'not found' });
   }
 
-  return { match, handle };
+  return { match, handle, stopAllStarted };
 };

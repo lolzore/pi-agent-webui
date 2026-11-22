@@ -5,9 +5,9 @@ rem ---------------------------------------------------------------------------
 rem  Opens the Pi Agent UI in its own window - no build step, no toolchain.
 rem
 rem  Same UI that start-webui.bat serves, launched in Edge/Chrome "app mode" so
-rem  it gets its own window without tabs or an address bar. Use this one when
-rem  you do not want to install Visual Studio just for the native shell in
-rem  pi-desktop\ (start-app.bat). Falls back to the default browser.
+rem  it gets its own window without tabs or an address bar. Use the Electron app
+rem  in pi-electron\ when you want the real shorts feeds beside the chat.
+rem  Falls back to the default browser.
 rem
 rem  The bridge is started automatically when nothing listens on PORT.
 rem ---------------------------------------------------------------------------

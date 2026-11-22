@@ -8,7 +8,7 @@
  */
 'use strict';
 
-const { spawnSync } = require('child_process');
+const { execFile } = require('child_process');
 
 const VIDEO_EXT = new Set(['.mp4', '.m4v', '.webm', '.mov', '.ogv', '.mkv']);
 
@@ -42,53 +42,59 @@ module.exports = function uploadRoutes(deps) {
   const FFMPEG_SETTING = process.env.PI_WEBUI_FFMPEG === undefined ? 'ffmpeg' : String(process.env.PI_WEBUI_FFMPEG).trim();
   const FFMPEG_OFF = FFMPEG_SETTING === '' || /^(off|none|0|false)$/i.test(FFMPEG_SETTING);
   const FFMPEG_BIN = FFMPEG_SETTING || 'ffmpeg';
+  /* One command, without holding the event loop. These used to be spawnSync:
+   * a long video froze the whole bridge (agent RPC, health, every tab) until
+   * ffmpeg finished, up to the two-minute cap. */
+  const run = (cmd, args, timeoutMs) => new Promise((resolve) => {
+    execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 8 << 20 }, (err, stdout, stderr) => resolve({
+      ok: !err,
+      stdout: String(stdout || ''),
+      stderr: String(stderr || '') + (err && !stderr ? ' ' + err.message : ''),
+    }));
+  });
   let ffmpegChecked = null;
-  const ffmpegAvailable = () => {
+  const ffmpegAvailable = async () => {
     if (FFMPEG_OFF) return false;
     if (ffmpegChecked !== null) return ffmpegChecked;
-    try {
-      const r = spawnSync(FFMPEG_BIN, ['-version'], { timeout: 5000, stdio: 'ignore' });
-      ffmpegChecked = !r.error && r.status === 0;
-    } catch { ffmpegChecked = false; }
+    const r = await run(FFMPEG_BIN, ['-version'], 5000);
+    ffmpegChecked = r.ok;
     return ffmpegChecked;
   };
 
-  const probeDuration = (file) => {
+  const probeDuration = async (file) => {
     const probe = /[\\/]/.test(FFMPEG_BIN) ? path.join(path.dirname(FFMPEG_BIN), 'ffprobe') : 'ffprobe';
-    try {
-      const r = spawnSync(probe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', file], { timeout: 15000, encoding: 'utf8' });
-      const n = parseFloat(String(r.stdout || '').trim());
-      return Number.isFinite(n) && n > 0 ? n : null;
-    } catch { return null; }
+    const r = await run(probe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', file], 15000);
+    const n = parseFloat(r.stdout.trim());
+    return Number.isFinite(n) && n > 0 ? n : null;
   };
 
   const isVideo = (file, mimeType) => /^video\//i.test(mimeType || '') || VIDEO_EXT.has(path.extname(file).toLowerCase());
 
   /* null for a non-video; otherwise {frames, frameNote}. Never throws - an
    * upload must not fail because ffmpeg did. */
-  function extractVideoFrames(file, mimeType) {
+  async function extractVideoFrames(file, mimeType) {
     if (!isVideo(file, mimeType)) return null;
     if (FFMPEG_OFF) {
       return { frames: [], frameNote: 'video frames are switched off on this bridge - the model gets the path, not pictures from it' };
     }
-    if (!ffmpegAvailable()) {
+    if (!(await ffmpegAvailable())) {
       return { frames: [], frameNote: 'ffmpeg is not installed on this bridge - the model gets the video\'s path, not pictures from it' };
     }
     let outDir = file + '.frames';
     try {
-      const duration = probeDuration(file);
+      const duration = await probeDuration(file);
       const count = duration ? Math.max(3, Math.min(6, Math.round(duration / 5))) : 4;
       const fps = duration ? count / duration : 1;
       fs.rmSync(outDir, { recursive: true, force: true });
       fs.mkdirSync(outDir, { recursive: true });
-      const r = spawnSync(FFMPEG_BIN, [
+      const r = await run(FFMPEG_BIN, [
         '-v', 'error', '-i', file,
         '-vf', `fps=${fps.toFixed(4)},scale=768:-2`,
         '-frames:v', String(count), '-q:v', '3',
         path.join(outDir, 'f%02d.jpg'),
-      ], { timeout: 120000, maxBuffer: 1 << 20 });
-      if (r.error || r.status !== 0) {
-        const why = String((r.stderr || '') + (r.error ? r.error.message : '')).trim().split('\n').pop() || 'ffmpeg failed';
+      ], 120000);
+      if (!r.ok) {
+        const why = r.stderr.trim().split('\n').pop() || 'ffmpeg failed';
         return { frames: [], frameNote: 'could not read frames from this video (' + why.slice(0, 200) + ')' };
       }
       const names = fs.readdirSync(outDir).filter((n) => /\.jpe?g$/i.test(n)).sort();
@@ -110,9 +116,9 @@ module.exports = function uploadRoutes(deps) {
   }
 
   /* The upload response, plus what the model will be able to see of it. */
-  function withFrames(payload, file, mimeType) {
+  async function withFrames(payload, file, mimeType) {
     try {
-      const got = extractVideoFrames(file, mimeType);
+      const got = await extractVideoFrames(file, mimeType);
       if (got) {
         payload.frames = got.frames;
         if (got.frameNote) payload.frameNote = got.frameNote;
@@ -138,7 +144,7 @@ module.exports = function uploadRoutes(deps) {
     let body = '';
     const MAX = 256 * 1024 * 1024; // base64 of ~190 MB
     req.on('data', (c) => { body += c; if (body.length > MAX) { req.destroy(); } });
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
         const { name, data, mimeType } = JSON.parse(body || '{}');
         if (typeof name !== 'string' || !name) throw new Error('name is required');
@@ -160,7 +166,7 @@ module.exports = function uploadRoutes(deps) {
           try {
             const st = fs.statSync(known);
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(withFrames({ ok: true, path: known, size: st.size, mimeType: mimeType || null, duplicate: true }, known, mimeType || '')));
+            res.end(JSON.stringify(await withFrames({ ok: true, path: known, size: st.size, mimeType: mimeType || null, duplicate: true }, known, mimeType || '')));
             return;
           } catch { delete index[hash]; }   // the file was removed by hand
         }
@@ -170,7 +176,7 @@ module.exports = function uploadRoutes(deps) {
         index[hash] = file;
         try { fs.writeFileSync(indexFile, JSON.stringify(index)); } catch { /* index is a nicety */ }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(withFrames({ ok: true, path: file, size: buf.length, mimeType: mimeType || null }, file, mimeType || '')));
+        res.end(JSON.stringify(await withFrames({ ok: true, path: file, size: buf.length, mimeType: mimeType || null }, file, mimeType || '')));
       } catch (e) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: e.message }));
@@ -195,18 +201,38 @@ module.exports = function uploadRoutes(deps) {
     const MAX_RAW = Number(process.env.PI_WEBUI_MAX_UPLOAD || 4 * 1024 * 1024 * 1024);
     let got = 0;
     let failed = null;
+    let failedStatus = 500;
     const cleanup = () => { try { fs.rmSync(tmp, { force: true }); } catch { /* gone */ } };
+    const limitText = (n) => (n >= 1073741824 ? `${(n / 1073741824).toFixed(1)} GB` : `${Math.round(n / 1048576)} MB`);
     req.on('data', (c) => {
       got += c.length;
-      if (got > MAX_RAW) { failed = `file is larger than the ${Math.round(MAX_RAW / 1073741824)} GB upload limit`; req.destroy(); return; }
+      if (got > MAX_RAW) {
+        /* Answer here rather than only in out.on('finish'): destroying the
+         * request never ends the write stream, so finish never fires and the
+         * caller used to get a connection reset instead of the 413. */
+        failed = `file is larger than the ${limitText(MAX_RAW)} upload limit`;
+        failedStatus = 413;
+        try { req.unpipe(out); } catch { /* already gone */ }
+        try { out.destroy(); } catch { /* already gone */ }
+        cleanup();
+        if (!res.headersSent) {
+          res.writeHead(413, { 'Content-Type': 'application/json', Connection: 'close' });
+          res.end(JSON.stringify({ error: failed }));
+        }
+        /* Do not destroy the request here: that tears the socket down before
+         * the 413 can be read (the client saw "socket hang up"). Stop storing,
+         * drain what is still arriving, and let Connection: close end it. */
+        try { req.resume(); } catch { /* already gone */ }
+        return;
+      }
       hash.update(c);
     });
     req.on('error', () => { cleanup(); });
     out.on('error', (e) => { failed = e.message; cleanup(); });
     req.pipe(out);
-    out.on('finish', () => {
+    out.on('finish', async () => {
       if (failed) {
-        if (!res.headersSent) { res.writeHead(failed.indexOf('larger') === 0 ? 413 : 500, { 'Content-Type': 'application/json' }); }
+        if (!res.headersSent) { res.writeHead(failedStatus, { 'Content-Type': 'application/json' }); }
         res.end(JSON.stringify({ error: failed }));
         return;
       }
@@ -221,7 +247,7 @@ module.exports = function uploadRoutes(deps) {
             const st = fs.statSync(known);
             cleanup();
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(withFrames({ ok: true, path: known, size: st.size, duplicate: true }, known, '')));
+            res.end(JSON.stringify(await withFrames({ ok: true, path: known, size: st.size, duplicate: true }, known, '')));
             return;
           } catch { delete index[digest]; }
         }
@@ -231,7 +257,7 @@ module.exports = function uploadRoutes(deps) {
         index[digest] = file;
         try { fs.writeFileSync(indexFile, JSON.stringify(index)); } catch { /* index is a nicety */ }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(withFrames({ ok: true, path: file, size: got }, file, '')));
+        res.end(JSON.stringify(await withFrames({ ok: true, path: file, size: got }, file, '')));
       } catch (e) {
         cleanup();
         res.writeHead(500, { 'Content-Type': 'application/json' });

@@ -51,6 +51,12 @@ function renderCodePreview(lang, code) {
   const body = $('code-preview-body');
   const title = $('code-preview-title');
   if (!body) return;
+  /* Keep what the Copy button will copy in step with what is drawn. While a
+   * block is still being written, followLiveBlock() re-renders the preview but
+   * the dialog used to keep the code it was opened with - so Copy returned a
+   * truncated block. */
+  const dialog = $('code-preview');
+  if (dialog) dialog._code = code;
   if (title) title.textContent = lang === 'svg' ? 'svg' : 'html page';
   if (lang === 'svg') {
     let img = body.querySelector('img.code-preview-svg');
@@ -133,15 +139,6 @@ function openCodePreview(box) {
   followLiveBlock(box, lang);
 }
 
-async function copyText(text) {
-  try {
-    await navigator.clipboard.writeText(text);
-    toast('Code copied', 'ok');
-  } catch {
-    toast('Could not copy the code', 'error');
-  }
-}
-
 function closeCodePreview() {
   const dialog = $('code-preview');
   stopFollowing();
@@ -159,7 +156,7 @@ function wireCodePreview() {
     e.stopPropagation();
     const box = hit.closest('.codebox');
     if (hit.classList.contains('code-copy')) {
-      copyText(codeFromBox(box));
+      copyText(codeFromBox(box), 'Code copied');
       return;
     }
     openCodePreview(box);
@@ -176,7 +173,7 @@ function wireCodePreview() {
   if (copy) {
     copy.onclick = async () => {
       const code = (dialog._code !== undefined) ? dialog._code : '';
-      copyText(code);
+      copyText(code, 'Code copied');
     };
   }
   dialog.addEventListener('close', stopFollowing);

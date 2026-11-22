@@ -52,6 +52,23 @@ const getJson = (p) => new Promise((res, rej) => {
 
 // The measurement, run inside the page for one viewport: every visible
 // settings-grid child, with its column and width.
+const OVERFLOW = `(() => {
+  const d = document.getElementById('settings-dialog');
+  const dr = d.getBoundingClientRect();
+  const panel = [...d.querySelectorAll('.tab-panel')].find((p) => !p.classList.contains('hidden'));
+  const bad = [];
+  for (const el of d.querySelectorAll('*')) {
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+    const b = el.getBoundingClientRect();
+    if (b.width < 1 || b.height < 1) continue;
+    if (b.right > innerWidth + 1 || b.left < -1 || b.right > dr.right + 1 || b.left < dr.left - 1) {
+      bad.push({ tag: el.tagName, cls: String(el.className || '').slice(0, 30), text: (el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 40), left: Math.round(b.left), right: Math.round(b.right), dialogRight: Math.round(dr.right) });
+    }
+  }
+  return JSON.stringify({ dialog: { left: Math.round(dr.left), right: Math.round(dr.right), w: Math.round(dr.width), sw: d.scrollWidth, cw: d.clientWidth }, vw: innerWidth, panel: panel && panel.id, bad: bad.slice(0, 8), badCount: bad.length });
+})()`;
+
 const MEASURE = `(() => {
   const out = [];
   for (const grid of document.querySelectorAll('#settings-dialog .settings-grid')) {
@@ -181,18 +198,64 @@ const MEASURE = `(() => {
       const isSectionLabel = k.tag === 'LABEL' && !/check-label/.test(k.cls);
       if (isSectionLabel) {
         if (k.x !== labelX) fail(`${panel.tab}: "${k.text}" is a section label but sits at x=${k.x} (label column is ${labelX})`);
-      } else {
+      } else if (!/avatar-settings-row/.test(k.cls)) {
         if (k.x !== controlX) fail(`${panel.tab}: "${k.text}" is a control but sits at x=${k.x} (control column is ${controlX})`);
         if (k.w < 200) fail(`${panel.tab}: "${k.text}" is only ${k.w}px wide - it landed in the label column`);
       }
     }
   }
   // The row from the screenshot, specifically (a tab can hold several grids).
-  const compaction = wide.filter((p) => p.tab === 'General').flatMap((p) => p.kids).find((k) => /pi auto-compaction/.test(k.text));
+  const generalKids = wide.filter((p) => p.tab === 'General').flatMap((p) => p.kids);
+  const avatar = generalKids.find((k) => /avatar-settings-row/.test(k.cls));
+  if (!avatar) fail('the profile-image row is not in the General tab');
+  const labelX = Math.min(...generalKids.map((k) => k.x));
+  if (avatar.x !== labelX) fail(`the profile-image row starts at x=${avatar.x}, not at the label edge (${labelX})`);
+  const avatarButtons = JSON.parse(await evalJs(`(() => {
+    const shown = (id) => { const n = $(id); return !!n && getComputedStyle(n).display !== 'none'; };
+    return JSON.stringify({ avatar: !!SET.avatar, crop: shown('btn-avatar-crop'), clear: shown('btn-avatar-clear') });
+  })()`));
+  if (!avatarButtons.avatar && (avatarButtons.crop || avatarButtons.clear)) {
+    fail('crop/clear are visible on an empty profile row: ' + JSON.stringify(avatarButtons));
+  }
+  const withAvatar = JSON.parse(await evalJs(`(async () => {
+    SET.avatar = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
+    applySettings();
+    await new Promise((r) => setTimeout(r, 100));
+    const shown = (id) => { const n = $(id); return !!n && getComputedStyle(n).display !== 'none'; };
+    const out = { crop: shown('btn-avatar-crop'), clear: shown('btn-avatar-clear') };
+    SET.avatar = null;
+    applySettings();
+    return JSON.stringify(out);
+  })()`));
+  if (!withAvatar.crop || !withAvatar.clear) {
+    fail('crop/clear stayed hidden after a profile image was set: ' + JSON.stringify(withAvatar));
+  }
+  const compaction = generalKids.find((k) => /pi auto-compaction/.test(k.text));
   if (!compaction) fail('the pi auto-compaction row is not in the General tab');
   if (compaction.w < 200) fail(`pi auto-compaction is ${compaction.w}px wide - the #105 bug is back`);
   console.log(`  1200px: ${wide.length} grids, ${wide.reduce((n, p) => n + p.kids.length, 0)} rows - labels col 1, controls col 2, pi auto-compaction ${compaction.w}px`);
 
+  /* Issue #269 follow-up: the narrow fix made the dialog fit a phone, but a
+   * 520px desktop dialog clipped its own multi-button rows. It is wider now,
+   * and every control has to stay inside the dialog at desktop width too. */
+  const wideTabs = await evalJs("[...document.querySelectorAll('#settings-tabs .tab')].map((t) => t.textContent.trim())");
+  for (const label of wideTabs) {
+    await evalJs(`(async () => {
+      const t = [...document.querySelectorAll('#settings-tabs .tab')].find((x) => x.textContent.trim() === ${JSON.stringify(label)});
+      if (t) t.click();
+      await new Promise((r) => setTimeout(r, 180));
+      return true;
+    })()`);
+    const o = JSON.parse(await evalJs(OVERFLOW));
+    if (o.dialog.w < 700) fail(`${label} at 1200px: the settings dialog is only ${o.dialog.w}px wide`);
+    if (o.badCount) fail(`${label} at 1200px: ${o.badCount} element(s) cut off: ` + JSON.stringify(o.bad));
+  }
+  console.log(`  1200px: ${wideTabs.length} settings tabs fit inside the wider dialog`);
+
+  // Leave the screenshot on the page the report was about (the background
+  // upload/crop/clear row), not on whichever tab the loop visited last.
+  await evalJs("(() => { const t = [...document.querySelectorAll('#settings-tabs .tab')].find((x) => x.dataset.tab === 'appearance'); if (t) t.click(); return true; })()");
+  await sleep(180);
   const shot = await send('Page.captureScreenshot', { format: 'png' });
   fs.writeFileSync(shotPath, Buffer.from(shot.result.data, 'base64'));
   console.log('  screenshot:', shotPath);
@@ -214,8 +277,45 @@ const MEASURE = `(() => {
   }
   console.log(`  525px: ${narrow.length} grids, every row full width`);
 
+  /* ── Issue #200: the dialog stays centered below the 760px breakpoint ── */
+  await send('Emulation.setDeviceMetricsOverride', { width: 700, height: 700, deviceScaleFactor: 1, mobile: false });
+  await sleep(250);
+  const centered = JSON.parse(await evalJs(`(() => {
+    const d = document.getElementById('settings-dialog');
+    const r = d.getBoundingClientRect();
+    return JSON.stringify({ x: r.x, w: r.width, vw: innerWidth, open: d.open });
+  })()`));
+  if (!centered.open) fail('the settings dialog closed while resizing to 700px');
+  const expectedX = (centered.vw - centered.w) / 2;
+  if (Math.abs(centered.x - expectedX) > 2) {
+    fail(`the settings dialog is not centered at 700px: x=${centered.x}, width=${centered.w}, viewport=${centered.vw} (expected x≈${Math.round(expectedX)})`);
+  }
+  console.log(`  700px: dialog x=${Math.round(centered.x)} width=${Math.round(centered.w)} in ${centered.vw}px viewport (centered)`);
+
+  /* ── Issue #269: a 367px-wide phone screenshot had the right side of every
+   *    settings row cut off. The dialog's min-width:380px was wider than the
+   *    screen; long labels with help icons also stayed nowrap. Nothing may
+   *    stick out of a 360px viewport now. ── */
+  await send('Emulation.setDeviceMetricsOverride', { width: 360, height: 700, deviceScaleFactor: 1, mobile: false });
+  await sleep(250);
+  const tabs360 = await evalJs("[...document.querySelectorAll('#settings-tabs .tab')].map((t) => t.textContent.trim())");
+  for (const label of tabs360) {
+    await evalJs(`(async () => {
+      const t = [...document.querySelectorAll('#settings-tabs .tab')].find((x) => x.textContent.trim() === ${JSON.stringify(label)});
+      if (t) t.click();
+      await new Promise((r) => setTimeout(r, 220));
+      return true;
+    })()`);
+    const o = JSON.parse(await evalJs(OVERFLOW));
+    if (o.dialog.right > o.vw + 1 || o.dialog.left < -1) {
+      fail(`${label} at 360px: dialog runs from ${o.dialog.left} to ${o.dialog.right} in a ${o.vw}px viewport`);
+    }
+    if (o.badCount) fail(`${label} at 360px: ${o.badCount} element(s) cut off: ` + JSON.stringify(o.bad));
+  }
+  console.log(`  360px: ${tabs360.length} settings tabs fit without horizontal cut-off`);
+
   if (problems.length) fail('the page reported errors:\n' + problems.join('\n'));
-  console.log('  PASS #105 settings rows are pinned to their columns at both widths');
+  console.log('  PASS #105/#200/#269 settings rows are pinned, centered, and fit a narrow phone');
   cleanupBrowser();
   cleanup();
   process.exit(0);

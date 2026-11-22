@@ -62,7 +62,7 @@ function llamaServerCandidates() {
  * the server is unreachable or has no models endpoint. A network error on the
  * first path means the host is unreachable — don't waste another timeout on
  * the second path. */
-async function fetchLlamaModels(url, timeoutMs = 1200) {
+async function fetchLlamaModels(url, timeoutMs = 1200, headers) {
   const parse = (d) => {
     const arr = Array.isArray(d) ? d : (Array.isArray(d.data) ? d.data : null);
     if (!arr) return null;
@@ -71,13 +71,13 @@ async function fetchLlamaModels(url, timeoutMs = 1200) {
       .map((m) => ({ id: m.id, name: m.name || m.id }));
   };
   try {
-    const res = await fetch(url + '/v1/models', { signal: AbortSignal.timeout(Math.max(150, Number(timeoutMs) || 1200)) });
+    const res = await fetch(url + '/v1/models', { headers, signal: AbortSignal.timeout(Math.max(150, Number(timeoutMs) || 1200)) });
     if (res.ok) {
       const models = parse(await res.json());
       if (models) return models;
     }
     // Server answered (404/405/etc.) — try the plain /models path (llama.cpp).
-    const res2 = await fetch(url + '/models', { signal: AbortSignal.timeout(1200) });
+    const res2 = await fetch(url + '/models', { headers, signal: AbortSignal.timeout(1200) });
     if (res2.ok) return parse(await res2.json());
     return null;
   } catch {
@@ -162,6 +162,25 @@ const MODEL_FIELDS = ['id', 'name', 'api', 'baseUrl', 'reasoning', 'input',
   'contextWindow', 'maxTokens', 'cost', 'compat', 'thinkingLevelMap', 'headers'];
 const PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
+/* People copy the endpoint their provider documents (".../v1/chat/completions")
+ * into the base URL field, which is not what pi wants: it appends
+ * /chat/completions itself. Accept both by removing the endpoint suffix here.
+ * A full endpoint also makes model discovery and the connection test probe
+ * nonsense paths (".../chat/completions/models"), so normalising before either
+ * is the actual fix for that confusion. */
+function normalizeProviderBaseUrl(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  const withProto = /^https?:\/\//i.test(text) ? text : `https://${text}`;
+  let u;
+  try { u = new URL(withProto); } catch { return text.replace(/\/+$/, ''); }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return text.replace(/\/+$/, '');
+  u.pathname = u.pathname.replace(/\/+$/, '').replace(/\/(?:chat\/completions|completions|models)$/i, '') || '/';
+  u.search = '';
+  u.hash = '';
+  return u.toString().replace(/\/$/, '');
+}
+
 // Built-in provider ids, i.e. the keys pi accepts in auth.json. Sourced from
 // docs/providers.md (API-key table) plus the OAuth/subscription providers.
 const BUILTIN_PROVIDER_IDS = [
@@ -227,7 +246,23 @@ function writeJsonAtomic(target, value) {
  * so "add provider" reported a bare ENOENT. */
 function writeModelsFile(file) {
   fs.mkdirSync(PI_AGENT_DIR, { recursive: true });
-  writeJsonAtomic(PI_MODELS_FILE, `${JSON.stringify(file, null, 2)}\n`);
+  // writeJsonAtomic already serialises its value. Passing a JSON.stringify()
+  // result here wrote a JSON *string* of the object into models.json, so pi
+  // could not read the providers and the next add failed with "Cannot create
+  // property 'providers' on string".
+  writeJsonAtomic(PI_MODELS_FILE, file);
+}
+
+/* Read pi's models.json, including a legacy double-encoded file written by the
+ * bug above. Reading it back as an object means opening the providers tab
+ * repairs neither the file nor the problem, but at least shows what is in it;
+ * the next add/remove rewrites it correctly. */
+function readModelsFile() {
+  let file = readJsonSafe(PI_MODELS_FILE);
+  if (typeof file === 'string') {
+    try { file = JSON.parse(file); } catch { file = null; }
+  }
+  return file && typeof file === 'object' && !Array.isArray(file) ? file : {};
 }
 
 /* This machine's private IPv4 addresses. A llama-server started with the default
@@ -344,6 +379,7 @@ const llamaModelsCache = { at: 0, data: null };
     LOCAL_LLAMA_PORTS,
     MODEL_FIELDS,
     PROVIDER_ID_RE,
+    normalizeProviderBaseUrl,
     VIRTUAL_IFACE,
     authEntryKind,
     fetchLlamaModels,
@@ -355,6 +391,7 @@ const llamaModelsCache = { at: 0, data: null };
     llamaModelsCache,
     llamaServerCandidates,
     llamaServerIdentity,
+    readModelsFile,
     llamaSweepLan,
     localIPv4s,
     maskKey,

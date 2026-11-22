@@ -12,6 +12,9 @@
  */
 'use strict';
 
+const sessionModes = require('./session-modes');
+const plainModels = require('./plain-models');
+
 module.exports = function agentSupervision(deps) {
   const {
     DEBUG_RPC,
@@ -28,20 +31,24 @@ module.exports = function agentSupervision(deps) {
     execSync,
     fs,
     forgetLastSession,
+    forgetLastSessionIf,
     hostOnly,
     hostSpawnDir,
     isWin,
     http,
     lanAddress,
+    lastSessionSkipped,
     loadLastSession,
     path,
     proxyWss,
     saveLastSession,
     server,
-    sessionFileExists,
+    sessionProblem,
+    sessionProblemNow,
     spawn,
     splitProxyPath,
     startWhisper,
+    stopStartedInstances,
     stopWhisper,
     whisperUrl,
   } = deps;
@@ -64,6 +71,12 @@ const wss = new WebSocketServer({ noServer: true });
  * clients using "req-1" would resolve each other's requests.
  */
 let agent = null;               // the shared child process
+let agentMode = 'normal';       // 'normal' | 'plain' (no tools/extensions/skills/AGENTS.md)
+const PLAIN_FLAGS = '--no-tools --no-extensions --no-skills --no-context-files --no-mcp';
+// A mode switch to a specific session (a plain chat from the sidebar, or a
+// normal chat while the bridge happens to be in plain mode) has to start pi in
+// that session rather than in a fresh one. startAgent consumes this once.
+let pendingStartPath = null;
 const clients = new Set();      // connected sockets
 // A reload closes the old socket and opens a new one a moment later. Killing the
 // agent on the first close meant every reload restarted pi, and a reload right
@@ -73,13 +86,25 @@ const clients = new Set();      // connected sockets
 // seconds later.
 const IDLE_KILL_MS = parseInt(process.env.PI_WEBUI_IDLE_KILL_MS || '25000', 10);
 let agentIdleTimer = null;
-// rpc request id -> { ws, type, sessionPath }: the socket that sent it (the
-// response is routed back to it, not broadcast - ids are only unique per
-// client), plus the command so the bridge can track session changes.
+/* Requests on the wire are keyed by an id this bridge assigns, never by the
+ * client's own id. Every page numbers its requests from zero, so two tabs both
+ * send `req-1`; keying by that id meant the second tab overwrote the first and
+ * one of them was handed the other's answer (while the other timed out). The
+ * client's id is kept beside the owner and written back into the response, so
+ * each page still sees the id it sent.
+ *
+ * wire id -> { ws, clientId, type, sessionPath, agent }: the socket that sent
+ * it, its own id, and the command so session changes can be tracked. */
 const pendingOwner = new Map();
+let wireReqId = 0;
 // RPCs issued by the bridge itself (session bookkeeping): their responses are
 // consumed here instead of being routed to a client socket.
 const bridgePending = new Map(); // request id -> { resolve, reject }
+
+function rememberPlainSession(sessionPath) {
+  if (!sessionPath || agentMode !== 'plain') return;
+  try { sessionModes.remember(PI_AGENT_DIR, sessionPath, 'plain'); } catch { /* mode is a nicety */ }
+}
 let bridgeReqId = 0;
 
 function bridgeRpc(commandObj, timeoutMs = 120000) {
@@ -105,6 +130,23 @@ function failBridgePending(reason) {
   }
 }
 
+/* The same for the commands a *client* is waiting on.
+ *
+ * Every request in pendingOwner was written to a pipe that just closed, so none
+ * of them will ever be answered. Dropping them silently is what left the page
+ * waiting: the send path on the client keeps the message row on screen until the
+ * request settles, and its request timeout is two minutes. The page has to be
+ * told, or nothing it does with that row can ever be right. */
+function failPendingOwners(reason) {
+  for (const [id, owner] of pendingOwner) {
+    pendingOwner.delete(id);
+    wsSend(owner.ws, {
+      bridge: 'rpc',
+      payload: { type: 'response', id, command: owner.type, success: false, error: reason },
+    });
+  }
+}
+
 /* Keep the "last session" record current so a restarted agent can resume it.
  * switch_session says which file directly; new_session/fork/clone create a
  * file whose path the agent only reports via get_state. Cancelled switches
@@ -115,13 +157,33 @@ function trackSessionChange(parsed, owner) {
   const cmd = parsed.command || owner.type;
   const cancelled = parsed.data && parsed.data.cancelled === true;
   if (cmd === 'switch_session' && owner.sessionPath && !cancelled) {
-    saveLastSession(owner.sessionPath);
+    agentStatus.sessionFile = owner.sessionPath;
+    // The user (or a page) moved deliberately: whatever resume failed before is
+    // no longer what this agent is about.
+    lastResumeFailed = null;
+    rememberPlainSession(owner.sessionPath);
+    if (agentMode !== 'plain') saveLastSession(owner.sessionPath);
+  } else if (cmd === 'get_state' && parsed.data && parsed.data.sessionFile) {
+    // The page asks for this on every session open and after a fresh start.
+    // It is also how a new plain chat's filename becomes known: pi does not
+    // create the file until the first message, so this is the only path the
+    // sidebar can show (and remember as plain) in the meantime.
+    agentStatus.sessionFile = parsed.data.sessionFile;
+    rememberPlainSession(parsed.data.sessionFile);
+  } else if (cmd === 'get_available_models' && parsed.data && Array.isArray(parsed.data.models)) {
+    // Remember the normal agent's complete catalogue (extension providers
+    // included); the plain child cannot run those extensions to discover them.
+    if (agentMode !== 'plain') plainModels.rememberSnapshot(PI_AGENT_DIR, parsed.data.models);
   } else if ((cmd === 'prompt' || cmd === 'new_session' || cmd === 'fork' || cmd === 'clone') && !cancelled) {
     // A prompt can be the first thing that creates a session file, and its path
     // is reported nowhere else - re-read it, so the record matches the session
     // the message actually landed in.
     bridgeRpc({ type: 'get_state' }, 15000)
-      .then((st) => { if (st && st.sessionFile) saveLastSession(st.sessionFile); })
+      .then((st) => {
+        if (!st || !st.sessionFile) return;
+        rememberPlainSession(st.sessionFile);
+        if (agentMode !== 'plain') saveLastSession(st.sessionFile);
+      })
       .catch(() => { /* agent gone; nothing to record */ });
   }
 }
@@ -139,7 +201,7 @@ function broadcast(obj, except) {
 function noteAgentActivity(obj) {
   if (!obj || typeof obj !== 'object') return;
   const sf = obj.sessionFile || (obj.session && obj.session.file) || null;
-  if (sf) agentStatus.sessionFile = sf;
+  if (sf) { agentStatus.sessionFile = sf; rememberPlainSession(sf); }
   switch (obj.type) {
     case 'agent_start': agentStatus.busy = true; break;
     case 'agent_settled':
@@ -183,8 +245,84 @@ function wsSend(ws, obj) {
   }
 }
 
+/* A wedged extension runner, cleared by restarting the agent.
+ *
+ * pi invalidates every extension context when the session is replaced or the
+ * extensions are reloaded. If an agent ends up running its turns against one of
+ * those dead contexts, pi answers every extension handler with the same error -
+ * "This extension ctx is stale after session replacement or reload" - turn after
+ * turn, and the boundary reports "turn_end could not resolve the persisted
+ * assistant entry ID" with it. The page cannot repair that, and neither can a
+ * /reload: the session keeps streaming into a runner nobody rebuilt. A fresh
+ * child is the one reliable repair, and the session it was in comes back from
+ * the usual last-session record.
+ *
+ * Only between turns: a restart mid-answer would throw the answer away. Bounded
+ * to three repairs an hour, because an extension that is broken in a way a
+ * restart cannot fix must not become a restart loop. */
+const STALE_EXTENSION_CTX = /extension ctx is stale|stale after session replacement or reload/i;
+let staleRepairs = [];
+let staleRepairTimer = null;
+let staleRepairRunning = false;
+let staleRepairGaveUp = false;
+
+function noteExtensionHealth(parsed) {
+  if (!parsed || parsed.type !== 'extension_error') return;
+  if (!STALE_EXTENSION_CTX.test(String(parsed.error || ''))) return;
+  if (staleRepairTimer || staleRepairRunning) return; // already queued or running
+  staleRepairTimer = setTimeout(tryStaleRepair, 1500);
+}
+
+function tryStaleRepair() {
+  staleRepairTimer = null;
+  if (!agent || shuttingDown) return;
+  // Wait for the turn to finish: the stale batch arrives at turn_end and at the
+  // start of the next request, so the answer is usually still streaming.
+  if (agentStatus.busy) { staleRepairTimer = setTimeout(tryStaleRepair, 1500); return; }
+  const now = Date.now();
+  staleRepairs = staleRepairs.filter((t) => now - t < 3600000);
+  if (staleRepairs.length >= 3) {
+    if (!staleRepairGaveUp) {
+      staleRepairGaveUp = true;
+      console.error('extension contexts are still stale after three restarts; not restarting again for now');
+      broadcast({ bridge: 'agent_stderr', text: 'The agent keeps reporting stale extension contexts (an extension is holding a replaced session) - restart it from the top bar to clear it.' });
+    }
+    return;
+  }
+  staleRepairGaveUp = false;
+  staleRepairs.push(now);
+  staleRepairRunning = true;
+  const child = agent;
+  console.log('extension contexts are stale - restarting the agent to clear them');
+  // Record where we are first, so the restart resumes this session rather than
+  // whatever the last record said.
+  recordCurrentSession(8000).finally(() => {
+    staleRepairRunning = false;
+    if (!agent || agent !== child) return;
+    // The exit handler schedules the restart; leave `agent` alone so it sees the
+    // exit as the current child's and brings it back with the session recorded.
+    try { killTree(child); } catch (e) { console.error('stale-ctx repair kill failed:', e.message); }
+  });
+}
+
 let agentRestarts = [];
 let agentRestartTimer = null;
+
+/* Why the agent is not in the session the bridge meant to be in.
+ *
+ * A resume that is skipped (or a start that dies because of the session it was
+ * given) is not something the page can see on its own: it looks like the last
+ * conversation simply vanished. The news is kept, like lastResumed, because the
+ * bridge decides it before the browser's socket is open - a plain broadcast would
+ * have no listener. */
+let lastResumeFailed = null;   // { path, reason: 'file'|'folder', explicit?: boolean }
+
+function announceResumeFailure(info) {
+  if (!info) return;
+  lastResumeFailed = info;
+  lastResumed = null;
+  broadcast({ bridge: 'session_resume_failed', path: info.path, reason: info.reason, explicit: !!info.explicit });
+}
 
 /* Bring the agent back after it exited with clients still connected. Bounded: a
  * command that cannot start at all must not respawn in a tight loop. */
@@ -214,8 +352,41 @@ function shellArg(value) {
   return "'" + str.replace(/'/g, "'\\''") + "'";
 }
 
+/* Switch between the normal agent and a plain-chat agent. A mode change needs a
+ * new pi process because tools/extensions/skills/context files are fixed when pi
+ * starts. Session bookkeeping deliberately keeps lastSession pointing at the
+ * last normal chat, so leaving plain mode returns to the conversation the user
+ * was in before it. */
+function setAgentMode(mode, sessionPath) {
+  const next = mode === 'plain' ? 'plain' : (mode === 'normal' ? 'normal' : null);
+  if (!next) throw new Error('mode must be "normal" or "plain"');
+  if (agentStatus.busy || agentStatus.compacting) {
+    return { ok: false, error: 'the agent is busy; wait for the current turn to finish', busy: true };
+  }
+  agentMode = next;
+  agentStatus.mode = next;
+  agentStatus.resuming = null;
+  lastResumed = null;
+  lastResumeFailed = null;
+  pendingStartPath = sessionPath ? String(sessionPath) : null;
+  // The old path belongs to the old process/mode. Clear it until the new child
+  // answers get_state (or use the requested target) so the sidebar cannot paint
+  // the old session with the new mode's outline in the gap.
+  agentStatus.sessionFile = pendingStartPath || null;
+  failBridgePending('agent mode changed');
+  const old = agent;
+  agent = null;
+  if (old) killTree(old);
+  broadcast({ bridge: 'agent_mode', mode: next });
+  setTimeout(() => { if (!agent && !shuttingDown) startAgent(); }, 120).unref?.();
+  return { ok: true, mode: next, sessionPath: pendingStartPath };
+}
+
 function startAgent() {
   if (agent) return agent;
+  // A new child makes any resume belonging to the previous one moot; clearing
+  // it here keeps /api/sessions from claiming a resume that can no longer land.
+  agentStatus.resuming = null;
 
   // pi keeps its own idea of where its config and sessions live, and nothing
   // was telling it about the ones this bridge was pointed at: set
@@ -244,15 +415,63 @@ function startAgent() {
    * sends is already about the right session.
    *
    * A local session file is checked here, synchronously; the container case
-   * still goes through the switch below, because the file lives in there. */
+   * still goes through the switch below, because the file lives in there.
+   *
+   * "Checked" has to mean more than "the file is there": pi exits code 1 when
+   * the session's recorded working directory is gone, and starting in the
+   * session is exactly how that message becomes a dead agent. See
+   * sessionProblemNow() in server.js - a stale record used to make every restart
+   * resume the same dead session, so the page never got a running agent again. */
   let resumePath = null;
-  if (!SESSION_DIR.startsWith('docker:')) {
+  let resumeProblem = null;   // the session we wanted and could not use, if any
+  let resumeExplicit = false; // the user picked this session (a mode switch)
+  if (pendingStartPath) {
+    resumePath = pendingStartPath;
+    pendingStartPath = null;
+    // A session the user picked can be stale too (a mode switch into a plain
+    // chat whose project folder was renamed). Ask the same question.
+    const problem = sessionProblemNow(resumePath);
+    if (problem) {
+      resumeProblem = { path: resumePath, reason: problem, explicit: true };
+      forgetLastSessionIf(resumePath);
+      resumePath = null;
+    } else {
+      resumeExplicit = true;
+    }
+  } else if (agentMode !== 'plain' && !SESSION_DIR.startsWith('docker:')) {
     try {
       const last = loadLastSession();
       if (last && fs.existsSync(last)) resumePath = last;
     } catch { /* no record, or no fs to check with: start fresh */ }
+    // loadLastSession forgets a record it cannot use; report why this start is in
+    // a fresh session rather than the one the user left.
+    if (!resumePath) resumeProblem = (lastSessionSkipped && lastSessionSkipped()) || null;
   }
-  const command = resumePath ? `${PI_COMMAND} --session ${shellArg(resumePath)}` : PI_COMMAND;
+  // Plain chat is a separate pi process: no tools, no extensions (including
+  // built-in MCP), no skills, and no AGENTS.md/CLAUDE.md context files. It never
+  // resumes the previous session; a new chat starts empty.
+  const command = agentMode === 'plain'
+    ? `${PI_COMMAND} ${PLAIN_FLAGS}${resumePath ? ` --session ${shellArg(resumePath)}` : ''}`
+    : (resumePath ? `${PI_COMMAND} --session ${shellArg(resumePath)}` : PI_COMMAND);
+  /* A plain child has no extensions, and extensions are where llama.cpp and
+   * SchizoDev register their providers. Give that child a temporary agent dir
+   * with a models.json merged from models-store/auth instead, so its picker is
+   * not reduced to the custom models.json providers. The real config is never
+   * written; the overlay is discarded when the child is replaced. */
+  if (agentMode === 'plain') {
+    const overlay = plainModels.create(PI_AGENT_DIR, PI_COMMAND);
+    if (overlay) {
+      plainModels.setActive(overlay);
+      childEnv.PI_CODING_AGENT_DIR = overlay;
+    }
+  } else {
+    plainModels.setActive(null);
+  }
+  /* A resume path in a container is a path *in there*; pi is started in the
+   * same container, so it is valid where it is used. Only the local check can
+   * answer the cwd question, and sessionProblemNow says "cannot tell" for a
+   * container path rather than "gone". */
+  const startedAt = Date.now();
   let child;
   try {
     child = spawn(command, {
@@ -307,6 +526,7 @@ function startAgent() {
       // A response belongs only to the client that issued the request; events
       // (everything without a matching owner) go to everybody.
       noteAgentActivity(parsed);
+      noteExtensionHealth(parsed);
       if (parsed && parsed.type === 'response' && parsed.id) {
         const bp = bridgePending.get(parsed.id);
         if (bp) {
@@ -317,11 +537,34 @@ function startAgent() {
         if (pendingOwner.has(parsed.id)) {
           const owner = pendingOwner.get(parsed.id);
           pendingOwner.delete(parsed.id);
+          const payload = owner.clientId !== undefined && owner.clientId !== parsed.id
+            ? { ...parsed, id: owner.clientId }
+            : parsed;
+          // A response from a child that has been replaced describes the wrong
+          // session (and the wrong mode). Settle the caller with an error rather
+          // than letting it write a stale session path into bookkeeping.
+          if (owner.agent !== agent) {
+            wsSend(owner.ws, { bridge: 'rpc', payload: {
+              type: 'response', id: payload.id, command: parsed.command || owner.type,
+              success: false, error: 'agent restarted',
+            } });
+            continue;
+          }
           if (DEBUG_RPC) console.log(`[rpc] -> ${parsed.command || owner.type}${parsed.success ? '' : ' FAILED: ' + (parsed.error || '')}`);
-          wsSend(owner.ws, { bridge: 'rpc', payload: parsed });
+          wsSend(owner.ws, { bridge: 'rpc', payload });
           trackSessionChange(parsed, owner);
           continue;
         }
+      }
+      /* Request-scoped events carry the id of the request that caused them
+       * (`bash_execution_update` does). The id on the wire is the bridge's, so
+       * it is translated back and sent to the caller only: broadcasting it
+       * would let another tab with the same client-side id show output from a
+       * command it did not run. */
+      if (parsed && parsed.type === 'bash_execution_update' && parsed.id && pendingOwner.has(parsed.id)) {
+        const owner = pendingOwner.get(parsed.id);
+        wsSend(owner.ws, { bridge: 'rpc', payload: { ...parsed, id: owner.clientId } });
+        continue;
       }
       broadcast({ bridge: 'rpc', payload: parsed });
     }
@@ -329,7 +572,9 @@ function startAgent() {
 
   child.stderr.on('data', (d) => {
     if (child !== agent) return;
-    broadcast({ bridge: 'agent_stderr', text: d.toString('utf8') });
+    const text = d.toString('utf8');
+    if (DEBUG_RPC) console.error(`[agent stderr] ${text.trimEnd()}`);
+    broadcast({ bridge: 'agent_stderr', text });
   });
 
   child.on('error', (err) => {
@@ -350,8 +595,23 @@ function startAgent() {
     if (wasCurrent) agent = null;
     if (!wasCurrent) return;   // a replaced child; its exit is not the bridge's business
     agentStatus.busy = false;
+    agentStatus.resuming = null;
     failBridgePending('agent exited');
+    failPendingOwners('the agent exited before it answered - the command was not run');
     console.log(`agent exited (code ${code}${signal ? ', signal ' + signal : ''})`);
+    /* A child that dies moments after being started *in a session* died because
+     * of that session. That is pi's behaviour when the session's recorded
+     * working directory is gone - it prints the reason and exits 1 - and it is
+     * also what any other fatal, session-specific startup failure looks like
+     * from here. Retrying the same start forever is what turned one stale record
+     * into "the agent is not running" for every command: five restarts, the same
+     * wall, no agent. Drop the record once and come back in a fresh session, so
+     * the UI recovers by itself and the conversation is still in the sidebar. */
+    if (resumePath && Date.now() - startedAt < 5000) {
+      console.warn(`the agent died right after starting in ${resumePath} - not resuming it again`);
+      forgetLastSessionIf(resumePath);
+      announceResumeFailure({ path: resumePath, reason: 'start', explicit: !!resumeExplicit });
+    }
     broadcast({ bridge: 'agent_exit', code, signal });
     // pi can end on its own - a container settling, a provider dropping the RPC
     // loop. Waiting for somebody to press "restart" leaves the page sitting in
@@ -364,6 +624,7 @@ function startAgent() {
   broadcast({
     bridge: 'agent_started',
     command: PI_COMMAND,
+    mode: agentMode,
     workspace: WORKSPACE_DIR,
     sessionDir: SESSION_DIR,
   });
@@ -373,8 +634,23 @@ function startAgent() {
   if (resumePath) {
     // already in it: there is nothing to switch to
     lastResumed = resumePath;
+    lastResumeFailed = null;
+    agentStatus.sessionFile = resumePath;
+    rememberPlainSession(resumePath);
+    if (agentMode !== 'plain') saveLastSession(resumePath);
     console.log(`started in the last session: ${resumePath}`);
     broadcast({ bridge: 'session_resumed', path: resumePath });
+    recordCurrentSession();
+  } else if (resumeProblem) {
+    // The session we meant to open cannot be opened. Say so (and remind late
+    // arrivals when they connect), then start in a fresh one - never in the dead
+    // session, which would take the whole agent down.
+    console.warn(`not starting in ${resumeProblem.path}: the session's ${resumeProblem.reason === 'folder' ? 'working directory is gone' : 'file is gone'}`);
+    announceResumeFailure(resumeProblem);
+    recordCurrentSession();
+  } else if (agentMode === 'plain') {
+    // A plain chat is a new chat. Resuming the last normal session here was the
+    // reason the outlined plain row kept pointing at the normal conversation.
     recordCurrentSession();
   } else {
     resumeLastSessionOnAgent();
@@ -389,7 +665,9 @@ async function recordCurrentSession(timeoutMs = 15000) {
     const st = await bridgeRpc({ type: 'get_state' }, timeoutMs);
     if (st && st.sessionFile) {
       if (DEBUG_RPC) console.log(`[session] recorded ${st.sessionFile}`);
-      saveLastSession(st.sessionFile);
+      agentStatus.sessionFile = st.sessionFile;
+      rememberPlainSession(st.sessionFile);
+      if (agentMode !== 'plain') saveLastSession(st.sessionFile);
       return st.sessionFile;
     }
   } catch { /* agent gone or too slow - the previous record still stands */ }
@@ -420,26 +698,41 @@ async function recordCurrentSession(timeoutMs = 15000) {
 let lastResumed = null;
 
 function resumeLastSessionOnAgent() {
+  // Plain chat never resumes the remembered normal session; its own target is
+  // passed to startAgent as pendingStartPath instead.
+  if (agentMode === 'plain') { recordCurrentSession(); return; }
   const last = loadLastSession();
-  if (!last) { recordCurrentSession(); return; }
-  // Ask whether the file is still there *before* switching: a record left behind
-  // by a session that has since been deleted (or by another bridge that used a
-  // different session dir) used to produce a failed switch, a "could not reopen
-  // your last session" toast and - with a pi that does not answer - a wedged
-  // agent that had to be restarted. None of that is a resume.
-  sessionFileExists(last).then((exists) => {
-    if (exists) return resumeInto(last);
-    console.warn(`forgetting last session (gone): ${last}`);
+  if (!last) { agentStatus.resuming = null; recordCurrentSession(); return; }
+  // Publish "a resume is in flight" before the existence check. In container
+  // mode that check is a `docker exec` that can take hundreds of milliseconds;
+  // a page connecting during it used to see a fresh session and issue its own
+  // switch to the same path. That second switch made pi start the session twice
+  // - and an extension that asks a question on session_start (goal-x's "Resume
+  // paused goal?") asked it twice as well (issue #220).
+  agentStatus.resuming = last;
+  // Ask whether the session can still be opened *before* switching: a record
+  // left behind by a session that has since been deleted, or whose recorded
+  // working directory is gone, used to produce a failed switch, a "could not
+  // reopen your last session" toast and - with a pi that does not answer - a
+  // wedged agent that had to be restarted. None of that is a resume.
+  sessionProblem(last).then((problem) => {
+    if (!problem) return resumeInto(last);
+    console.warn(`forgetting last session (${problem === 'folder' ? 'its folder is gone' : 'gone'}): ${last}`);
     forgetLastSession();
+    announceResumeFailure({ path: last, reason: problem });
     recordCurrentSession();
-  }).catch(() => resumeInto(last));   // a docker failure: let the agent decide
+  }).catch(() => resumeInto(last))   // a docker failure: let the agent decide
+    .finally(() => { if (agentStatus.resuming === last) agentStatus.resuming = null; });
 }
 
 function resumeInto(last) {
-  bridgeRpc({ type: 'switch_session', sessionPath: last }, 30000)
+  agentStatus.resuming = last;
+  return bridgeRpc({ type: 'switch_session', sessionPath: last }, 30000)
     .then(() => {
       console.log(`resumed last session: ${last}`);
       lastResumed = last;
+      lastResumeFailed = null;
+      agentStatus.sessionFile = last;
       broadcast({ bridge: 'session_resumed', path: last });
       recordCurrentSession();
     })
@@ -461,10 +754,15 @@ function resumeInto(last) {
         startAgent();
         return;
       }
-      sessionFileExists(last)
-        .then((exists) => { if (!exists) broadcast({ bridge: 'session_resume_failed', path: last }); })
-        .catch(() => { /* container gone; nothing to report */ });
-    });
+      // The agent stayed in its fresh session, so the page has to be told: it
+      // left the user in a conversation that is not the one on screen. A switch
+      // can fail for a reason no check can see (an unreadable session, an
+      // extension's error), and the answer used to be silence.
+      const missingCwd = /working directory does not exist/i.test(e.message || '');
+      if (missingCwd) forgetLastSessionIf(last);
+      announceResumeFailure({ path: last, reason: missingCwd ? 'folder' : 'start' });
+    })
+    .finally(() => { if (agentStatus.resuming === last) agentStatus.resuming = null; });
 }
 
 server.on('upgrade', (req, socket, head) => {
@@ -512,7 +810,7 @@ wss.on('connection', (ws) => {
   if (agentIdleTimer) { clearTimeout(agentIdleTimer); agentIdleTimer = null; }
   // Keepalive bookkeeping: the bridge pings every 30s (see below) and a dead
   // client is terminated once it misses a round. Without this, half-open
-  // connections (sleep/wake, WebView2 network hiccups) linger in `clients`
+  // connections (sleep/wake, embedded-browser network hiccups) linger in `clients`
   // forever, so "last one out turns off the lights" never fires for a client
   // that is actually gone.
   ws.isAlive = true;
@@ -520,17 +818,25 @@ wss.on('connection', (ws) => {
   // A client socket error must not take the bridge down — an unhandled
   // 'error' event would crash the process and drop every other client.
   ws.on('error', () => { /* 'close' follows */ });
+  // Was there an agent already? If not, startAgent below is the one that starts
+  // it, and it broadcasts the resume news to every client as it goes - sending
+  // it again to this socket would show the same toast twice.
+  const hadAgent = !!agent;
   startAgent();
   // Tell the newcomer where it is, and let it pull the current state itself.
   wsSend(ws, {
     bridge: 'agent_started',
     command: PI_COMMAND,
+    mode: agentMode,
     workspace: WORKSPACE_DIR,
     sessionDir: SESSION_DIR,
   });
   // ... and which session the agent was put back into, in case this page missed
-  // the broadcast while it was still connecting.
+  // the broadcast while it was still connecting. If a resume had to be abandoned,
+  // that is the news instead - otherwise the page just looks like the last
+  // conversation vanished.
   if (lastResumed) wsSend(ws, { bridge: 'session_resumed', path: lastResumed });
+  else if (lastResumeFailed && hadAgent) wsSend(ws, { bridge: 'session_resume_failed', ...lastResumeFailed });
 
   ws.on('message', (data) => {
     let msg;
@@ -548,14 +854,56 @@ wss.on('connection', (ws) => {
       return;
     }
     if (msg.bridge) return; // bridge-level chatter is not forwarded
+    /* An answer to an extension dialog is not an RPC of ours, and its id is not
+     * ours to change. pi keeps the dialogs it asked for in a map keyed by the id
+     * it put on the request (`pendingExtensionRequests.get(response.id)` in its
+     * rpc mode) and silently drops an answer whose id it does not know. Every
+     * client request is rewritten to a unique wire id so two tabs cannot collide
+     * (issue #227), and rewriting this one turned `dlg1` into `wire-7`: the
+     * extension's await never resolved, so accepting a goal menu sent nothing
+     * (issues #274, #275) and the session that was waiting on it stopped
+     * answering anything until the server was restarted (issue #276).
+     *
+     * Passed through untouched, for the agent that asked for it. */
+    if (msg.type === 'extension_ui_response') {
+      if (agent && agent.stdin.writable) agent.stdin.write(JSON.stringify(msg) + '\n');
+      return;
+    }
     if (agent && agent.stdin.writable) {
       // Remember who asked (and what they asked), so the response goes back
-      // to them and not to everybody (ids are only unique per client), and
-      // session-changing commands keep the last-session record current.
+      // to them and not to everybody. The id is replaced on the wire: client
+      // ids are only unique per page, and two tabs both use `req-1`. The
+      // client's own id is restored on the way back (see the response arm).
       if (DEBUG_RPC) console.log(`[rpc] <- ${msg.type}${msg.sessionPath ? ' ' + msg.sessionPath : ''}`);
-      if (msg.id) pendingOwner.set(msg.id, { ws, type: msg.type, sessionPath: msg.sessionPath });
+      if (msg.id) {
+        const clientId = msg.id;
+        msg.id = `wire-${++wireReqId}`;
+        pendingOwner.set(msg.id, { ws, clientId, type: msg.type, sessionPath: msg.sessionPath, agent });
+      }
       agent.stdin.write(JSON.stringify(msg) + '\n');
     } else {
+      /* Answer the request itself, not just the console.
+       *
+       * A command that arrives while the agent is down used to get one
+       * broadcast 'agent_stderr' line, which the page writes to its console and
+       * shows nowhere. The request id was never answered, so the caller sat on
+       * its full timeout - two minutes for a prompt - with the message already
+       * drawn in the transcript and the composer already cleared. A reload in
+       * that window destroyed the row and the text together, which is the "I
+       * sent a message and it was discarded" report.
+       *
+       * A real response rejects the caller immediately, so sendPrompt's error
+       * path runs: the row comes off the screen and the text goes back into the
+       * box. The message was not sent, and now it visibly was not sent. */
+      if (msg.id) {
+        wsSend(ws, {
+          bridge: 'rpc',
+          payload: {
+            type: 'response', id: msg.id, command: msg.type, success: false,
+            error: 'The agent is not running - the message was not sent. Try again in a moment.',
+          },
+        });
+      }
       wsSend(ws, { bridge: 'agent_stderr', text: 'Agent process is not running.' });
     }
   });
@@ -673,17 +1021,25 @@ server.listen(PORT, HOST, () => {
 // "close the console window" on Windows, where the signal handlers may not get
 // a chance to run.
 let shuttingDown = false;
-function shutdown(code = 0) {
+async function shutdown(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log('\nStopping Pi Agent WebUI — killing agent processes…');
-  if (agent) killTree(agent);
-  stopWhisper();
-  try { server.close(); } catch { /* ignore */ }
-  process.exit(code);
+  /* Instances this bridge started live in their own process groups (issue
+   * #268). Stop them first, while the event loop can still wait for the
+   * health check that makes stop() safe against a reused pid. */
+  try {
+    try { if (stopStartedInstances) await stopStartedInstances(); } catch { /* keep shutting down */ }
+    if (agent) killTree(agent);
+    stopWhisper();
+    try { server.close(); } catch { /* ignore */ }
+  } finally {
+    process.exit(code);
+  }
 }
-process.on('SIGINT', () => shutdown(0));
-process.on('SIGTERM', () => shutdown(0));
+const stopOnSignal = () => { shutdown(0).catch(() => process.exit(0)); };
+process.on('SIGINT', stopOnSignal);
+process.on('SIGTERM', stopOnSignal);
 process.on('exit', () => {
   if (agent) {
     try {
@@ -694,5 +1050,5 @@ process.on('exit', () => {
   try { stopWhisper(); } catch { /* ignore */ }
 });
 
-  return { agentStatus };
+  return { agentStatus, setAgentMode, broadcast };
 };

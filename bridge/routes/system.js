@@ -89,7 +89,16 @@ module.exports = function systemRoutes(deps) {
     let fam = null;
     if (file) {
       try {
-        if (fs.statSync(file).size < 10 * 1024 * 1024) fam = ttfFamilyName(fs.readFileSync(file));
+        // The name table lives in the first few KB; reading a 10 MB font whole
+        // just to find it blocked the request (and the agent's event loop).
+        const st = fs.statSync(file);
+        if (st.size < 10 * 1024 * 1024) {
+          const len = Math.min(65536, st.size);
+          const buf = Buffer.alloc(len);
+          const fd = fs.openSync(file, 'r');
+          try { fs.readSync(fd, buf, 0, len, 0); } finally { fs.closeSync(fd); }
+          fam = ttfFamilyName(buf);
+        }
       } catch { /* unreadable */ }
     }
     addFamily(families, fam || fallback);

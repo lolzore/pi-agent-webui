@@ -23,13 +23,37 @@ function sameSessionPath(a, b, all) {
   return same.length === 1;
 }
 
+/* What the browser tab calls this conversation.
+ *
+ * The tab title used to be the agent name and nothing else, so switching
+ * sessions - or starting a new one - left "Pi agent" in the tab while the
+ * topbar said something else (issue #206). The topbar input is the source of
+ * truth (it carries pi's explicit name, the derived name from the first user
+ * message, or a name just typed by the reader); a brand-new session has no
+ * file yet, so it reads "New session" until the first message names it. */
+function sessionTitleForDocument() {
+  const explicit = (($('session-name') && $('session-name').value) || '').trim();
+  if (explicit) return explicit;
+  const file = (S.state && S.state.sessionFile) || '';
+  const base = String(file).split(/[\\/]/).pop().replace(/\.jsonl$/, '');
+  return base || 'New session';
+}
+
+function updateDocumentTitle() {
+  const agent = (typeof displayAgentName === 'function' && displayAgentName()) || 'Pi Agent';
+  const session = sessionTitleForDocument();
+  document.title = session ? `${session} — ${agent}` : agent;
+}
+
 /* A cheap signature of the session list. renderSessions() throws the sidebar
  * away and builds it again, so calling it when nothing has changed is pure
  * waste - and it is called every twenty seconds by the idle poll, so most of
  * those calls changed nothing at all. */
 function sessionsSignature(list) {
   let s = '';
-  for (const x of list) s += `${x.path}\u0001${x.name}\u0001${x.size}\u0001${x.mtime}\u0001${x.parent || ''}\u0002`;
+  for (const x of list) s += `${x.path}\u0001${x.name}\u0001${x.size}\u0001${x.mtime}\u0001${x.parent || ''}\u0001${x.mode || 'normal'}\u0002`;
+  const p = S.pendingSession;
+  if (p) s += `pending\u0001${p.path}\u0001${p.name}\u0001${p.mode || 'normal'}\u0003`;
   return s;
 }
 
@@ -38,6 +62,15 @@ async function refreshSessions(force) {
     const res = await fetch(api('/api/sessions'));
     const d = await res.json();
     const list = d.sessions || [];
+    // A reload while the bridge is in plain mode has to restore the banner and
+    // the row mode even before any agent event arrives.
+    if (d.mode) {
+      const next = d.mode === 'plain' ? 'plain' : 'normal';
+      if (S.agentMode !== next) {
+        S.agentMode = next;
+        if (typeof updatePlainBanner === 'function') updatePlainBanner();
+      }
+    }
     /* A scan the bridge could not complete says so (issue #30).
      *
      * The scan returning nothing used to be reported as an empty list, so a
@@ -51,6 +84,7 @@ async function refreshSessions(force) {
     } else if (!d.scanError) {
       S.scanErrorShown = null;
     }
+    S.pendingSession = d.pending || null;
     const sig = sessionsSignature(list);
     if (!force && sig === S.sessionsSig) { applyAgentStatus(d); return; }
     S.sessionsSig = sig;
@@ -70,19 +104,24 @@ function applyAgentStatus(d) {
   const mine = !c || !c.session || !S.state.sessionFile || sameSessionPath(c.session, S.state.sessionFile, []);
   if (c && mine && !S.compacting) {
     S.compacting = true;
+    S.compactionSession = c.session || (S.state && S.state.sessionFile) || null;
     if (!S.compactionLive) S.compactionLive = renderCompactionLive(c.since);
     else if (S.compactionLive.setSince) S.compactionLive.setSince(c.since);
     document.body.classList.add('compacting');
   } else if (!c && S.compacting) {
-    // It finished while the page was away (or in another tab).
+    // It finished while the page was away (or in another tab). Keep the
+    // captured session: a late compaction_end still needs it to file its mark.
     S.compacting = false;
     S.compactionHappened = true;
     removeCompactionLive();
     document.body.classList.remove('compacting');
   }
   // The task clock: the agent is idle, so the task that was running when this page
-  // was last here is done - it stopped at the agent's last message.
-  if (S.agentBusy === false && S.runStartTs && !S.compacting) {
+  // was last here is done - it stopped at the agent's last message. Do not trust
+  // a poll taken between agent_end and agent_settled: S.isStreaming stays true
+  // until the turn has settled, and finishing the clock there froze it mid-task
+  // (issue #270).
+  if (S.agentBusy === false && S.runStartTs && !S.compacting && !S.isStreaming) {
     const endTs = lastAssistantTs();
     if (endTs > S.runStartTs) finishRunClock(endTs);
     // No message after the clock started (the page was reloaded into a session
@@ -190,7 +229,10 @@ function renderSessions(sessions) {
   // one the agent is actually on, otherwise "new session" looks like it did
   // nothing until a reload.
   const cur = S.state.sessionFile;
-  if (cur && !sessions.some((s) => s.path === cur || s.fileName === cur.split(/[\\/]/).pop())) {
+  const pending = S.pendingSession;
+  if (pending && pending.path && !sessions.some((s) => s.path === pending.path)) {
+    sessions = [{ ...pending, pending: true }, ...sessions];
+  } else if (cur && !sessions.some((s) => s.path === cur || s.fileName === cur.split(/[\\/]/).pop())) {
     sessions = [{
       path: cur,
       fileName: cur.split(/[\\/]/).pop(),
@@ -198,6 +240,7 @@ function renderSessions(sessions) {
       mtime: Date.now(),
       size: 0,
       pending: true,
+      mode: S.agentMode === 'plain' ? 'plain' : 'normal',
     }, ...sessions];
   }
   list.innerHTML = '';
@@ -215,6 +258,7 @@ function renderSessions(sessions) {
       nameInput.title = `${match.name} — click to rename`;
     }
   }
+  updateDocumentTitle();
   // Order the list so a session is followed by the forks it spawned, instead of
   // everything being sorted by time: a branch belongs under the session it came
   // from.
@@ -300,6 +344,10 @@ function renderSessions(sessions) {
       const kids = kidsOf(s.path);
       const isCurrent = current && sameSessionPath(s.path, current, sessions);
       const isViewed = S.viewSession ? sameSessionPath(s.path, S.viewSession, sessions) : false;
+      if (s.mode === 'plain') {
+        item.classList.add('plain');
+        item.title = 'plain chat — no tools, extensions, skills or AGENTS.md';
+      }
       // The blue highlight follows what you are looking at; the green pulsing dot
       // marks the session still running in the background. Highlighting both made
       // it look like two sessions were selected at once.
@@ -361,18 +409,27 @@ function renderSessions(sessions) {
         item.classList.remove('drop-line');
         if (!dragSession || dragSession === s.path) return;
         const fid = folderOf.get(s.path) || null;
+        // onto a session inside a folder: file it there, before that row. Onto a
+        // top-level session: taking a filed session out - dropping on the empty
+        // strip below the list was the only way out, and with a folder or ten it
+        // is a small target (issue #217 follow-up).
         if (fid) assignToFolder(dragSession, fid, s.path);
+        else if (folderOf.has(dragSession)) assignToFolder(dragSession, null, s.path);
       });
       list.appendChild(item);
   };
 
-  for (const f of folders) {
+  const drawFolder = (f) => {
     const kids = shown.filter((x) => folderOf.get(x.path) === f.id);
-    if (filter && !kids.length) continue;          // while searching, empty folders are noise
+    if (filter && !kids.length) return;            // while searching, empty folders are noise
     list.appendChild(folderHeader(f, kids.length));
     if (!collapsedFolders[f.id]) for (const k of kids) addRow(k);
-  }
+  };
+  // Folders created with "place at the bottom" are drawn after the unfiled
+  // sessions; every existing folder keeps its place at the top.
+  for (const f of folders) if (!f.bottom) drawFolder(f);
   for (const x of shown) if (!inFolder.has(x.path)) addRow(x);
+  for (const f of folders) if (f.bottom) drawFolder(f);
   // Put the reader back on the row they were looking at, not on the pixel they
   // happened to be at. See sessionListAnchor above.
   restoreSessionListAnchor(list, anchor, keepScroll);
@@ -420,13 +477,40 @@ function migrateFolders() {
   saveSettings();
 }
 
+/* Repaint the sidebar from the sessions already in memory. Folder membership,
+ * collapsed state and order are all in SET/S, so there is nothing to fetch; the
+ * deferral lets a drag/drop handler that is still running finish with the DOM it
+ * was moving. */
+function rerenderSessions() {
+  setTimeout(() => {
+    try { renderSessions(S.sessionsList || []); } catch { /* keep whatever is on screen */ }
+  }, 0);
+}
+
 function saveFolders() {
   setFolders(sessionFolders().filter((f) => f && f.id));
   syncSessionHighlight();
+  /* Issue #217: the list has to show what just changed. Creating a folder, filing
+   * a session into one, renaming, emptying or deleting one all end up here, and
+   * none of them re-rendered: the new folder only appeared on the next 20s poll
+   * (or a manual refresh), and a session dropped into a folder stayed in the
+   * unfiled list until then. Render from the payload we already have - folder
+   * membership is the only thing that moved, so there is nothing to fetch - and
+   * defer a tick so a drag/drop handler that is still running is done with the
+   * DOM it was moving. Collapsed folders stay collapsed: that state lives in
+   * S.collapsedFolders, not in the DOM. */
+  rerenderSessions();
 }
 
-function newFolder(name, beforeId) {
-  const f = { id: `f${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, name: name || 'new folder', paths: [] };
+function newFolder(name, beforeId, bottom) {
+  const f = {
+    id: `f${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+    name: name || 'new folder',
+    paths: [],
+    // Most folders sit above the unfiled sessions; this one is asked to sit
+    // below them (issue #222).
+    bottom: !!bottom,
+  };
   const list = ensureFolders();
   const at = beforeId ? list.findIndex((x) => x.id === beforeId) : -1;
   if (at >= 0) list.splice(at, 0, f); else list.push(f);
@@ -437,20 +521,25 @@ function newFolder(name, beforeId) {
 async function addFolderDialog() {
   const out = await askDialog({
     title: 'New folder',
-    body: 'Sessions you drag into it stay in this browser setup, not in the agent.',
-    fields: [{ name: 'name', label: 'name', value: 'new folder' }],
+    body: 'Sessions you drag into it are grouped here; the agent is not changed.',
+    fields: [
+      { name: 'name', label: 'name', value: 'new folder' },
+      { name: 'bottom', label: 'place', type: 'checkbox', text: 'at the bottom of the session list', value: false },
+    ],
     okLabel: 'create',
     require: ['name'],
   });
   if (!out) return;
-  newFolder(out.name);
+  newFolder(out.name, null, out.bottom);
 }
 
 function toggleFolder(id) {
   const c = S.collapsedFolders || (S.collapsedFolders = {});
   c[id] = !c[id];
   try { localStorage.setItem('piwebui-folders-collapsed', JSON.stringify(c)); } catch { /* private mode */ }
-  syncSessionHighlight();
+  // Issue #217 follow-up: the caret and the rows ARE the state, so a fold that
+  // only writes the map looked like it did nothing until a reload.
+  rerenderSessions();
 }
 
 /* One session (or none) moving into a folder, or a folder being reordered. */
@@ -464,12 +553,11 @@ function assignToFolder(path, folderId, beforePath) {
     if (!target.paths) target.paths = [];
     if (at >= 0) target.paths.splice(at, 0, path); else target.paths.push(path);
   }
+  // The folder stays exactly as it was - closed stays closed - while the row
+  // leaves the unfiled list and the folder's count goes up: saveFolders()
+  // re-renders, and collapsed state lives in S.collapsedFolders rather than in
+  // the DOM, so nothing opens under the pointer.
   saveFolders();
-  // The folder stays exactly as it was - closed stays closed. Opening it here
-  // meant a drag that was meant to file one session away rearranged the whole
-  // list under the pointer, and the session you had just filed vanished into a
-  // folder you were not looking at. The count badge moves instead, which is
-  // the confirmation that it landed.
   toast(`Moved to “${(folders.find((f) => f.id === folderId) || {}).name || 'folder'}”`);
 }
 
@@ -483,7 +571,11 @@ function reorderFolder(id, ontoId) {
   const from = folders.findIndex((f) => f.id === id);
   const to = folders.findIndex((f) => f.id === ontoId);
   if (from < 0 || to < 0) return;
+  const targetBottom = !!folders[to].bottom;
   const [moved] = folders.splice(from, 1);
+  // Dropping a folder onto one in the other group joins that group, so the
+  // row really lands where the drop says it will.
+  moved.bottom = targetBottom;
   folders.splice(to, 0, moved);
   saveFolders();
 }
@@ -497,7 +589,16 @@ function openFolderMenu(f, row) {
       f.name = out.name;
       saveFolders();
     } },
-    { label: 'new folder below', onPick: () => newFolder('new folder', null) },
+    { label: f.bottom ? 'move to the top of the list' : 'move to the bottom of the list',
+      hint: f.bottom ? 'above the unfiled sessions' : 'below the unfiled sessions',
+      onPick: () => { f.bottom = !f.bottom; saveFolders(); } },
+    { label: 'new folder below', onPick: () => {
+      // "below" means directly under this folder, not at the end of the list.
+      const list = sessionFolders();
+      const at = list.findIndex((x) => x.id === f.id);
+      const next = at >= 0 ? list[at + 1] : null;
+      newFolder('new folder', next ? next.id : null, f.bottom);
+    } },
     { label: count ? `empty it (${count} session${count > 1 ? 's' : ''})` : 'it is already empty', danger: false, onPick: () => {
       if (!count) return;
       f.paths = [];
@@ -521,7 +622,7 @@ function folderHeader(f, count) {
   row.appendChild(el('span', 'folder-caret', open ? '▾' : '▸'));
   row.appendChild(el('span', 'folder-name', f.name || 'folder'));
   row.appendChild(el('span', 'folder-count', String(count)));
-  row.title = `${f.name} — ${count} session${count === 1 ? '' : 's'}
+  row.title = `${f.name} — ${count} session${count === 1 ? '' : 's'}${f.bottom ? ' · bottom of list' : ''}
 click to fold, drag a session here, right-click to rename`;
   // Dragging one folder onto another reorders them.
   row.draggable = true;
@@ -624,25 +725,123 @@ function requestAgentSwitch(target) {
   return switchSend;
 }
 
+/* Which mode does this session belong to? The current agent session is the
+ * authority for its own mode; other rows carry it from /api/sessions (the bridge
+ * keeps a plain-chat registry beside the session files). */
+function sessionModeForPath(sessionPath) {
+  if (sameSessionPath(sessionPath, S.state.sessionFile, S.sessionsList || [])) return S.agentMode;
+  const row = (S.sessionsList || []).find((s) => sameSessionPath(s.path, sessionPath, S.sessionsList || []));
+  return row && row.mode === 'plain' ? 'plain' : 'normal';
+}
+
+/* A session in the other mode needs a new pi process: tools, extensions and
+ * AGENTS.md are fixed at startup. Start it in the target session rather than in
+ * a fresh one, so switching back to a plain chat resumes that conversation.
+ *
+ * This is only called when the agent is idle. During a turn or compaction the
+ * caller still opens the target read-only, exactly as it does for a session in
+ * the same mode: switching the agent away would cancel the work. */
+async function restartAgentForSession(sessionPath, mode) {
+  const gen = ++switchGen;
+  S.plainNeedsInit = false;
+  S.pendingModePath = sessionPath;
+  const ready = waitForAgentReady(60000);
+  try {
+    const r = await fetch(api('/api/agent-mode'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode, sessionPath }),
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || `failed (${r.status})`);
+    await ready;
+    if (switchGen !== gen) return;
+    S.agentMode = mode;
+    S.pendingModePath = null;
+    S.viewSubagent = null;
+    S.viewSession = null;
+    S.state.sessionFile = sessionPath;
+    $('session-name').value = '';
+    updateDocumentTitle();
+    syncSessionHighlight();
+    resetContextForSession();
+    await initSession(false);
+    refreshSessions(true).catch(() => {});
+    toast(mode === 'plain' ? 'Plain chat opened' : 'Session opened in the normal agent');
+  } catch (e) {
+    if (switchGen === gen) {
+      S.pendingModePath = null;
+      S.plainNeedsInit = false;
+    }
+    throw e;
+  }
+}
+
 async function switchToSession(sessionPath) {
   const agentSession = S.state.sessionFile;
+  // A plain chat and a normal chat are different pi processes. While the agent
+  // is idle, moving between them has to restart pi in the target session's mode;
+  // while it is running, the read-only branch below still lets you look at it.
+  const targetMode = sessionModeForPath(sessionPath);
+  if (targetMode !== S.agentMode) {
+    /* The page can be a tab behind another one: it may believe the agent is in
+     * plain mode (or idle) while the bridge is actually running a normal turn.
+     * Ask the bridge before restarting anything. This also repairs a stale
+     * mode after a reload, where restarting would kill the conversation the
+     * user is trying to open. */
+    let state = null;
+    try {
+      const r = await fetch(api('/api/health'), { cache: 'no-store' });
+      if (r.ok) state = await r.json();
+    } catch { /* older bridge or offline: use what the page knows */ }
+    if (state && state.mode) {
+      const actual = state.mode === 'plain' ? 'plain' : 'normal';
+      if (actual !== S.agentMode) {
+        S.agentMode = actual;
+        if (typeof updatePlainBanner === 'function') updatePlainBanner();
+      }
+    }
+    if (state && state.busy && !S.isStreaming) {
+      // Another tab is driving a turn. Never restart the agent away from it.
+      S.isStreaming = true;
+      if (typeof updateStreamUi === 'function') updateStreamUi();
+    }
+    if (targetMode !== S.agentMode && !S.isStreaming && !S.compacting) {
+      try { await restartAgentForSession(sessionPath, targetMode); }
+      catch (e) { toast(`Could not open that session: ${e.message}`, 'error'); }
+      return;
+    }
+  }
   if (sessionPath === agentSession) {
     if (!S.viewSession) return; // already here
     // Coming back to the agent's own session: re-render it and re-attach the
     // live view (if the agent is still running).
     S.viewSubagent = null;
+    // A compaction result lives inline at the point it happened, which can be
+    // far above the bottom after a switch. Ask the re-render to pin the newest
+    // one for this return so the message the user was watching does not look
+    // gone.
+    // Pin only a result that arrived while this session was off screen. Pinning
+    // the newest historical mark on every return made an old "conversation
+    // compacted" block reappear at the bottom, looking like a stale event until
+    // a reload cleared the page's memory.
+    S.pinCompactionOnReturn = !!S.compactionAway;
+    S.compactionAway = false;
     S.viewSession = null;
+    resetContextForSession();
     await refreshMessages();
+    refreshStats().catch(() => {});
     updateViewBanner();
     updateSubagentsBtn();
     syncSessionHighlight();
     return;
   }
-  if (S.isStreaming) {
-    // The agent is running in its own session. Keep it running in the
-    // background: park the live DOM (deltas keep landing in it) and view the
-    // target session read-only from its file. The green dot in the session
-    // list shows which session is still running.
+  if (S.isStreaming || S.compacting) {
+    // The agent is running (or compacting) in its own session. Keep it going in
+    // the background: park the live DOM (deltas keep landing in it) and view the
+    // target session read-only from its file. The green dot in the session list
+    // shows which session is still running. A manual compaction is also a job in
+    // the agent's session; switching the agent away from it cancels the job, so
+    // click-away browsing must not do that.
     if (S.live) {
       const frag = document.createDocumentFragment();
       frag.appendChild(S.live.root); // detaches it from the visible chat
@@ -650,6 +849,9 @@ async function switchToSession(sessionPath) {
     }
     S.viewSubagent = null;
     S.viewSession = sessionPath;
+    // The ring belongs to the session on screen, not the one the agent kept
+    // running; renderSessionFromDisk() puts this session's own count back.
+    resetContextForSession();
     /* The same supersede rule as the idle path below: this click owns the view,
      * and the read it is about to start must bail out if another click takes
      * over. Without it two quick switches each fetched, each cleared the chat and
@@ -699,7 +901,12 @@ async function switchToSession(sessionPath) {
     S.state.sessionFile = sessionPath;
     S.viewSubagent = null;
     S.viewSession = null;
+    S.compactionAway = false;
+    // Same context, different session: the old high-water marks would clamp
+    // the new session's first number while the switch still looks like a turn.
+    resetContextForSession();
     $('session-name').value = '';
+    updateDocumentTitle();
     const drawn = refreshMessages(prefetch);
     /* Answer the click straight away.
      *
@@ -743,6 +950,7 @@ async function switchToSession(sessionPath) {
       if (superseded()) return;
       S.state.sessionFile = previous;   // the switch was refused; undo the guess
       await drawn.catch(() => {});
+      refreshStats().catch(() => {});
       throw err;
     }
     // Do not apply state from a switch that has been overtaken - that is the
@@ -757,10 +965,13 @@ async function switchToSession(sessionPath) {
     const missing = /working directory does not exist:\s*(.+?)\s*$/im.exec(e.message || '');
     if (missing && missing[1]) {
       const dir = missing[1].trim();
-      const ok = confirm(
-        `This session was recorded in\n\n${dir}\n\n` +
-        'and that folder does not exist any more - it was renamed or moved.\n\n' +
-        'Create the folder again so the session can be opened?');
+      const ok = await askDialog({
+        title: 'The session’s folder is missing',
+        body: `This session was recorded in\n\n${dir}\n\n` +
+          'and that folder does not exist any more - it was renamed or moved.\n\n' +
+          'Create the folder again so the session can be opened?',
+        okLabel: 'create the folder',
+      });
       if (!ok) {
         toast('Session not opened - its recorded folder is missing', 'warning');
         return;
@@ -769,7 +980,7 @@ async function switchToSession(sessionPath) {
         const r = await fetch(api('/api/ensure-dir'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: dir }),
+          body: JSON.stringify({ path: dir, session: sessionPath }),
         });
         const d = await r.json();
         if (!r.ok) throw new Error(d.error || 'could not create it');
@@ -778,6 +989,7 @@ async function switchToSession(sessionPath) {
         S.viewSubagent = null;
         S.viewSession = null;
         $('session-name').value = '';
+        updateDocumentTitle();
         await initSession(false);
         toast('Session opened - its old folder was recreated');
       } catch (e2) {
@@ -798,17 +1010,20 @@ async function renderSessionFromDisk(sessionPath, gen) {
   try {
     const d = await fetchSession(sessionPath);
     if (superseded()) return;
+    // The read-only session's own context, not the agent's (see
+    // contextForSession). Drawn before the DOM clears, so the counter and the
+    // transcript change together.
+    showViewedContext(d.messages, d.compactions);
     const msgs = d.messages;
     const distFromBottom = chatScroller().scrollHeight - chatScroller().scrollTop - chatScroller().clientHeight;
+    unobserveMedia(chat);
     chat.innerHTML = '';
     transcriptTarget = chat;
-    for (const m of msgs) {
-      if (m.role === 'user') renderUserMessage(m);
-      else if (m.role === 'assistant') renderAssistantMessage(m);
-      else if (m.role === 'toolResult') renderToolResult(m);
-      else if (m.role === 'bashExecution') renderBashExecution(m);
-      else if (m.role === 'compactionSummary') renderCompactionSummary(m);
-    }
+    // A read-only view is not the agent's own session, so a call the file has no
+    // result for is an interrupted one - never "running" (the agent is not
+    // executing it here) and never "done" (it never finished).
+    const openTools = openToolCalls(msgs);
+    for (const m of msgs) renderMessageRow(m, { openTools, openLive: false });
     transcriptTarget = null;
     // Put the file's compaction markers back where they happened.
     if (d.compactions.length) {
@@ -832,25 +1047,61 @@ async function renderSessionFromDisk(sessionPath, gen) {
   }
 }
 
-$('btn-new-session').onclick = async () => {
+async function startNewSession() {
+  if (S.compacting) { toast('Compaction in progress — wait for it to finish before starting a new session', 'warning'); return; }
+  if (S.agentMode === 'plain') { toast('Leave plain chat first — use the button in the plain-chat banner', 'warning'); return; }
   try {
     await rpc({ type: 'new_session' });
     await applyDefaultModel();
+    resetContextForSession();
     await initSession(false);
+    updateDocumentTitle();
     // The file for a fresh session does not exist yet, so the list has nothing
     // to show. Re-check shortly (and after the first message lands) as well.
     refreshSessions(true).catch(() => {});
     setTimeout(() => refreshSessions(true).catch(() => {}), 700);
     toast('New session started');
   } catch (e) { toast(e.message, 'error'); }
-};
+}
 
+async function startPlainChat() {
+  if (S.compacting || S.isStreaming) {
+    toast('Wait for the current turn/compaction to finish before opening a plain chat', 'warning');
+    return;
+  }
+  try {
+    const r = await fetch(api('/api/agent-mode'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'plain' }),
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || `failed (${r.status})`);
+    toast('Starting a plain chat — no tools, extensions, skills or AGENTS.md');
+  } catch (e) {
+    toast(`Could not start a plain chat: ${e.message}`, 'error');
+  }
+}
+
+$('btn-new-session').onclick = () => startNewSession();
+/* Only the New session button has this menu: a plain chat is another way to
+ * start a conversation, not a session-row action. */
+$('btn-new-session').addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  openMenu($('btn-new-session'), [
+    { label: 'new session', hint: 'the normal agent — tools, extensions and AGENTS.md', onPick: () => startNewSession() },
+    { label: 'new plain chat', hint: 'no tools, extensions, skills or AGENTS.md', onPick: () => startPlainChat() },
+  ], { title: 'new session', width: 360 });
+});
+
+$('session-name').addEventListener('input', () => updateDocumentTitle());
 $('session-name').addEventListener('change', async (e) => {
   const name = e.target.value.trim();
   if (!name) return;
   try {
     await rpc({ type: 'set_session_name', name });
     await refreshSessions(true);
+    updateDocumentTitle();
     toast('Session renamed');
   } catch (err) { toast(err.message, 'error'); }
 });

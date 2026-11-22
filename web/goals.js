@@ -15,19 +15,37 @@
 let goalState = null;
 let goalTimer = null;
 let goalSeq = 0;   // a slow older fetch must not overwrite a newer render
+let goalMissRetries = 0;
+let goalRetryTimer = null;
 
 function startGoalPoll() {
   if (goalTimer) return;
-  // The files change while the agent works. The poll is one small read on the
-  // bridge, and it stops as soon as no goal is present.
-  goalTimer = setInterval(() => { refreshGoals().catch(() => {}); }, 10000);
+  // The files change while the agent works. This used to stop as soon as the
+  // page saw no goal, which made a transient miss permanent: a reload can ask
+  // before the bridge can see the goal files (or while goal-x is rewriting
+  // them), and then nothing ever asked again until a new goal/widget event.
+  // Keep the small read going, but only while the page is visible.
+  goalTimer = setInterval(() => {
+    if (document.visibilityState !== 'visible') return;
+    refreshGoals().catch(() => {});
+  }, 10000);
 }
 
-function stopGoalPoll() {
-  if (goalTimer) { clearInterval(goalTimer); goalTimer = null; }
+/* A reload can beat the bridge or goal-x to the files. Ask again a few times
+ * quickly instead of waiting for the next ten-second poll, then fall back to
+ * the poll - and keep polling even while no goal is present, because the goal
+ * may appear (or reappear) later without an extension event. */
+function retryGoalsSoon() {
+  if (goalRetryTimer || goalMissRetries >= 4) return;
+  goalMissRetries++;
+  goalRetryTimer = setTimeout(() => {
+    goalRetryTimer = null;
+    if (document.visibilityState !== 'hidden') refreshGoals().catch(() => {});
+  }, 400 * goalMissRetries);
 }
 
 async function refreshGoals() {
+  startGoalPoll();
   const seq = ++goalSeq;
   let next = null;
   try {
@@ -38,6 +56,8 @@ async function refreshGoals() {
   if (seq !== goalSeq) return;
   goalState = next;
   renderGoalBar();
+  if (!next || !next.present) retryGoalsSoon();
+  else goalMissRetries = 0;
 }
 
 /* ── goal-x controls (issue #81) ───────────────────────────────────────
@@ -57,9 +77,18 @@ async function goalTaskAction(goal, task, status) {
   let evidence = '';
   if (status === 'complete' && task.contract) {
     // A native evidence dialog, which is what the TUI tool's confirmation was
-    // for: the extension requires it for a contracted task.
-    evidence = prompt(`Evidence for "${task.title || task.id}"\n\nIts verification contract:\n${task.contract}`, '') || '';
-    if (!evidence.trim()) { toast('This task has a verification contract; evidence is required', 'warning'); return; }
+    // for: the extension requires it for a contracted task. askDialog(), not
+    // window.prompt() - Electron does not implement prompt, so the desktop app
+    // could never complete a contracted task.
+    const out = await askDialog({
+      title: `Evidence for “${task.title || task.id}”`,
+      body: `Its verification contract:\n${task.contract}`,
+      fields: [{ name: 'evidence', label: 'evidence', placeholder: 'how it was verified' }],
+      require: ['evidence'],
+      okLabel: 'complete',
+    });
+    if (!out) { toast('This task has a verification contract; evidence is required', 'warning'); return; }
+    evidence = out.evidence;
   }
   try {
     const r = await fetch(api('/api/goals/task'), {
@@ -78,16 +107,39 @@ async function goalTaskAction(goal, task, status) {
   }
 }
 
+/* Which session owns this goal? The bridge normally resolves the full session
+ * path; a comparison on the id also works in container mode, where the bridge
+ * cannot list the container's session directory but the page has the path. */
+function goalBelongsToSession(goal, current) {
+  if (!goal || !current) return false;
+  if (goal.sessionPath) return sameSessionPath(goal.sessionPath, current, S.sessionsList || []);
+  return !!(goal.sessionId && String(current).includes(goal.sessionId));
+}
+
 function renderGoalBar() {
   const bar = $('goal-bar');
   if (!bar) return;
-  const list = goalState && goalState.present ? (goalState.goals || []) : [];
+  if (S.agentMode === 'plain') {
+    bar.classList.add('hidden');
+    bar.classList.remove('open', 'blocked', 'paused', 'complete');
+    bar.innerHTML = '';
+    return;
+  }
+  const all = goalState && goalState.present ? (goalState.goals || []) : [];
+  /* goal-x keeps a pool per project, not per session. The native surface is the
+   * session's goal, so a goal recorded in another session must not follow the
+   * reader around. A goal without a resolved session path is an old/foreign
+   * record; keep it visible rather than hiding something we cannot classify. */
+  const current = (S.state && S.state.sessionFile) || null;
+  const list = all.filter((g) => goalBelongsToSession(g, current));
   const goal = list.find((g) => g.focused) || list[0] || null;
   if (!goal) {
     bar.classList.add('hidden');
     bar.classList.remove('open', 'blocked', 'paused', 'complete');
     bar.innerHTML = '';
-    stopGoalPoll();
+    // Do not stop the poll: a goal can appear after this snapshot (the initial
+    // read raced the bridge, or goal-x is about to write its files).
+    retryGoalsSoon();
     return;
   }
   startGoalPoll();

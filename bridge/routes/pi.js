@@ -20,14 +20,18 @@ module.exports = function piRoutes(deps) {
     PI_MODELS_FILE,
     PI_SETTINGS_FILE,
     PROVIDER_ID_RE,
+    SESSION_DIR,
     WORKSPACE_DIR,
+    currentSessionPath,
     fs,
     http,
     jsonOut,
     maskKey,
+    normalizeProviderBaseUrl,
     os,
     path,
     readJsonSafe,
+    readModelsFile,
     serveStatic,
     writeJsonAtomic,
     writeModelsFile,
@@ -149,6 +153,48 @@ function writePiSettings(settings) {
   writeJsonAtomic(PI_SETTINGS_FILE, settings);
 }
 
+/* pi's compaction settings, with the same defaults its documentation lists.
+ * `reserveTokens` is the free-context threshold; `keepRecentTokens` is the
+ * amount a compaction leaves alone. Both are non-negative integers. */
+/* pi-searxng reads ~/.pi/searxng.json (not the agent dir) and defaults to
+ * localhost:8080. This is the one config file the extension exposes, so the
+ * WebUI can point it at the user's instance and prove the endpoint answers. */
+const SEARXNG_CONFIG = path.join(os.homedir(), '.pi', 'searxng.json');
+function readSearxngConfig() {
+  try {
+    const j = JSON.parse(fs.readFileSync(SEARXNG_CONFIG, 'utf8'));
+    return j && typeof j === 'object' ? j : {};
+  } catch { return {}; }
+}
+function searxngPayload() {
+  const c = readSearxngConfig();
+  return {
+    url: typeof c.searxngUrl === 'string' ? c.searxngUrl : 'http://localhost:8080',
+    timeoutMs: Number.isSafeInteger(c.timeoutMs) && c.timeoutMs > 0 ? c.timeoutMs : 30000,
+    maxResults: Number.isSafeInteger(c.maxResults) && c.maxResults > 0 ? c.maxResults : 10,
+    file: SEARXNG_CONFIG,
+  };
+}
+
+function piCompactionConfig(settings) {
+  const c = (settings && typeof settings.compaction === 'object' && settings.compaction) || {};
+  const int = (v, dflt) => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : dflt);
+  return {
+    enabled: c.enabled !== false,
+    reserveTokens: int(c.reserveTokens, 16384),
+    keepRecentTokens: int(c.keepRecentTokens, 20000),
+  };
+}
+
+/* Issue #214: pi's `images.blockImages` is the setting that actually stops
+ * images reaching the model. The WebUI had a toggle of its own that only hid
+ * pictures in the transcript and left the agent reading and sending them, which
+ * is not what the setting was understood to do. This is the one pi reads. */
+function piImagesConfig(settings) {
+  const i = (settings && typeof settings.images === 'object' && settings.images) || {};
+  return { blockImages: i.blockImages === true };
+}
+
 /* pi's override resolution, reduced to what a single row needs: is this resource
  * enabled? `rel` is the path relative to the agent dir, posix-separated. */
 function resourceEnabled(patterns, rel, name) {
@@ -267,17 +313,57 @@ function agentContextFiles() {
   return out;
 }
 
+  /* goal-x keeps its pool next to the session's working directory. The bridge's
+   * WORKSPACE_DIR is the project it was launched in, but a resumed session can
+   * belong to a different project - then the extension shows its goals while
+   * this endpoint looked in the wrong directory and the native bar stayed empty. */
+  function sessionCwdFromFile(file) {
+    if (!file || String(file).startsWith('docker:')) return null;
+    try {
+      const line = fs.readFileSync(file, 'utf8').split('\n', 1)[0];
+      const header = JSON.parse(line);
+      return header && header.type === 'session' && typeof header.cwd === 'string' ? header.cwd : null;
+    } catch { return null; }
+  }
+
+  function currentGoalsDir() {
+    // An explicit PI_GOALS_DIR is a test/operator override; honour it instead of
+    // deriving from the resumed session's cwd.
+    if (process.env.PI_GOALS_DIR) return GOALS_DIR;
+    const file = typeof currentSessionPath === 'function' ? currentSessionPath() : null;
+    const cwd = sessionCwdFromFile(file);
+    if (cwd) {
+      const dir = path.join(cwd, '.pi', 'goals');
+      try { if (fs.statSync(dir).isDirectory()) return dir; } catch { /* not this project */ }
+    }
+    return GOALS_DIR;
+  }
+
+  /* The scheduler owner is the pi session id; session files embed it after the
+   * timestamp. A goal can therefore point back at the conversation it came from. */
+  function sessionPathForGoal(sessionId) {
+    if (!sessionId || String(SESSION_DIR).startsWith('docker:')) return null;
+    try {
+      const names = fs.readdirSync(SESSION_DIR);
+      const hit = names.find((n) => n.endsWith(`_${sessionId}.jsonl`) || n === `${sessionId}.jsonl`);
+      return hit ? path.join(SESSION_DIR, hit) : null;
+    } catch { return null; }
+  }
+
   /* The goal pool: `active_goal_*` is the focused one, `goal_*` the rest. */
   function listGoals() {
-    const out = { ok: true, present: false, dir: GOALS_DIR, focused: null, goals: [] };
+    const dir = currentGoalsDir();
+    const out = { ok: true, present: false, dir, focused: null, goals: [] };
     let names = [];
-    try { names = fs.readdirSync(GOALS_DIR); } catch { /* goal-x is not installed here */ }
+    try { names = fs.readdirSync(dir); } catch { /* goal-x is not installed here */ }
     for (const [focused, re] of [[true, /^active_goal_.*\.md$/], [false, /^goal_.*\.md$/]]) {
       for (const n of names.filter((x) => re.test(x))) {
-        const file = path.join(GOALS_DIR, n);
+        const file = path.join(dir, n);
         const rec = readGoalRecord(file);
         if (!rec) continue;
-        out.goals.push(goalSummary(rec, focused, file));
+        const goal = goalSummary(rec, focused, file);
+        goal.sessionPath = sessionPathForGoal(goal.sessionId);
+        out.goals.push(goal);
         if (focused && !out.focused) out.focused = rec.id || n;
       }
     }
@@ -288,6 +374,7 @@ function agentContextFiles() {
 
   function match(req) {
     return req.url.startsWith('/api/goals')
+      || req.url.startsWith('/api/searxng-config')
       || req.url.startsWith('/api/pi-config')
       || req.url.startsWith('/api/pi-extensions')
       || req.url.startsWith('/api/pi-agents')
@@ -295,6 +382,59 @@ function agentContextFiles() {
   }
 
   function handle(req, res) {
+  if (req.url.startsWith('/api/searxng-config')) {
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => { body += c; if (body.length > 1 << 20) req.destroy(); });
+      req.on('end', async () => {
+        let j = null;
+        try { j = JSON.parse(body || '{}'); } catch { j = null; }
+        const raw = j && typeof j.searxngUrl === 'string' ? j.searxngUrl.trim() : '';
+        let url;
+        try { url = new URL(raw); } catch { url = null; }
+        if (!j || !url || !/^https?:$/.test(url.protocol)) {
+          jsonOut(res, 400, { ok: false, error: 'searxngUrl must be an http(s) URL' });
+          return;
+        }
+        url.hash = '';
+        url.search = '';
+        const cfg = {
+          searxngUrl: url.toString().replace(/\/$/, ''),
+          timeoutMs: Number.isSafeInteger(j.timeoutMs) && j.timeoutMs > 0 ? j.timeoutMs : 30000,
+          maxResults: Number.isSafeInteger(j.maxResults) && j.maxResults > 0 ? j.maxResults : 10,
+        };
+        try { writeJsonAtomic(SEARXNG_CONFIG, cfg); } catch (e) {
+          jsonOut(res, 500, { ok: false, error: e.message });
+          return;
+        }
+        let test = null;
+        if (j.test === true) {
+          try {
+            const r = await fetch(`${cfg.searxngUrl}/search?q=pi&format=json`, {
+              headers: { Accept: 'application/json' },
+              signal: AbortSignal.timeout(10000),
+            });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const d = await r.json();
+            test = { ok: true, results: Array.isArray(d.results) ? d.results.length : 0 };
+          } catch (e) {
+            test = { ok: false, error: e.message };
+          }
+        }
+        jsonOut(res, 200, { ok: true, ...searxngPayload(), test });
+      });
+      return;
+    }
+    const payload = searxngPayload();
+    if (req.method === 'GET' && req.url.split('?')[0] === '/api/searxng-config') {
+      // a self-test of the saved endpoint: the page asks only when the reader
+      // presses test, so a dead local SearXNG costs nothing on open
+      jsonOut(res, 200, { ok: true, ...payload });
+      return;
+    }
+    jsonOut(res, 405, { ok: false, error: 'use GET or POST' });
+    return;
+  }
 if (req.url.startsWith('/api/goals')) {
   /* Complete or reopen one task, with goal-x's own gates (issue #81). The page
    * sends /goal-refresh afterwards so the extension reloads what changed here. */
@@ -308,7 +448,8 @@ if (req.url.startsWith('/api/goals')) {
       const file = String(j.file == null ? '' : j.file);
       const name = path.basename(file);
       const dir = path.dirname(path.resolve(file));
-      if (!/^(active_)?goal_[^/\\]*\.md$/.test(name) || dir !== path.resolve(GOALS_DIR)) {
+      const goalsDir = currentGoalsDir();
+      if (!/^(active_)?goal_[^/\\]*\.md$/.test(name) || dir !== path.resolve(goalsDir)) {
         jsonOut(res, 400, { ok: false, error: 'not a goal file in this workspace' });
         return;
       }
@@ -326,11 +467,56 @@ if (req.url.startsWith('/api/goals')) {
  * auto-compaction is persisted by pi in settings.json, so the same file the
  * Extensions tab reads tells the checkbox what state it is in. */
 if (req.url.startsWith('/api/pi-config')) {
+  /* Issue #194: pi has no RPC for the threshold, so the bridge writes the same
+   * `compaction.reserveTokens` setting pi's own SettingsManager reads. The
+   * response is the full config so the page can read back exactly what landed. */
+  if (req.method === 'POST' && req.url.split('?')[0] === '/api/pi-config') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1 << 20) req.destroy(); });
+    req.on('end', () => {
+      let j = null;
+      try { j = JSON.parse(body || '{}'); } catch { j = null; }
+      const hasCompaction = j && typeof j.compaction === 'object' && j.compaction !== null;
+      const hasImages = j && typeof j.images === 'object' && j.images !== null;
+      if (!hasCompaction && !hasImages) {
+        jsonOut(res, 400, { ok: false, error: 'expected { compaction: { reserveTokens, keepRecentTokens } } and/or { images: { blockImages } }' });
+        return;
+      }
+      const settings = readPiSettings();
+      if (hasCompaction) {
+        if (!settings.compaction || typeof settings.compaction !== 'object') settings.compaction = {};
+        for (const key of ['reserveTokens', 'keepRecentTokens']) {
+          if (j.compaction[key] === undefined) continue;
+          const n = j.compaction[key];
+          if (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0) {
+            jsonOut(res, 400, { ok: false, error: `${key} must be a non-negative whole number` });
+            return;
+          }
+          settings.compaction[key] = n;
+        }
+      }
+      if (hasImages && j.images.blockImages !== undefined) {
+        if (typeof j.images.blockImages !== 'boolean') {
+          jsonOut(res, 400, { ok: false, error: 'images.blockImages must be true or false' });
+          return;
+        }
+        if (!settings.images || typeof settings.images !== 'object') settings.images = {};
+        settings.images.blockImages = j.images.blockImages;
+      }
+      try { writePiSettings(settings); } catch (e) {
+        jsonOut(res, 500, { ok: false, error: e.message });
+        return;
+      }
+      jsonOut(res, 200, { ok: true, file: PI_SETTINGS_FILE, compaction: piCompactionConfig(settings), images: piImagesConfig(settings) });
+    });
+    return;
+  }
   const settings = readPiSettings();
   jsonOut(res, 200, {
     ok: true,
     file: PI_SETTINGS_FILE,
-    compaction: { enabled: !(settings.compaction && settings.compaction.enabled === false) },
+    compaction: piCompactionConfig(settings),
+    images: piImagesConfig(settings),
   });
   return;
 }
@@ -498,7 +684,13 @@ if (req.url.startsWith('/api/pi-agents')) {
       if (j.content.length > 4 * 1024 * 1024) return jsonOut(res, 413, { error: 'too large' });
       try {
         if (j.content.trim() === '') { try { fs.rmSync(PI_AGENTS_FILE, { force: true }); } catch { /* gone */ } }
-        else fs.writeFileSync(PI_AGENTS_FILE, j.content, 'utf8');
+        else {
+          // Written beside and renamed: a half-written AGENTS.md is worse than
+          // the old one.
+          const tmp = `${PI_AGENTS_FILE}.${process.pid}.tmp`;
+          fs.writeFileSync(tmp, j.content, 'utf8');
+          fs.renameSync(tmp, PI_AGENTS_FILE);
+        }
       } catch (e) { return jsonOut(res, 500, { error: 'could not write it: ' + e.message }); }
       jsonOut(res, 200, { ok: true, path: PI_AGENTS_FILE, bytes: j.content.length });
     });
@@ -511,7 +703,7 @@ if (req.url.startsWith('/api/pi-agents')) {
 
   if (req.url.startsWith('/api/pi-providers')) {
     if (req.method === 'GET') {
-      const file = readJsonSafe(PI_MODELS_FILE) || {};
+      const file = readModelsFile();
       const providers = {};
       for (const [id, p] of Object.entries(file.providers || {})) {
         providers[id] = {
@@ -534,7 +726,7 @@ if (req.url.startsWith('/api/pi-agents')) {
         res.end(JSON.stringify({ error: 'invalid provider id' }));
         return;
       }
-      const file = readJsonSafe(PI_MODELS_FILE) || {};
+      const file = readModelsFile();
       if (!(file.providers && file.providers[id])) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: `provider "${id}" not found` }));
@@ -559,7 +751,10 @@ if (req.url.startsWith('/api/pi-agents')) {
         try {
           const b = JSON.parse(body || '{}');
           const id = String(b.id || '').trim();
-          const baseUrl = String(b.baseUrl || '').trim().replace(/\/+$/, '');
+          // Base URL, not the chat endpoint: people paste
+          // .../chat/completions from provider docs, and pi appends the
+          // endpoint itself, so saving that unchanged made the provider fail.
+          const baseUrl = normalizeProviderBaseUrl(String(b.baseUrl || '').trim());
           const api = String(b.api || '');
           const apiKey = b.apiKey != null ? String(b.apiKey).trim() : '';
           if (!PROVIDER_ID_RE.test(id)) throw new Error('provider id must be 1-64 chars: letters, digits, . _ -');
@@ -576,6 +771,7 @@ if (req.url.startsWith('/api/pi-agents')) {
               const src = typeof m === 'string' ? { id: mid } : { ...m };
               const clean = {};
               for (const f of MODEL_FIELDS) if (src[f] !== undefined) clean[f] = src[f];
+              if (typeof b.reasoning === 'boolean') clean.reasoning = b.reasoning;
               models.push(clean);
             }
           }
@@ -585,11 +781,22 @@ if (req.url.startsWith('/api/pi-agents')) {
           if (models.length) provider.models = models;
           if (b.compat && typeof b.compat === 'object') provider.compat = b.compat;
 
-          const file = readJsonSafe(PI_MODELS_FILE) || {};
+          const file = readModelsFile();
           if (!file.providers || typeof file.providers !== 'object') file.providers = {};
+          const previous = file.providers[id];
+          // Editing an existing provider with an empty Models box means "keep
+          // the models"; it is also how an older provider gets the thinking
+          // flag applied without retyping every id.
+          if (!models.length && previous && Array.isArray(previous.models) && previous.models.length) {
+            provider.models = previous.models.map((m) => {
+              const copy = typeof m === 'string' ? { id: m } : { ...m };
+              if (typeof b.reasoning === 'boolean') copy.reasoning = b.reasoning;
+              return copy;
+            });
+          }
           // blank key on an existing provider keeps its current key
-          if (!apiKey && file.providers[id] && file.providers[id].apiKey) {
-            provider.apiKey = file.providers[id].apiKey;
+          if (!apiKey && previous && previous.apiKey) {
+            provider.apiKey = previous.apiKey;
           }
           file.providers[id] = provider;
           writeModelsFile(file);

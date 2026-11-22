@@ -15,28 +15,15 @@ const SHORTS_FEEDS = {
 };
 
 /* ───────────────────────── Reels / Shorts ─────────────────────────
- * Three ways to watch, depending on the platform:
+ * The Electron app gives the page a second real browsing surface beside the
+ * chat. That surface is a top-level browser context, so X-Frame-Options does
+ * not apply and the real infinite feeds load. The page sends it a rectangle
+ * and a URL through window.piDesktop; the main process owns the view.
  *
- *  1. NATIVE (React Native app): the page runs inside a WebView, so we can
- *     hand off to the app's native shorts sheet via window.webview.postMessage.
- *     The app loads the real feed top-level (a WebView is a full browser
- *     context, so X-Frame-Options doesn't apply) — the true seamless split.
- *
- *  2. IN-APP PANEL (browser default): a split pane inside the app that plays
- *     single videos via the official embeds (YouTube /embed/<id>, Instagram
- *     /reel/<id>/embed/, TikTok /embed/v2/<id>). The infinite feed itself
- *     can't be iframed (IG/TikTok send X-Frame-Options: DENY), so for that:
- *
- *  3. SIDE WINDOW: a popup docked flush against the right edge of the app
- *     window (zero gap) that loads the full feed — plus a plain tab fallback.
+ * The browser fallback is an in-app panel that plays single videos through
+ * official embeds. The infinite feed itself refuses to be iframed, so there it
+ * opens in a side window or a tab instead.
  * ─────────────────────────────────────────────────────────────────── */
-/* Check at call time (not load time): react-native-webview injects the
- * bridge during page load, and a lazy check is immune to load-order races. */
-function nativeBridge() {
-  if (window.webview && typeof window.webview.postMessage === 'function') return window.webview;
-  if (window.ReactNativeWebView && typeof window.ReactNativeWebView.postMessage === 'function') return window.ReactNativeWebView;
-  return null;
-}
 
 let reelsWin = null;           // side-window (full feed) handle
 let reelsFeed = 'instagram';   // active feed in the in-app panel
@@ -85,21 +72,14 @@ function reelsNavigate(url, fromHistory) {
   const target = browserTarget(raw);
   const frame = $('reels-frame');
   if (!frame) return;
-  /* A native shell has a real browsing context, so the URL goes to it - an
-   * iframe cannot show the sites that refuse to be embedded (issue #135). */
-  const host = webView2Host();
+  /* The Electron shell has a real browsing context, so the URL goes to it -
+   * an iframe cannot show sites that refuse to be embedded (issue #135). */
+  const host = desktopHost();
   if (host) {
     closeNativeFeed();
     const r = panelRect();
     host.postMessage(`piagent|browser|open|${r.x}|${r.y}|${r.w}|${r.h}|${target}`);
     nativeBrowserOpen = true;
-    rememberBrowserUrl(target);
-    $('reels-url').value = raw;
-    return;
-  }
-  const rn = nativeBridge();
-  if (rn) {
-    try { rn.postMessage(JSON.stringify({ type: 'openBrowser', url: target })); } catch { /* older shell */ }
     rememberBrowserUrl(target);
     $('reels-url').value = raw;
     return;
@@ -135,15 +115,14 @@ function setReelsFeed(feed) {
     // The browser tab is a real top-level surface too. Re-navigate on every
     // switch so the surface is shown again if it was closed, and use the URL
     // bar's current value without adding a duplicate history entry.
-    if (webView2Host()) reelsNavigate($('reels-url').value || SET.browserUrl || 'about:blank', true);
+    if (desktopHost()) reelsNavigate($('reels-url').value || SET.browserUrl || 'about:blank', true);
     else if (!$('reels-frame').getAttribute('src')) reelsNavigate($('reels-url').value || SET.browserUrl || 'about:blank');
     return;
   }
   closeNativeBrowser();
-  // In the app the panel is backed by a real browser surface. If there is no
-  // native host (an old shell, or a plain browser that should not have this
-  // panel at all), there is nothing to embed: these sites refuse iframes.
-  if (webView2Host()) { openNativeFeed(feed); return; }
+  // In the app the panel is backed by a real browser surface. Without the
+  // Electron host there is nothing to embed: these sites refuse iframes.
+  if (desktopHost()) { openNativeFeed(feed); return; }
   const v = $('reels-video');
   v.innerHTML = '';
   const ph = el('div', 'reels-placeholder');
@@ -164,28 +143,23 @@ function toggleReelsPanel() {
   }
 }
 
-/* ── docked native feed (Windows app) ──────────────────────────────
+/* ── docked feed (Electron app) ───────────────────────────────────
  *
- * In the app the page runs inside WebView2, which gives us something a browser
- * cannot: a second real browser surface we can place anywhere in the window.
- * So instead of iframing a feed (Instagram and TikTok refuse that with
- * X-Frame-Options: DENY) or opening a popup, we park a genuine Chromium surface
- * exactly over this panel's rectangle. The panel stays the layout -- drag the
- * splitter and the feed follows -- and the site sees a top-level browsing
- * context, so the infinite feed loads normally.
+ * In the app the page has something a browser does not: a second real browser
+ * surface that can be parked exactly over this panel's rectangle. The panel
+ * stays the layout -- drag the splitter and the feed follows -- and the site
+ * sees a top-level browsing context, so the infinite feed loads normally.
  *
- * Messages go to windows/PiAgent/WebView2Module.h as
+ * Messages go to pi-electron/main.js as
  *   piagent|shorts|open|x|y|w|h|url
  *   piagent|shorts|rect|x|y|w|h
  *   piagent|shorts|close
  * with x/y relative to the panel (straight from getBoundingClientRect).
  */
-function webView2Host() {
-  // Electron exposes the same one-way channel the WebView2 shell uses; see
-  // pi-electron/webui-preload.cjs.
-  if (window.piDesktop && typeof window.piDesktop.postMessage === 'function') return window.piDesktop;
-  const c = window.chrome;
-  return c && c.webview && typeof c.webview.postMessage === 'function' ? c.webview : null;
+function desktopHost() {
+  return window.piDesktop && typeof window.piDesktop.postMessage === 'function'
+    ? window.piDesktop
+    : null;
 }
 
 let nativeFeedOpen = false;
@@ -207,7 +181,7 @@ function panelRect() {
 }
 
 function openNativeFeed(feed) {
-  const host = webView2Host();
+  const host = desktopHost();
   if (!host) return false;
   const f = SHORTS_FEEDS[feed] || SHORTS_FEEDS.instagram;
   closeNativeBrowser();
@@ -220,7 +194,7 @@ function openNativeFeed(feed) {
 }
 
 function syncNativeEmbed() {
-  const host = webView2Host();
+  const host = desktopHost();
   if (!host) return;
   if ($('reels-panel').classList.contains('hidden')) { closeNativeFeed(); closeNativeBrowser(); return; }
   const r = panelRect();
@@ -229,12 +203,11 @@ function syncNativeEmbed() {
   else if (nativeBrowserOpen) host.postMessage(`piagent|browser|rect|${r.x}|${r.y}|${r.w}|${r.h}`);
 }
 
-// Kept as the name the older call sites use.
 function syncNativeFeed() { syncNativeEmbed(); }
 
 function closeNativeFeed() {
   nativeFeedOpen = false;
-  const host = webView2Host();
+  const host = desktopHost();
   if (host) host.postMessage('piagent|shorts|close');
   const v = $('reels-video');
   if (v) v.classList.remove('native-feed');
@@ -242,7 +215,7 @@ function closeNativeFeed() {
 
 function closeNativeBrowser() {
   nativeBrowserOpen = false;
-  const host = webView2Host();
+  const host = desktopHost();
   if (host) host.postMessage('piagent|browser|close');
 }
 
@@ -335,10 +308,10 @@ function toggleReels() {
   else hideReels();
 }
 
-/* The shorts feature is the desktop app's: a browser cannot play the real feeds
- * (they refuse with X-Frame-Options), and the pane the app opens is a native
- * one. So the Reels button - and the panel behind it - only exist there, the
- * same rule the settings tab follows (issue #158's follow-up). */
+/* The shorts feature is the desktop app's: a browser cannot play the real
+ * feeds (they refuse with X-Frame-Options), and the pane the app opens is a
+ * real browsing surface. So the Reels button - and the panel behind it - only
+ * exist there, the same rule the settings tab follows (issue #158's follow-up). */
 function shortsAreDesktopOnly() {
   return /Electron/i.test(navigator.userAgent);
 }
@@ -346,14 +319,8 @@ function shortsAreDesktopOnly() {
 function openShorts() {
   if (!shortsAreDesktopOnly()) return;
   const provider = SET.shortsProvider || 'instagram';
-  // Native (React Native) mode: open the app's native shorts sheet.
-  const bridge = nativeBridge();
-  if (bridge) {
-    bridge.postMessage(JSON.stringify({ type: 'openShorts', provider }));
-    return;
-  }
-  // WebView2 app: dock the feed inside the window, next to the chat.
-  if (webView2Host()) { toggleReels(); return; }
+  // Electron: dock the feed inside the window, next to the chat.
+  if (desktopHost()) { toggleReels(); return; }
   // The browser pane only exists inside the split pane (issue #123).
   if (provider === 'browser') { toggleReelsPanel(); return; }
   const mode = SET.shortsMode || 'panel';
@@ -430,13 +397,13 @@ window.addEventListener('resize', () => syncNativeEmbed());
 
 // The docked feed is a window this page does not own, so a reload would leave it
 // behind. Clear any orphan on startup, and try to close ours on the way out.
-if (webView2Host()) {
-  webView2Host().postMessage('piagent|shorts|close');
-  webView2Host().postMessage('piagent|browser|close');
+if (desktopHost()) {
+  desktopHost().postMessage('piagent|shorts|close');
+  desktopHost().postMessage('piagent|browser|close');
   window.addEventListener('beforeunload', () => {
     try {
-      webView2Host().postMessage('piagent|shorts|close');
-      webView2Host().postMessage('piagent|browser|close');
+      desktopHost().postMessage('piagent|shorts|close');
+      desktopHost().postMessage('piagent|browser|close');
     } catch { /* going away */ }
   });
 }

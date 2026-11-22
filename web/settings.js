@@ -65,11 +65,22 @@ function openSettings() {
   $('set-show-thinking').checked = SET.showThinking !== false;
   $('set-expand-thinking').checked = !!SET.autoExpandThinking;
   $('set-expand-tools').checked = !!SET.autoExpandTools;
+  $('set-party-confetti').checked = SET.partyConfetti !== false;
   $('set-stt-endpoint').value = SET.sttEndpoint || '';
   syncVoiceSettingsUi();
   $('set-tts-backend').value = SET.ttsBackend || 'browser';
-  if ($('set-tts-apikey')) $('set-tts-apikey').value = SET.ttsApiKey || '';
+  if ($('set-tts-apikey')) {
+    $('set-tts-apikey').value = '';
+    $('set-tts-apikey').placeholder = SET.ttsApiKeySet ? 'a key is set — leave blank to keep it' : 'paste the key here';
+  }
   if ($('set-tts-cloud-model')) $('set-tts-cloud-model').value = SET.ttsCloudModel || '';
+  if ($('set-tts-fish-model')) {
+    // Issue #211: the Fish model list; an unrecognised value (a model from the
+    // OpenAI field) falls back to what the endpoint itself defaults to.
+    const sel = $('set-tts-fish-model');
+    const stored = String(SET.ttsCloudModel || '');
+    sel.value = [...sel.options].some((o) => o.value === stored) ? stored : 's2.1-pro';
+  }
   if ($('set-tts-cloud-voice')) $('set-tts-cloud-voice').value = SET.ttsCloudVoice || '';
   if ($('set-tts-cloud-url')) $('set-tts-cloud-url').value = SET.ttsCloudUrl || '';
   syncTtsSettingsUi();
@@ -97,6 +108,13 @@ function openSettings() {
     $('set-gamer-speed').value = String(Number(SET.gamerSpeed) || 16);
     $('set-gamer-speed-val').textContent = `${Number(SET.gamerSpeed) || 16}s`;
     setGamerSpeedVisible(!!SET.gamerMode);
+  }
+  if ($('set-pet-enabled')) $('set-pet-enabled').checked = SET.petEnabled === true;
+  if (typeof syncPetOptionVisibility === 'function') syncPetOptionVisibility();
+  if ($('set-pet-size')) {
+    const size = Math.max(64, Math.min(160, Number(SET.petSize) || 96));
+    $('set-pet-size').value = String(size);
+    $('set-pet-size-val').textContent = `${size}px`;
   }
   $('set-done-sound').checked = !!SET.doneSound;
   $('set-done-notify').checked = !!SET.doneNotify;
@@ -135,9 +153,11 @@ function openSettings() {
   $('set-auto-continue').checked = SET.autoContinueAfterCompaction !== false;
   populateDefaultModelSelect();
   loadPiConfig();
+  loadSearxngConfig().catch(() => {});
   loadPiProviders();
   loadAuthProviders();
   loadExtensionsTab();
+  if (typeof loadPetLibrary === 'function') loadPetLibrary().catch(() => { /* built-in pet remains available */ });
   prettifySettingsSelects();
   const t0 = performance.now();
   $('settings-dialog').showModal();
@@ -244,9 +264,20 @@ $('set-show-tools').onchange = (e) => {
 $('set-expand-thinking').onchange = (e) => {
   SET.autoExpandThinking = e.target.checked;
   saveSettings();
+  // The setting applies to what is already on screen as well as to new blocks.
+  // It is applied here, on the setting's own change, instead of inside
+  // applySettings() - which runs for every unrelated setting too.
+  document.querySelectorAll('details.thinking').forEach((d) => { d.open = SET.autoExpandThinking === true; });
 };
 $('set-expand-tools').onchange = (e) => {
   SET.autoExpandTools = e.target.checked;
+  saveSettings();
+  document.querySelectorAll('.tool-card .tool-body').forEach((b) => {
+    b.classList.toggle('hidden', SET.autoExpandTools !== true);
+  });
+};
+$('set-party-confetti').onchange = (e) => {
+  SET.partyConfetti = e.target.checked;
   saveSettings();
 };
 $('set-stt-endpoint').addEventListener('change', (e) => {
@@ -266,8 +297,26 @@ $('set-stt-backend').onchange = async (e) => {
     : 'Voice input: browser speech recognition (Chrome/Edge only)');
 };
 $('set-tts-backend').onchange = (e) => { SET.ttsBackend = e.target.value; saveSettings(); syncTtsSettingsUi(); };
-$('set-tts-apikey').onchange = (e) => { SET.ttsApiKey = e.target.value.trim(); saveSettings(); toast('Voice key saved (it lives in the bridge settings)'); };
+$('set-tts-apikey').onchange = async (e) => {
+  const key = e.target.value.trim();
+  try {
+    const r = await fetch(api('/api/tts-key'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || `failed (${r.status})`);
+    SET.ttsApiKeySet = !!d.ttsApiKeySet;
+    e.target.value = '';
+    e.target.placeholder = SET.ttsApiKeySet ? 'a key is set — leave blank to keep it' : 'paste the key here';
+    toast(key ? 'Voice key saved (it stays on the bridge)' : 'Voice key cleared');
+  } catch (err) {
+    toast(`Could not save the voice key: ${err.message}`, 'error');
+  }
+};
 $('set-tts-cloud-model').onchange = (e) => { SET.ttsCloudModel = e.target.value.trim(); saveSettings(); };
+$('set-tts-fish-model').onchange = (e) => { SET.ttsCloudModel = e.target.value; saveSettings(); };
 $('set-tts-cloud-voice').onchange = (e) => { SET.ttsCloudVoice = e.target.value.trim(); saveSettings(); };
 $('set-tts-cloud-url').onchange = (e) => { SET.ttsCloudUrl = e.target.value.trim(); saveSettings(); };
 $('set-tts-endpoint').addEventListener('change', (e) => { SET.ttsEndpoint = e.target.value.trim(); saveSettings(); });
@@ -318,95 +367,6 @@ async function setBackgroundFromFile(f) {
 };
 $('btn-bg-clear').onclick = () => { SET.themeBg = null; SET.bgCrop = null; saveSettings(); };
 $('btn-bg-crop').onclick = () => openCropper('bg');
-
-/* Apply SET.themeBg to the page. Images, GIFs and videos all render as a real
- * element behind the app, so one code path (and one crop) covers all three -
- * a body background-image could not be zoomed or panned by hand. */
-/* The accent, the outline colour and the avatar size: everything that gamer mode
- * (or a settings change) has to be able to put back on its own. */
-function applyThemeColours() {
-  const rootStyle = document.documentElement.style;
-  // text outline: a 4-way shadow keeps glyphs readable when the panels are
-  // translucent and the background image shows through.
-  document.body.classList.toggle('text-outline', SET.textOutline !== false);
-  rootStyle.setProperty('--outline-color', SET.textOutlineColor || '#000000');
-  if (SET.themeAccent) {
-    rootStyle.setProperty('--accent', SET.themeAccent);
-    rootStyle.setProperty('--accent-dim', `color-mix(in srgb, ${SET.themeAccent} 35%, #171b22)`);
-  } else {
-    rootStyle.removeProperty('--accent');
-    rootStyle.removeProperty('--accent-dim');
-  }
-}
-
-function applyBackgroundMedia() {
-  const host = $('bg-media');
-  // Another instance brings its own background (its own file, served by its own
-  // bridge) - showing this machine's picture behind another machine's chat was
-  // the "background carries over" report. How it is shown (volume, crop applied)
-  // stays this machine's preference.
-  const look = instanceLook();
-  const src = instanceMediaUrl(look.themeBg) || '';
-  if (!host) return;
-  const frame = window.innerWidth / Math.max(1, window.innerHeight);
-  const current = host.querySelector('img, video');
-  // Same source: keep the element. Rebuilding it restarted a background video
-  // from the beginning every time any unrelated setting was saved.
-  if (current && current.getAttribute('src') === src) {
-    applyCrop(current, look.bgCrop, frame);
-    applyBgAudio(current);
-    return;
-  }
-  // If the element does have to be rebuilt, the video must not start over: keep
-  // the playhead, the mute state and whether it was playing (a resize, a settings
-  // save or a theme change used to send it back to the beginning, audio and all).
-  const before = current && current.tagName === 'VIDEO'
-    ? { at: current.currentTime, playing: !current.paused, muted: current.muted }
-    : null;
-  host.innerHTML = '';
-  if (!src) { host.classList.add('hidden'); return; }
-  const node = attachCrop(mediaNode(src, 'bg-node'), look.bgCrop, frame);
-  if (before && node.tagName === 'VIDEO') {
-    try { node.currentTime = before.at; } catch { /* not seekable yet */ }
-    node.muted = before.muted;
-    if (before.playing) node.addEventListener('loadeddata', () => node.play().catch(() => {}), { once: true });
-  }
-  node.onerror = () => toast(isVideoSrc(src) ? 'Background video failed to load' : 'Background image failed to load', 'error');
-  host.appendChild(node);
-  host.classList.remove('hidden');
-}
-
-/* Volume and mute live on the element, so changing them must not rebuild the
- * video (which would restart it from the beginning). */
-function applyBgAudio(node) {
-  if (!node || node.tagName !== 'VIDEO') return;
-  node.volume = Math.max(0, Math.min(1, (SET.bgVolume == null ? 50 : Number(SET.bgVolume)) / 100));
-  // `wantedPlay` is what the background *should* be doing, so the tab going
-  // hidden can pause it and coming back can resume it without having to guess.
-  node.dataset.wantedPlay = SET.bgAudio ? '1' : '0';
-  // A background clip nobody is looking at is a decoder and a buffer for
-  // nothing, so it is held while the tab is in the background and let go when
-  // the tab comes back.
-  if (document.visibilityState !== 'visible') { try { node.pause(); } catch { /* ignore */ } return; }
-  if (!SET.bgAudio) { node.muted = true; return; }
-  if (!node.muted && !node.paused) return;
-  node.muted = false;
-  node.play().catch(() => { node.muted = true; armBgAudioUnlock(node); });
-}
-
-/* Audible playback needs a user gesture: wait for the first click or key, then
- * unmute - the setting asked for sound, so it should actually be heard. */
-function armBgAudioUnlock(node) {
-  const unlock = () => {
-    document.removeEventListener('pointerdown', unlock, true);
-    document.removeEventListener('keydown', unlock, true);
-    if (!SET.bgAudio) return;
-    node.muted = false;
-    node.play().catch(() => { /* still blocked; leave it muted */ });
-  };
-  document.addEventListener('pointerdown', unlock, true);
-  document.addEventListener('keydown', unlock, true);
-}
 
 /* The frame aspect is the window's, so a resize changes how much of a cropped
  * background fits. Re-apply instead of rebuilding - rebuilding would restart a

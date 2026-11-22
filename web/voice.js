@@ -233,13 +233,6 @@ function ttsVoicesReady() {
   return ttsVoiceCache !== null;
 }
 
-/* The browser told us the list changed (or we are warming it): forget what we
- * had and fetch the new one. */
-function refreshTtsVoices() {
-  ttsVoiceCache = null;
-  return ttsVoices();
-}
-
 // Sensible default: prefer a natural-sounding en voice when none is chosen.
 function pickDefaultVoice() {
   const voices = ttsVoices();
@@ -323,12 +316,20 @@ async function speakInBatches(text, getAudio) {
   S.speaking = true;
   $('btn-tts').classList.add('on');
   for (const b of buffers) {
+    /* play() returns a promise and autoplay can refuse it (likely when TTS is
+     * triggered by a finished turn rather than a click). A rejected play()
+     * does NOT fire onerror, so the old promise never settled: S.speaking
+     * stayed true and the speak button stayed lit. The blob URL is revoked
+     * once the chunk has played, instead of living for the whole page. */
+    const url = URL.createObjectURL(b);
     await new Promise((done) => {
-      const a = new Audio(URL.createObjectURL(b));
-      a.onended = done;
-      a.onerror = done;
-      a.play();
+      const a = new Audio(url);
+      const finish = () => done();
+      a.onended = finish;
+      a.onerror = finish;
+      a.play().catch(finish);
     });
+    URL.revokeObjectURL(url);
   }
   S.speaking = false;
   $('btn-tts').classList.remove('on');

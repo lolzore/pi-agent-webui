@@ -42,7 +42,7 @@ let paneOpen = false;
 let activeFeed = 'instagram';
 const views = new Map();   // feed key -> WebContentsView (kept, so switching is instant)
 /* The WebUI's own split pane asks for a real surface through the preload shim
- * (the same piagent|... messages the WebView2 shell uses). These are separate
+ * (the same piagent|... messages the embedded surface uses). These are separate
  * from the top-level Shorts pane above: one covers #reels-video, the other
  * covers the Browser tab's #reels-frame. */
 const embedViews = { feed: null, browser: null };
@@ -90,12 +90,9 @@ function ensureFeedView(key) {
 
 /* ── in-page Shorts / Browser surface ─────────────────────────────────────
  *
- * The WebUI's split pane was written for the React Native WebView2 shell: it
- * sends `piagent|shorts|open|x|y|w|h|url` (and `browser|open|...`) to a host
- * that owns a real browsing surface. Electron had no such host, so the pane
- * fell back to an iframe, Instagram/TikTok refused it, and the user saw the
- * "Paste a Reels link" placeholder. The preload below exposes the same
- * postMessage method, and these views are the host side. */
+ * The WebUI's split pane sends `piagent|shorts|open|x|y|w|h|url` (and
+ * `browser|open|...`) to a host that owns a real browsing surface. The preload
+ * exposes the postMessage method, and these views are the host side. */
 function ensureEmbedView(kind) {
   const existing = embedViews[kind];
   if (existing) return existing;
@@ -263,14 +260,6 @@ const state = () => ({
   paneOpen,
   width: loadSettings().paneWidth,
 });
-
-function openPane(key) {
-  if (key) activeFeed = key;
-  paneOpen = true;
-  saveSettings({ paneOpen: true, activeFeed });
-  ensureFeedView(activeFeed);
-  layout();
-}
 
 function closePane() {
   paneOpen = false;

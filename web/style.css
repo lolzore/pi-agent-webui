@@ -13,7 +13,11 @@
   --yellow: #d9a53f;
   --radius: 10px;
   --mono: ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace;
-  --chat-font: "Segoe UI", system-ui, -apple-system, sans-serif;
+  /* The emoji families are part of the chat stack itself, not something bolted
+     onto <body>: #chat, the markdown blocks, the composer and the banner all set
+     var(--chat-font) directly, so a fallback only on body left AI output - the
+     place emojis are read - without one (issue #201). */
+  --chat-font: "Segoe UI", system-ui, -apple-system, sans-serif, "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji";
   --chat-size: 14px;
   /* --chat-size / 14, set from the text-size setting: every fixed size inside the
      conversation (thinking blocks, code, tool cards, the message header) is
@@ -28,6 +32,9 @@
   --space-md: 12px;
   --space-lg: 16px;
   --space-xl: 24px;
+  /* Horizontal padding of the composer dock. The goal bar sits outside #composer
+     but must share its box, so both read this value (issue #207). */
+  --composer-pad-x: 12px;
   /* Z-index scale */
   --z-base: 1;
   --z-dropdown: 10;
@@ -81,6 +88,10 @@ body {
   color: var(--text);
   overflow: hidden;
 }
+/* Emoji keep their colour even when the reader picked a text font for the UI.
+ * Without an emoji family in the stack, a theme font that has a glyph for an
+ * emoji can render it as a monochrome text glyph (issue #201). */
+body { font-family: var(--chat-font); }
 
 #app { display: flex; height: 100vh; }
 
@@ -156,6 +167,28 @@ body.sidebar-hidden #sidebar { display: none; }
 .session-list.drop-here { outline: 1px dashed var(--accent); outline-offset: -3px; border-radius: 8px; }
 
 .session-item.active { background: var(--accent-dim); border-color: var(--accent); }
+/* A plain chat is a different kind of conversation: no tools, extensions,
+ * skills or AGENTS.md. Outline it in the list so it is identifiable before you
+ * switch to it, not only after the plain-chat banner appears. */
+.session-item.plain {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+.session-item.plain.active { border-style: solid; }
+.session-item.plain .s-name::after {
+  content: 'plain';
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0 5px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .3px;
+  text-transform: uppercase;
+}
 /* The arrow that folds a session's forks away. It was a 10px glyph - too small to
    hit, especially on a phone - so it is a real button-sized target now (the row
    itself is still clickable for switching sessions). */
@@ -180,11 +213,6 @@ body.sidebar-hidden #sidebar { display: none; }
 }
 .session-item .s-name > .name-text { overflow: hidden; text-overflow: ellipsis; }
 .session-item .s-meta { font-size: 11px; color: var(--text-dim); }
-.sidebar-foot {
-  border-top: 1px solid var(--border);
-  padding: 8px 12px; font-size: 11.5px; color: var(--text-dim);
-  display: flex; flex-direction: column; gap: 2px;
-}
 .ellipsis { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* ───────────────────────── main / topbar ───────────────────────── */
@@ -268,7 +296,7 @@ body.sidebar-hidden #sidebar { display: none; }
   position: relative;
 }
 /* Drag handle on the panel's left edge. Dragging it widens the panel, and the
-   docked WebView2 surface (when present) is told the new rectangle so the live
+   docked Electron surface (when present) is told the new rectangle so the live
    feed tracks it in real time. */
 #reels-resize {
   position: absolute; left: -4px; top: 0; bottom: 0; width: 8px;
@@ -321,6 +349,7 @@ body.sidebar-hidden #sidebar { display: none; }
 .btn.primary:hover { filter: brightness(1.1); }
 .btn.stop { background: var(--red); border-color: var(--red); color: #fff; }
 .btn.icon { padding: 5px 9px; }
+.btn.icon svg { display: block; }
 .btn.small { font-size: 11.5px; padding: 2px 8px; }
 .btn.toggle.on { background: var(--accent-dim); border-color: var(--accent); }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
@@ -419,8 +448,6 @@ input::placeholder { color: var(--text-dim); opacity: .75; }
 .diffbox .diff-count { font-weight: 600; }
 .diffbox .diff-count .c-add { color: #7ee2a0; }
 .diffbox .diff-count .c-del { color: #ff9d97; }
-.reels-modes { display: flex; gap: 4px; }
-.reels-note { padding: 8px 12px; font-size: 11.5px; color: var(--text-dim); border-bottom: 1px solid var(--border); }
 .diffbox .dl { padding: 0 10px; }
 .diffbox .dl.del { background: rgba(229, 83, 75, .18); color: #ff9d97; }
 .diffbox .dl.add { background: rgba(63, 185, 104, .15); color: #7ee2a0; }
@@ -636,25 +663,99 @@ dialog#notices-dialog {
   display: flex; flex-direction: column; gap: 2px;
 }
 .notice-row {
-  display: flex; align-items: baseline; gap: 10px;
+  display: flex; align-items: flex-start; gap: 10px;
   padding: 7px 9px; border-radius: 7px; border: 1px solid transparent;
   cursor: pointer; font-size: var(--chat-size, 14px); line-height: 1.45;
 }
 .notice-row:hover { background: var(--bg-hover); border-color: var(--border); }
 .notice-row.error { border-color: color-mix(in srgb, var(--red) 50%, transparent); }
+.notice-row .n-meta { display: flex; flex-direction: column; gap: 2px; flex: 0 0 auto; min-width: 62px; }
 .notice-row .n-time { flex: 0 0 auto; font: 11px var(--mono); color: var(--text-dim); }
 .notice-row .n-kind {
   flex: 0 0 auto; font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px;
   color: var(--text-dim);
 }
-.notice-row .n-text { flex: 1; min-width: 0; }
+.notice-row .n-body { flex: 1; min-width: 0; }
+.notice-row .n-text {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2;
+  overflow: hidden; overflow-wrap: anywhere; white-space: pre-wrap;
+}
+.notice-row.expanded .n-text { display: block; -webkit-line-clamp: unset; line-clamp: unset; overflow: visible; }
+.notice-row .n-detail {
+  display: none; margin-top: 6px; padding-top: 6px;
+  border-top: 1px dashed var(--border); color: var(--text-dim);
+  font: 12px/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.notice-row.expanded .n-detail { display: block; }
+.notice-row .n-toggle {
+  flex: 0 0 auto; align-self: flex-start; margin-top: 1px;
+  background: none; border: 0; color: var(--text-dim); cursor: pointer;
+  font: 13px/1 var(--mono); padding: 1px 3px; border-radius: 4px;
+}
+.notice-row .n-toggle:hover, .notice-row .n-toggle:focus-visible { color: var(--text); background: var(--bg-elev); outline: none; }
 .notice-empty { padding: 18px 6px; text-align: center; color: var(--text-dim); }
 .notices-foot { margin-top: 6px; }
 .notices-spacer { flex: 1; }
 
+/* ── one notification, full window ──────────────────────────────────────
+ * The list row clamps to two lines so the log stays scannable. This is the
+ * reading view: whole text at chat size, the detail in a selectable <pre> with
+ * its line breaks and indentation intact, and enough room for a stack trace.
+ * Like the statistics dialog, display:flex belongs only on [open] - a closed
+ * <dialog> must stay display:none or it paints on every page. */
+dialog#notice-detail-dialog {
+  width: clamp(560px, 94vw, 1400px); max-width: 96vw;
+  height: clamp(420px, 90vh, 950px); max-height: 94vh;
+}
+dialog#notice-detail-dialog[open] { display: flex; flex-direction: column; }
+.notice-detail-meta { color: var(--text-dim); font: 11.5px var(--mono); margin: 2px 0 10px; }
+.notice-detail-body {
+  flex: 1 1 auto; min-height: 0; overflow: auto;
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 14px; background: color-mix(in srgb, #12161d calc(var(--ui-alpha) * 100%), transparent);
+  font-family: var(--chat-font); font-size: var(--chat-size, 14px); line-height: 1.55;
+}
+.notice-detail-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.notice-detail-code {
+  margin: 12px 0 0; padding: 10px 12px; border-top: 1px dashed var(--border);
+  color: var(--text-dim); background: transparent;
+  font: 12px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+/* ── settings notes behind a ? (issue #219) ──────────────────────────────
+ * The prose that explained a setting sat under every row and made the dialog
+ * read as a wall of text. The note is kept in the DOM (in #settings-help-sources)
+ * so the code that updates it keeps working, but it is shown only while the
+ * question mark is hovered, focused or pinned. */
+.help-sources { display: none; }
+.help-tip {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 15px; height: 15px; flex: 0 0 auto; margin-left: 6px;
+  padding: 0; border-radius: 50%; border: 1px solid color-mix(in srgb, var(--accent) 65%, var(--border));
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent); cursor: help; vertical-align: middle;
+  font-family: inherit; font-size: 10px; font-weight: 700; line-height: 1;
+}
+.help-tip:hover, .help-tip:focus-visible, .help-tip[aria-expanded="true"] {
+  background: var(--accent); color: #fff; border-color: var(--accent); outline: none;
+}
+.help-pop {
+  position: fixed; z-index: 9999; display: block;
+  max-width: min(380px, calc(100vw - 16px));
+  padding: 9px 11px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--bg-panel); color: var(--text);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .45);
+  font-family: inherit; font-size: 12.5px; line-height: 1.5; overflow-wrap: anywhere;
+}
+.help-pop code { font: 11.5px var(--mono); color: var(--accent); }
+.help-pop a { color: var(--accent); }
+.help-pop.hidden { display: none; }
+
 /* settings dialog */
 .settings-grid {
-  display: grid; grid-template-columns: 110px 1fr; gap: 10px 12px;
+  /* 156px leaves room for the ? that follows a label (issue #219): the longest
+   * one, "Compaction threshold", is 131px, plus a 15px icon and its gap. */
+  display: grid; grid-template-columns: 156px 1fr; gap: 10px 12px;
   align-items: center; margin-top: 10px;
 }
 /* Issue #105: the grid used to place children by alternation (label, control,
@@ -665,6 +766,7 @@ dialog#notices-dialog {
  * everything it controls is column 2, check-labels included (they carry their
  * own text). A row without a label simply leaves column 1 empty. */
 .settings-grid > label:not(.check-label) { grid-column: 1; }
+.settings-grid > label.has-help { white-space: nowrap; }
 .settings-grid > .check-label,
 .settings-grid > :not(label) { grid-column: 2; }
 .settings-grid label { font-size: 12.5px; color: var(--text-dim); }
@@ -681,6 +783,13 @@ dialog#notices-dialog {
   background: color-mix(in srgb, var(--accent) 12%, transparent); border-radius: 8px;
 }
 .avatar-row { display: flex; align-items: center; gap: 8px; }
+/* The profile row is one unit: its label belongs beside the picture and buttons,
+ * not in a separate grid column with the controls parked on the far right. */
+.settings-grid > .avatar-settings-row { grid-column: 1 / -1; gap: 16px; }
+.settings-grid > .avatar-settings-row > label { flex: 0 0 auto; margin-right: 8px; white-space: nowrap; }
+/* An empty preview is kept for a chosen picture, but it must not leave a 64px
+ * hole between the label and the upload/crop/clear buttons before one exists. */
+.avatar-settings-row .avatar-wrap:empty { display: none; }
 .rate-row { display: flex; align-items: center; gap: 8px; }
 .rate-row input[type="range"] { flex: 1; }
 /* a path / URL field next to its own buttons: the field takes the free space
@@ -730,7 +839,10 @@ dialog#settings-dialog {
 dialog#settings-dialog[open] {
   display: flex;
   flex-direction: column;
-  width: 520px;
+  /* Wide enough for the two-column form, its help icons and the multi-button
+   * rows (background upload/crop/clear, TTS, cursor). At 520px the right side
+   * of those controls was clipped on a full desktop window. */
+  width: min(760px, 92vw);
   max-width: 92vw;
   height: min(660px, 84vh);
   /* Do NOT give this dialog `contain`, `transform` or `will-change: transform`.
@@ -778,6 +890,44 @@ dialog#settings-dialog h3 { margin: 0 0 4px; }
  * instead of leaving a checkbox that can neither read nor write. */
 #set-pi-compaction-note { display: block; margin-top: 3px; color: var(--red); font-size: 11.5px; }
 #set-pi-compaction-note:empty { display: none; }
+/* The value beside the compaction slider is a button: click it to type an exact
+ * reserveTokens value instead of being limited to the slider's steps. */
+#set-pi-compaction-threshold-val {
+  cursor: pointer; white-space: nowrap; border-bottom: 1px dotted color-mix(in srgb, var(--text-dim) 65%, transparent);
+}
+#set-pi-compaction-threshold-val:hover, #set-pi-compaction-threshold-val:focus { color: var(--text); border-bottom-color: var(--accent); }
+#set-pi-compaction-threshold-val.hidden { display: none; }
+#set-pi-compaction-threshold-manual {
+  width: 112px; flex: 0 0 auto; box-sizing: border-box;
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); padding: 4px 7px; font-size: 12px;
+}
+#set-pi-compaction-threshold-manual:focus { outline: none; border-color: var(--accent); }
+
+/* ── hidden model/token statistics ─────────────────────────────────────── */
+/* `[open]` is load-bearing, as on the settings dialog: an author `display:flex`
+ * on the closed element overrides the browser's `dialog:not([open])` rule and
+ * made the statistics panel sit open on every page, surviving reloads. */
+dialog#statistics-dialog {
+  width: clamp(680px, 86vw, 1400px); max-width: 94vw;
+  height: clamp(480px, 82vh, 860px); max-height: 88vh;
+}
+dialog#statistics-dialog[open] { display: flex; flex-direction: column; }
+dialog#statistics-dialog h3 { margin: 0 0 4px; }
+dialog#statistics-dialog .statistics-scroll {
+  flex: 1 1 auto; min-height: 0; overflow: auto; margin: 10px 0 4px;
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.statistics-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.statistics-table th, .statistics-table td { padding: 7px 9px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+.statistics-table th { position: sticky; top: 0; background: var(--bg-elev); color: var(--text-dim); font-weight: 600; z-index: 1; }
+.statistics-table th:first-child, .statistics-table td:first-child { text-align: left; }
+.statistics-table tbody tr:hover { background: var(--bg-hover); }
+.statistics-table tbody tr:last-child td { border-bottom: 0; }
+.statistics-model { font-family: var(--mono); color: var(--text); }
+.statistics-provider { color: var(--text-dim); font-size: 11px; }
+.statistics-total td { border-top: 1px solid var(--accent-dim); border-bottom: 0; font-weight: 600; }
+.statistics-empty { padding: 24px; color: var(--text-dim); text-align: center; }
 
 /* first-launch setup dialog */
 dialog#setup-dialog {
@@ -788,15 +938,9 @@ dialog#setup-dialog {
 dialog#setup-dialog::backdrop { background: rgba(0,0,0,.7); }
 dialog#setup-dialog h3 { margin: 0 0 2px; }
 .setup-sub { color: var(--text-dim); font-size: 12.5px; margin: 0 0 10px; }
-
-/* pi providers section */
-.settings-section {
-  margin-top: 16px; border-top: 1px solid var(--border); padding-top: 10px;
-}
-.settings-section h4 { margin: 0 0 8px; font-size: 13px; }
-.settings-section h4 .hint { color: var(--text-dim); font-weight: 400; font-size: 11.5px; }
 .prov-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .prov-row { display: flex; align-items: center; gap: 8px; }
+.prov-row-custom { gap: 10px; }
 .prov-info { flex: 1; min-width: 0; }
 .prov-id { font: 600 12.5px var(--mono); }
 .prov-meta {
@@ -815,6 +959,16 @@ dialog#setup-dialog h3 { margin: 0 0 2px; }
   cursor: pointer; padding: 4px 6px; border-radius: 6px; border: 1px solid transparent;
 }
 .auth-logged-in .prov-row:hover { background: var(--bg-hover); border-color: var(--border); }
+
+/* Plain chat is a mode, not a session: say so while it is active and keep the
+ * way back one click away. */
+.plain-banner {
+  margin: 8px 12px 0; padding: 7px 10px; border-radius: 8px; font-size: 12.5px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: color-mix(in srgb, var(--yellow) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--yellow) 55%, transparent);
+}
+.plain-banner .btn { margin-left: auto; }
 
 /* "Viewing another session" banner (the agent keeps running in its own). */
 .view-banner {
@@ -1116,7 +1270,7 @@ details.thinking .th-body { white-space: pre-wrap; margin-top: 6px; }
 .goal-bar {
   /* The same box as the composer row and the stats bar (issue #127): it used
    * to fill the whole dock, so it stuck out past the + and send buttons. */
-  max-width: 860px; width: calc(100% - 24px);
+  max-width: 860px; width: calc(100% - 2 * var(--composer-pad-x));
   background: color-mix(in srgb, #141a26 calc(var(--ui-alpha) * 100%), transparent);
   border: 1px solid color-mix(in srgb, var(--border) calc(var(--ui-alpha) * 100%), transparent);
   border-radius: 8px; padding: 6px 10px; margin: 0 auto 4px;
@@ -1228,7 +1382,7 @@ body.run-active .status-bar.hidden[data-had-content] {
 /* No slab behind the whole composer strip: only the actual controls carry a
  * background, so typing more (or adding attachments) never stretches a dark bar
  * past the elements themselves. */
-#composer { padding: 4px 12px 10px; }
+#composer { padding: 4px var(--composer-pad-x) 10px; }
 #stats-bar {
   padding: 3px 8px;
   border-radius: var(--radius);
@@ -1366,6 +1520,23 @@ body.run-active .status-bar.hidden[data-had-content] {
 .slash-item .src.skill { color: var(--green); border-color: var(--green); }
 .slash-item .src.builtin { color: var(--accent); border-color: var(--accent); }
 
+/* Issue #201: the party-emoji confetti. (Blocked-image placeholders went away
+ * with issue #214: blocking is pi's own setting, not a display mode.) */
+.party-layer {
+  position: fixed; inset: 0; z-index: 210; pointer-events: none; overflow: hidden;
+}
+.party-bit {
+  position: absolute; top: -18px; display: block; border-radius: 2px;
+  animation-name: party-fall; animation-timing-function: ease-in; animation-fill-mode: forwards;
+}
+@keyframes party-fall {
+  0%   { transform: translateY(0) rotate(0deg); opacity: 1; }
+  100% { transform: translateY(105vh) rotate(720deg); opacity: .85; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .party-layer { display: none; }
+}
+
 /* banner, toasts, drop overlay */
 .banner {
   max-width: 860px; margin: 8px auto 0; padding: 8px 12px; border-radius: 8px;
@@ -1419,21 +1590,8 @@ body { display: flex; }
   background: var(--bg-panel); border-left: 1px solid var(--border);
   display: flex; flex-direction: column;
 }
-.reels-head {
-  display: flex; justify-content: space-between; align-items: center; gap: 8px;
-  padding: 10px 12px; border-bottom: 1px solid var(--border);
-}
-.reels-head .reels-links { display: flex; gap: 6px; margin-left: auto; }
-.reels-add { display: flex; gap: 6px; padding: 8px 12px; }
-.reels-add input {
-  flex: 1; min-width: 0; background: var(--bg-elev); border: 1px solid var(--border);
-  border-radius: 6px; color: var(--text); padding: 5px 8px; font-size: 12.5px;
-}
-.reels-nav { display: flex; gap: 6px; align-items: center; padding: 0 12px 8px; }
-.reels-pos { margin-left: auto; margin-right: auto; font-size: 11.5px; color: var(--text-dim); }
 #reels-frame-wrap { flex: 1; overflow-y: auto; padding: 0 12px 12px; }
 #reels-frame { width: 100%; min-height: 500px; border: none; border-radius: 10px; background: #000; }
-.reels-empty { color: var(--text-dim); font-size: 12.5px; padding: 30px 10px; text-align: center; }
 
 /* ── live tool timers / elapsed ── */
 .tool-card .tool-timer {
@@ -1659,9 +1817,9 @@ html.custom-cursor button { cursor: var(--cursor, auto), pointer !important; }
  * be scrolled sideways, which is never what you want: the text wraps, and only
  * a code block itself scrolls. */
 #chat-scroll { overflow-x: hidden; }
-.msg, .msg .body, .msg .bubble, .msg .text, .who, .tool-card, .tool-card .tool-out,
-.tool-card .tool-name, .queue-item, .status-bar, #view-banner, .edit-banner,
-.stt-transcript, .agent-stats, .attachments {
+.msg, .msg .body, .msg .bubble, .msg .text, .who, .tool-card,
+.tool-card .tool-name, .status-bar, #view-banner, .edit-banner,
+.agent-stats, .attachments {
   overflow-wrap: anywhere;
   word-break: break-word;
   min-width: 0;
@@ -1710,6 +1868,7 @@ html.custom-cursor button { cursor: var(--cursor, auto), pointer !important; }
   .msg { margin-bottom: 12px; }
 
   #composer { padding: 4px 8px 8px; }
+  :root { --composer-pad-x: 8px; }
   .composer-row { gap: 6px; padding: 6px; }
   .composer-row .btn.icon { padding: 7px; }
   #input { font-size: 15px; }               /* 16px avoids the iOS zoom-on-focus */
@@ -1728,21 +1887,41 @@ html.custom-cursor button { cursor: var(--cursor, auto), pointer !important; }
   /* and the dock can never be taller than what it sits in */
   #composer-dock { max-height: 100%; overflow-y: auto; }
   .stats-spacer { display: none; }
-  #stat-turn { display: none; }
+  /* Issue #270: the total time is the one number that answers "how long did
+   * that take?", so it goes first and stays visible at every width instead of
+   * being hidden under 760px. The rest of the row still scrolls sideways. */
+  #stat-turn { order: -2; display: inline-block; }
   #ctx-label { max-width: 45vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #model-btn.pill { max-width: 44vw; }
   .ctx-ring svg { width: 30px; height: 30px; }
 
   /* dialogs go edge to edge: a 560px box on a 412px screen is mostly backdrop */
   dialog { max-width: 100vw; }
-  dialog#settings-dialog, dialog#setup-dialog, dialog#ask-dialog, dialog#crop-dialog {
+  dialog#settings-dialog, dialog#setup-dialog, dialog#ask-dialog, dialog#crop-dialog, dialog#statistics-dialog, dialog#notice-detail-dialog {
     width: 100vw; max-width: 100vw; height: 100vh; height: 100dvh;
-    max-height: 100dvh; border-radius: 0; margin: 0;
+    max-height: 100dvh; border-radius: 0;
+    /* Issue #200: `margin: 0` pinned the settings dialog to the top-left as
+     * soon as the window was narrower than 760px. The dialog's own `[open]`
+     * width rule is more specific than this one, so it stayed 520px wide and
+     * simply sat in the corner. Keep the UA's centering instead. */
+    margin: auto;
   }
+  /* Issue #269: the base dialog has min-width:380px, which is wider than a
+   * 367px phone screen, so the right edge of every settings row was cut off.
+   * The full-width rules below have to be allowed to shrink past it. Long
+   * labels with a help icon also stop being nowrap here, and rows with fields
+   * plus buttons wrap instead of overflowing. */
+  dialog#settings-dialog { min-width: 0; }
+  /* Issue #269: six tabs do not fit a phone width. Wrapping keeps every tab
+   * reachable instead of letting the last one hang off the right edge. */
+  dialog#settings-dialog > .tabs { flex-wrap: wrap; row-gap: 2px; }
   dialog#settings-dialog .settings-grid { grid-template-columns: 1fr; }
   /* One column at this width, so the two-column pinning above is overridden. */
-  dialog#settings-dialog .settings-grid > * { grid-column: 1; }
+  dialog#settings-dialog .settings-grid > * { grid-column: 1; min-width: 0; }
   dialog#settings-dialog .settings-grid > label { margin-top: 6px; }
+  dialog#settings-dialog .settings-grid > label.has-help { white-space: normal; }
+  dialog#settings-dialog .settings-grid > .check-label { align-items: flex-start; }
+  dialog#settings-dialog .rate-row, dialog#settings-dialog .font-row { flex-wrap: wrap; }
 
   /* anything tappable gets a real target */
   .btn { min-height: 32px; }
@@ -1760,7 +1939,6 @@ html.custom-cursor button { cursor: var(--cursor, auto), pointer !important; }
 /* Reels placeholder: the feed cannot be iframed, so the panel offers a real
    top-level window instead (a popup gets its own browsing context, where the
    sites' X-Frame-Options: DENY does not apply). */
-.reels-placeholder-actions { display: flex; gap: 8px; margin-top: 4px; }
 
 /* ── text outline ─────────────────────────────────────────────────────────
  * A 4-way shadow makes a real 1px outline; -webkit-text-stroke would thin the
@@ -1931,16 +2109,11 @@ body.text-outline .session-item .s-meta { text-shadow: none; }
 .model-menu .menu-sep { height: 1px; background: var(--border); margin: 4px 2px; }
 .model-item.danger .model-label { color: var(--red); }
 .model-item.disabled { opacity: .5; cursor: default; }
-.model-item .model-arrow { color: var(--text-dim); flex-shrink: 0; }
 .model-menu .menu-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 /* Two controls on one row (start + forget on a stopped instance, issue #119). */
 .model-menu .menu-controls { display: inline-flex; gap: 4px; margin-left: auto; }
 .model-menu .menu-dot.live-dot { background: var(--green); animation: live-pulse 1.2s ease-in-out infinite; }
 .model-menu .menu-dot.off-dot { background: #55606f; }
-
-/* the instance switcher lives in the sidebar footer */
-.sidebar-foot { border-top: 1px solid color-mix(in srgb, var(--border) calc(var(--ui-alpha) * 100%), transparent); padding: 8px; }
-.instance-btn { width: 100%; text-align: left; }
 
 /* stats line: outlined like the rest of the chat text */
 body.text-outline #stats-bar { text-shadow:
@@ -1965,17 +2138,48 @@ body.text-outline #stats-bar { text-shadow:
 #crop-fit-row .btn:disabled { opacity: .45; }
 
 /* ── in-app confirmations / small forms ───────────────────────────────────── */
-#ask-dialog { width: min(460px, 92vw); }
-#ask-dialog #ask-body { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 2px; }
-#ask-dialog .ask-text { margin: 0; font-size: 13px; color: var(--text); overflow-wrap: anywhere; white-space: pre-wrap; }
-#ask-dialog .ask-hint { margin: 0; font-size: 12px; color: var(--text-dim); }
-#ask-dialog .ask-row { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--text-dim); }
-#ask-dialog .ask-label { width: 70px; flex-shrink: 0; text-align: right; }
-#ask-dialog .ask-row input {
-  flex: 1; min-width: 0; background: var(--bg-elev); border: 1px solid var(--border);
-  border-radius: 6px; color: var(--text); padding: 6px 8px; font-size: 12.5px;
+/* The same spacing as Settings: a title, a quiet explanation, labelled rows,
+ * then a rule and the buttons on the right. Before this the New folder dialog
+ * had browser-default button placement (hard against the left edge) and the
+ * checkbox row floated a pixel or two below its label. */
+#ask-dialog {
+  width: min(440px, 92vw); max-height: 86vh; overflow-y: auto;
+  padding: 20px;
 }
-#ask-dialog .ask-row input:focus { outline: none; border-color: var(--accent); }
+#ask-dialog > h3 { margin: 0 0 6px; font-size: 15px; }
+#ask-dialog #ask-body {
+  display: flex; flex-direction: column; gap: 10px;
+  margin: 10px 0 4px;
+}
+#ask-dialog .ask-text {
+  margin: 0 0 2px; font-size: 12.5px; line-height: 1.5;
+  color: var(--text-dim); overflow-wrap: anywhere; white-space: pre-wrap;
+}
+#ask-dialog .ask-hint { margin: 0; font-size: 12px; color: var(--text-dim); }
+#ask-dialog .ask-row {
+  display: grid; grid-template-columns: 82px minmax(0, 1fr);
+  align-items: center; gap: 12px;
+  min-height: 30px; font-size: 12.5px; color: var(--text-dim);
+}
+#ask-dialog .ask-label { min-width: 0; text-align: right; line-height: 1.3; }
+#ask-dialog .ask-check {
+  display: flex; align-items: center; gap: 8px;
+  min-width: 0; color: var(--text); line-height: 1.35; cursor: pointer;
+}
+#ask-dialog .ask-row input[type="text"] {
+  width: 100%; min-width: 0; box-sizing: border-box;
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); padding: 7px 9px; font-size: 12.5px;
+}
+#ask-dialog .ask-row input[type="text"]:focus { outline: none; border-color: var(--accent); }
+#ask-dialog .ask-check input {
+  width: 15px; height: 15px; flex: 0 0 auto; margin: 0;
+  accent-color: var(--accent); cursor: pointer;
+}
+#ask-dialog > .dialog-buttons {
+  display: flex; justify-content: flex-end; align-items: center; gap: 8px;
+  margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border);
+}
 #ask-dialog .btn.danger { background: var(--red); border-color: var(--red); color: #fff; }
 #ask-dialog .btn.danger:hover { filter: brightness(1.08); }
 
@@ -2051,6 +2255,7 @@ body.hide-tools .msg.tool { display: none; }
   margin: 2px 0 6px; font-size: 12.5px; font-weight: 600; letter-spacing: .02em;
   display: flex; align-items: center; gap: 6px;
 }
+#tab-extensions .ext-head .help-tip { margin-left: 0; }
 #tab-extensions .ext-count {
   font-size: 11px; font-weight: 500; color: var(--text-dim);
   border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; line-height: 15px;
@@ -2106,3 +2311,108 @@ body.hide-tools .msg.tool { display: none; }
 .md-table th { background: color-mix(in srgb, var(--accent) 12%, transparent); font-weight: 600; }
 .md-table tr:nth-child(even) td { background: color-mix(in srgb, var(--text) 4%, transparent); }
 .md-table code.inline { white-space: nowrap; }
+
+/* ── fun: the DeepSeek desk pet ──────────────────────────────────────────
+ * Opt-in from Settings > Fun. It is a real fixed layer, not part of the
+ * transcript, so tool cards and streaming cannot move it. Drag it anywhere;
+ * the position is clamped to the viewport and remembered per browser. */
+#pet-overlay {
+  position: fixed; right: 24px; bottom: 24px;
+  width: var(--pet-size, 96px); height: var(--pet-size, 96px);
+  z-index: 30; cursor: grab; touch-action: none; user-select: none;
+  filter: drop-shadow(0 8px 16px rgba(0, 0, 0, .35));
+}
+#pet-overlay.hidden { display: none; }
+#pet-overlay.dragging { cursor: grabbing; }
+#pet-overlay:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 50%; }
+#pet-overlay .pet-art {
+  width: 100%; height: 100%; transform-origin: 50% 85%;
+  animation: pet-idle 3s ease-in-out infinite;
+}
+#pet-overlay .pet-art svg { display: block; width: 100%; height: 100%; fill: #4D6BFE; }
+#pet-overlay[data-state="loading"] .pet-art { animation: pet-loading 1.2s ease-in-out infinite; }
+#pet-overlay[data-state="inferring"] .pet-art { animation: pet-swim .6s ease-in-out infinite; }
+#pet-overlay[data-state="scoring"] .pet-art { animation: pet-scoring 2s ease-in-out infinite; }
+#pet-overlay[data-state="done"] .pet-art { animation: pet-done 1s ease-in-out infinite; }
+#pet-overlay[data-state="sota"] .pet-art { animation: pet-jump 1.2s ease-in-out infinite; }
+#pet-overlay[data-state="error"] .pet-art { animation: pet-error .8s ease-in-out infinite; filter: grayscale(.8) drop-shadow(0 8px 16px rgba(0,0,0,.35)); }
+#pet-overlay[data-state="click"] .pet-art { animation: pet-jump .9s ease-in-out infinite; }
+#pet-overlay[data-state="fidget"] .pet-art { animation: pet-wiggle 1.5s ease-in-out infinite; }
+#pet-overlay .pet-bubble {
+  position: absolute; right: 100%; bottom: 62%; margin-right: 8px;
+  max-width: 190px; padding: 3px 9px; border-radius: 9px;
+  background: rgba(77, 107, 254, .94); color: #fff;
+  font: 12px/1.35 var(--chat-font); white-space: nowrap;
+  box-shadow: 0 3px 10px rgba(0,0,0,.3); pointer-events: none;
+}
+#pet-overlay .pet-bubble.hidden { display: none; }
+@keyframes pet-idle { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
+@keyframes pet-loading { 0%, 100% { transform: translateY(0) rotate(0deg); } 50% { transform: translateY(-5px) rotate(-3deg); } }
+@keyframes pet-swim { 0%, 100% { transform: rotate(-8deg) translateX(0); } 50% { transform: rotate(8deg) translateX(4px); } }
+@keyframes pet-scoring { 0%, 100% { transform: rotate(0deg) scale(1); } 50% { transform: rotate(6deg) scale(1.04); } }
+@keyframes pet-done { 0%, 100% { transform: rotate(-12deg); } 50% { transform: rotate(12deg); } }
+@keyframes pet-jump { 0% { transform: translateY(0) scale(1, 1); } 35% { transform: translateY(-30%) scale(.94, 1.08); } 70% { transform: translateY(0) scale(1.08, .92); } 85% { transform: translateY(-7%) scale(1, 1); } 100% { transform: translateY(0) scale(1, 1); } }
+@keyframes pet-error { 0%, 100% { transform: rotate(180deg); } 50% { transform: rotate(172deg); } }
+@keyframes pet-wiggle { 0%, 100% { transform: rotate(0deg) translateY(0); } 25% { transform: rotate(-6deg) translateY(-8%); } 75% { transform: rotate(6deg) translateY(-8%); } }
+@media (prefers-reduced-motion: reduce) {
+  #pet-overlay .pet-art { animation-duration: .001s !important; animation-iteration-count: 1 !important; }
+}
+
+/* Petdex library: downloaded sprites and the search result rows. */
+#pet-overlay[data-kind="sprite"] .pet-art { animation: none; }
+/* A cell is drawn at its own 192x208 size and the layer is zoomed to the picked
+ * pet size. The previous version stretched both dimensions of the whole sheet
+ * (`background-size: 800% N%`), which resampled the sheet: at a fractional size
+ * the nearest-neighbour sampler could reach past the cell it was drawing and
+ * show a sliver of the next sprite for some frames (issue #278 - a hat tip or a
+ * braid appearing beside the pet). Width-only sizing also keeps 9-row and
+ * 11-row sheets on their true rows instead of squashing them.
+ *
+ * zoom, not transform: scale(). A transform scales after the layer has been
+ * sampled, which is exactly how the neighbouring frame leaked in. zoom scales
+ * the box before the background is sampled, so every frame stays inside its own
+ * cell. */
+#pet-overlay .pet-sprite {
+  width: 192px; height: 208px;
+  background-repeat: no-repeat;
+  background-size: 1536px auto;
+  image-rendering: pixelated; background-position: 0 0;
+  zoom: var(--pet-zoom, .5);
+  transform-origin: 0 0;
+}
+.pet-skin-row select { flex: 1; min-width: 0; }
+.pet-search-row input[type="text"] { flex: 1; min-width: 0; }
+.pet-results {
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: 220px; overflow-y: auto;
+}
+.pet-result {
+  display: flex; align-items: center; gap: 10px;
+  min-width: 0; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-panel) 82%, var(--bg) 18%);
+}
+.pet-thumb {
+  flex: 0 0 42px; width: 42px; height: 46px;
+  border-radius: 6px; background-color: var(--bg);
+  background-repeat: no-repeat; image-rendering: pixelated;
+}
+.pet-result-info { flex: 1; min-width: 0; }
+.pet-result-name { font-size: 12.5px; color: var(--text); }
+.pet-result-desc {
+  font-size: 11px; color: var(--text-dim); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pet-result .btn { flex: 0 0 auto; }
+.pet-empty { font-size: 11.5px; color: var(--text-dim); padding: 4px 0; }
+@media (max-width: 760px) {
+  .pet-result-desc { white-space: normal; }
+  .pet-results { max-height: 260px; }
+}
+
+/* The desk pet's own little walk: the direction is set while it moves, then it
+ * returns to the idle row. Sprites use rows 1/2 for running and row 4 for the
+ * jump; the built-in whale gets the corresponding CSS motion. */
+#pet-overlay[data-state="run-right"] .pet-art { animation: pet-swim .6s ease-in-out infinite; }
+#pet-overlay[data-state="run-left"] .pet-art { animation: pet-swim .6s ease-in-out infinite reverse; }
+#pet-overlay[data-state="jumping"] .pet-art { animation: pet-jump 1.2s ease-in-out infinite; }
+#pet-overlay.wandering { transition-property: left, top; transition-timing-function: linear; }

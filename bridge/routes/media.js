@@ -87,9 +87,17 @@ module.exports = function mediaRoutes(deps) {
       // that did not fit the connection limit stalled).
       const range = req.headers.range;
       if (range) {
-        const m = /bytes=(\d*)-(\d*)/.exec(String(range));
-        let start = m && m[1] ? Number(m[1]) : 0;
-        let end = m && m[2] ? Number(m[2]) : st.size - 1;
+        /* Same rules as /api/upload-file: `bytes=N-`, `bytes=N-M` and the
+         * suffix form `bytes=-N` (the last N bytes). The suffix form used to be
+         * read as 0..N, so a player asking for the tail of a clip got the
+         * head. */
+        const m = /^bytes=(\d*)-(\d*)$/.exec(String(range).trim());
+        let start = 0;
+        let end = st.size - 1;
+        if (m && (m[1] || m[2])) {
+          start = m[1] ? Number(m[1]) : Math.max(0, st.size - Number(m[2]));
+          end = m[1] && m[2] ? Math.min(Number(m[2]), st.size - 1) : st.size - 1;
+        }
         if (!Number.isFinite(start) || start < 0) start = 0;
         if (!Number.isFinite(end) || end >= st.size) end = st.size - 1;
         if (start > end || start >= st.size) {

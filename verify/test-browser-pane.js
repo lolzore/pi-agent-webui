@@ -165,10 +165,10 @@ const getJson = (p) => new Promise((res, rej) => {
     await new Promise((r) => setTimeout(r, 500));
     res.searchUrl = SET.browserUrl || null;
     $('reels-url').value = 'https://example.com/somewhere';
-    // the native shell handoff: the URL goes to the shell, not the frame
-    const realHost = window.webView2Host;
+    // the Electron handoff: the URL goes to the shell, not the frame
+    const realHost = window.desktopHost;
     window.__hostMsgs = [];
-    window.webView2Host = () => ({ postMessage: (m) => window.__hostMsgs.push(m) });
+    window.desktopHost = () => ({ postMessage: (m) => window.__hostMsgs.push(m) });
     const frameBefore = $('reels-frame').getAttribute('src');
     reelsNavigate('https://example.com/somewhere');
     // A switch to the browser tab first closes the feed surface, so the handoff
@@ -176,7 +176,7 @@ const getJson = (p) => new Promise((res, rej) => {
     res.hostMsg = window.__hostMsgs.find((m) => m.startsWith('piagent|browser|open|')) || null;
     res.frameUnchanged = $('reels-frame').getAttribute('src') === frameBefore;
     res.hostRemembered = SET.browserUrl || null;
-    window.webView2Host = realHost;
+    window.desktopHost = realHost;
     // reopening the pane restores the remembered URL
     $('reels-frame').removeAttribute('src');
     setReelsFeed('browser');

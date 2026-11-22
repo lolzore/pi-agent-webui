@@ -27,7 +27,11 @@ const PORT = 3088;
 const DBG_PORT = 9380 + (process.pid % 200);
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-goals-'));
 const goalsDir = path.join(scratch, 'goals');
+const goalSessionId = '11111111-2222-3333-4444-555555555555';
 fs.mkdirSync(goalsDir, { recursive: true });
+fs.mkdirSync(path.join(scratch, 'sessions'), { recursive: true });
+const goalSessionFile = path.join(scratch, 'sessions', `2026-01-01T00-00-00-000Z_${goalSessionId}.jsonl`);
+fs.writeFileSync(goalSessionFile, JSON.stringify({ type: 'session', id: goalSessionId, cwd: path.join(scratch, 'ws') }) + '\n');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const task = (id, title, status, extra) => Object.assign({ id, title, status }, extra || {});
@@ -49,6 +53,7 @@ writeGoal('active_goal_20260101000000_goaltest1.md', {
   createdAt: '2026-01-01T00:00:00.000Z',
   updatedAt: '2026-01-01T00:10:00.000Z',
   usage: { tokensUsed: 1234, activeSeconds: 60 },
+  scheduler: { owner: goalSessionId },
   taskList: {
     blockCompletion: false,
     tasks: [
@@ -90,6 +95,9 @@ const getJson = (port, p) => new Promise((res, rej) => {
       PI_WEBUI_LAST_SESSION: path.join(scratch, 'last.json'),
       PI_GOALS_DIR: goalsDir,
       PI_COMMAND: `${process.execPath} ${path.join(ROOT, 'bridge', 'mock_agent.js')}`,
+      // The goal belongs to this session; the page must still show its bar and
+      // focus menu only here.
+      PI_MOCK_SESSION_FILE: goalSessionFile,
       PI_LLAMA_SCAN: 'off',
       PORT: String(PORT),
     }),
@@ -123,7 +131,10 @@ const getJson = (port, p) => new Promise((res, rej) => {
     fail('a completed task lost its evidence: ' + JSON.stringify(goal.tasks));
   }
   if (goal.focused !== true || !other || other.focused !== false) fail('focused flags are wrong');
-  console.log('  api: objective, counts (1/3 + 1 skipped) and evidence parsed from the JSON head');
+  if (goal.sessionId !== goalSessionId || goal.sessionPath !== goalSessionFile) {
+    fail('the goal does not point back at the session it was started in: ' + JSON.stringify({ id: goal.sessionId, path: goal.sessionPath }));
+  }
+  console.log('  api: objective, counts (1/3 + 1 skipped), evidence and origin session parsed');
 
   /* ── the page ─────────────────────────────────────────────────────────── */
   const userDir = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-goals-browser-'));
@@ -172,6 +183,10 @@ const getJson = (port, p) => new Promise((res, rej) => {
     fail(what);
   };
   await send('Runtime.enable'); await send('Page.enable');
+  /* Issue #207 is a breakpoint bug: at the default headless width the two
+   * boxes are identical, so exercise the <760px layout where the composer
+   * padding (and therefore the goal bar) changes. */
+  await send('Emulation.setDeviceMetricsOverride', { width: 756, height: 700, deviceScaleFactor: 1, mobile: false });
   await send('Page.navigate', { url: `http://127.0.0.1:${PORT}/` });
   await waitFor("typeof refreshGoals === 'function' && typeof handleRpcMessage === 'function' ? 1 : 0", 20000, 'the page never loaded');
   await evalJs("document.querySelectorAll('dialog[open]').forEach((d) => { try { d.close(); } catch {} })");
@@ -214,6 +229,7 @@ const getJson = (port, p) => new Promise((res, rej) => {
   /* A live update: goal-x rewrites the file and emits its widget event. */
   const record2 = {
     version: 3, id: 'goaltest1', objective: 'Ship the native goal panel', status: 'active', autoContinue: true,
+    scheduler: { owner: goalSessionId },
     createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:20:00.000Z',
     taskList: { blockCompletion: false, tasks: [
       task('t1', 'Design the bar', 'complete', { evidence: 'looks right in the screenshot' }),
@@ -251,15 +267,145 @@ const getJson = (port, p) => new Promise((res, rej) => {
   if (/[\\u250c\\u2502\\u2514]/.test(after.widget)) fail('the raw TUI widget lines reached the widget bar: ' + JSON.stringify(after.widget));
   if (!after.widgetHidden) fail('the widget bar is showing goal-x output it should not: ' + JSON.stringify(after.widget));
 
+  /* goal-x also publishes the unfocused state as a status line. The native bar
+   * already shows the same goal, count and focus control, so the hint must not
+   * be copied into the status bar - that is the goal appearing twice. */
+  await evalJs("handleRpcMessage({ type: 'extension_ui_request', method: 'setStatus', statusKey: 'goal', statusText: 'goal: unfocused [3 open] - /goal-focus' })");
+  await sleep(250);
+  const goalStatus = JSON.parse(await evalJs(`JSON.stringify({
+    text: (document.getElementById('status-bar') || {}).textContent || '',
+    hidden: !document.getElementById('status-bar') || document.getElementById('status-bar').classList.contains('hidden'),
+  })`));
+  if (!goalStatus.hidden || /unfocused|goal:/i.test(goalStatus.text)) {
+    fail('the unfocused goal hint was rendered in the status bar as well as the goal bar: ' + JSON.stringify(goalStatus));
+  }
+  console.log('  goal status stays in the native bar; no duplicate status line');
+
+  /* A goal-select request that is delivered twice shows one menu; the answer
+   * goes to both extension requests, and choosing a goal follows its session. */
+  const selectResult = JSON.parse(await evalJs(`(async () => {
+    const sent = [];
+    const realSend = window.send;
+    const realSwitch = window.switchToSession;
+    let switched = null;
+    window.send = (obj) => {
+      if (obj && obj.type === 'extension_ui_response') sent.push(obj);
+      else return realSend(obj);
+    };
+    window.switchToSession = async (p) => { switched = p; };
+    await refreshGoals();
+    const goal = (goalState.goals || []).find((g) => g.id === 'goaltest1');
+    const label = '* goaltest1 | active | goal | Ship the native goal panel';
+    handleRpcMessage({ type: 'extension_ui_request', id: 'goal-select-1', method: 'select', title: 'Focus open goal', options: [label] });
+    handleRpcMessage({ type: 'extension_ui_request', id: 'goal-select-2', method: 'select', title: 'Focus open goal', options: [label] });
+    const openAfterTwo = document.getElementById('ext-dialog').open;
+    const select = document.querySelector('#ext-dialog-body select');
+    select.value = label;
+    // Reading another session read-only is the case where the goal's own
+    // session is already the agent session but the view is elsewhere.
+    S.viewSession = '/tmp/ui-goals-view.jsonl';
+    document.getElementById('ext-dialog-ok').click();
+    await new Promise((r) => setTimeout(r, 500));
+    S.viewSession = null;
+    window.send = realSend;
+    window.switchToSession = realSwitch;
+    return JSON.stringify({
+      openAfterTwo,
+      openAfterPick: document.getElementById('ext-dialog').open,
+      sent,
+      switched,
+      expected: goal && goal.sessionPath,
+    });
+  })()`));
+  if (!selectResult.openAfterTwo) fail('the duplicate goal select did not show its first dialog');
+  if (selectResult.openAfterPick) fail('the goal select dialog stayed open after choosing');
+  if (selectResult.sent.length !== 2 || selectResult.sent.some((r) => r.id !== 'goal-select-1' && r.id !== 'goal-select-2')) {
+    fail('the duplicate goal select did not answer both extension requests: ' + JSON.stringify(selectResult.sent));
+  }
+  if (selectResult.sent.some((r) => r.value !== '* goaltest1 | active | goal | Ship the native goal panel')) {
+    fail('the duplicate goal select answered with a different value: ' + JSON.stringify(selectResult.sent));
+  }
+  if (selectResult.switched !== selectResult.expected || !/2026-01-01T00-00-00-000Z_11111111/.test(selectResult.switched || '')) {
+    fail('choosing a goal did not open the session it was started in: ' + JSON.stringify(selectResult));
+  }
+  console.log('  duplicate goal select: one dialog, both responses, and the goal\'s origin session opened');
+
+  /* The same pool menu must not follow us into a session that does not own the
+   * goal. The bar disappears too; the extension request is answered cancelled
+   * so goal-x is not left waiting. */
+  const awayResult = JSON.parse(await evalJs(`(async () => {
+    const realSend = window.send;
+    const sent = [];
+    window.send = (obj) => {
+      if (obj && obj.type === 'extension_ui_response') sent.push(obj);
+      else return realSend(obj);
+    };
+    const was = S.state.sessionFile;
+    S.state.sessionFile = '/tmp/ui-goals-other-session.jsonl';
+    S.viewSession = null;
+    // Render from the state we just set; a concurrent poll must not be part of
+    // what this assertion is testing.
+    renderGoalBar();
+    const barHidden = document.getElementById('goal-bar').classList.contains('hidden');
+    handleRpcMessage({ type: 'extension_ui_request', id: 'goal-away', method: 'select', title: 'Focus open goal',
+      options: ['* goaltest1 | active | goal | Ship the native goal panel'] });
+    await new Promise((r) => setTimeout(r, 250));
+    const out = { barHidden, dialogOpen: document.getElementById('ext-dialog').open, sent };
+    S.state.sessionFile = was;
+    window.send = realSend;
+    await refreshGoals();
+    return JSON.stringify(out);
+  })()`));
+  if (!awayResult.barHidden) fail('the goal bar followed the goal into another session: ' + JSON.stringify(awayResult));
+  if (awayResult.dialogOpen) fail('the goal focus menu followed the goal into another session: ' + JSON.stringify(awayResult));
+  if (awayResult.sent.length !== 1 || awayResult.sent[0].cancelled !== true) {
+    fail('the goal menu in the wrong session was not cancelled cleanly: ' + JSON.stringify(awayResult.sent));
+  }
+  console.log('  goal bar and goal menu stay on the session that owns the goal');
+
   /* No goal-x here: the bar goes away and nothing errors. */
   fs.renameSync(goalsDir, goalsDir + '-gone');
   await evalJs('refreshGoals()');
   await sleep(400);
   const absent = await evalJs("document.getElementById('goal-bar').classList.contains('hidden')");
   if (!absent) fail('the goal bar stayed up with no goals on disk');
+
+  /* Issue #204: a reload must not need a new goal or a widget event to see the
+   * goal again. Once the page had seen "no goals", the poll stopped, so a goal
+   * that appeared (or reappeared) afterwards was invisible until something else
+   * refreshed it. Put a goal back without calling refreshGoals() or emitting a
+   * widget event, and wait for the page's own retry/poll. */
+  fs.mkdirSync(goalsDir, { recursive: true });
+  writeGoal('active_goal_20260101000100_reappeared.md', {
+    id: 'reappeared',
+    objective: 'Come back after a reload',
+    status: 'active',
+    scheduler: { owner: goalSessionId },
+    updatedAt: '2026-01-01T00:11:00.000Z',
+    taskList: { tasks: [task('r1', 'Notice the file', 'pending')] },
+  });
+  let reappeared = false;
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 12000) {
+      if (await evalJs("document.getElementById('goal-bar').textContent.includes('Come back after a reload')")) { reappeared = true; break; }
+      await sleep(250);
+    }
+  }
+  if (!reappeared) {
+    const dbg = await evalJs(`(async () => JSON.stringify({
+      bar: document.getElementById('goal-bar').textContent,
+      hidden: document.getElementById('goal-bar').classList.contains('hidden'),
+      state: goalState ? goalState.present : null,
+      api: await fetch('/api/goals', { cache: 'no-store' }).then((r) => r.json()).then((d) => ({ present: d.present, ids: (d.goals || []).map((g) => g.id) })),
+    }))()`);
+    fail('a goal that appeared after a no-goal snapshot never showed up: ' + dbg);
+  }
+  console.log('  a goal written after the no-goal snapshot was picked up without an event');
+
   if (problems.length) fail('the page reported errors:\n' + problems.join('\n'));
 
-  console.log('  PASS #55 the goal bar renders goal-x state, updates live, and hides cleanly when absent');
+  console.log('  PASS #55/#204 the goal bar renders goal-x state, updates live, recovers after a miss, and hides cleanly');
   cleanupBrowser();
   cleanup();
   process.exit(0);
